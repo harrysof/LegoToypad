@@ -23,7 +23,11 @@ namespace
 	constexpr size_t kTagSize = 180;
 	constexpr uint8_t kLoadCommand = 0x01;
 	constexpr UINT_PTR kControllerTimer = 1;
-	constexpr wchar_t kToypadPickerInputEvent[] = L"Local\\CemuToypadPickerInputActive";
+	// NOTE: this string is a cross-repo contract with the Cemu fork's
+	// Controller.cpp, which waits on the same named event to know when to
+	// neutralize real controller input. If you change this string, update
+	// Controller.cpp to match or the handoff will silently stop working.
+	constexpr wchar_t kLegoToypadInputEvent[] = L"Local\\CemuLegoToypadInputActive";
 
 	// Overlay window sizing.
 	constexpr int kOverlayWidth = 900;
@@ -86,6 +90,19 @@ namespace
 		{XINPUT_GAMEPAD_Y, L"Y"},
 	}};
 
+	// Buttons already bound to in-app menu navigation (confirm, back, jump
+	// to settings, list scrolling). A captured shortcut made up of only
+	// these would immediately fight with normal use of the picker, so at
+	// least one other button is always required alongside them.
+	constexpr WORD kNavigationButtons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_Y |
+		XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN;
+
+	// Reserved chord that always cancels shortcut capture on a controller,
+	// regardless of what is being assigned. Keyboard capture is cancelled
+	// with Esc instead. This guarantees there is always a way to back out
+	// without a mouse or keyboard.
+	constexpr WORD kShortcutCancelChord = XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_START;
+
 	enum class Screen
 	{
 		FigureList,
@@ -120,6 +137,11 @@ namespace
 		UINT shortcutKeyModifiers = 0;
 		UINT shortcutKeyCode = 0;
 		bool capturingShortcut = false;
+		// Stays false until every controller button has been seen released
+		// at least once after entering capture mode, so whatever button was
+		// still held down from opening the Settings screen can't be
+		// mistaken for the start of the new shortcut.
+		bool shortcutCaptureArmed = false;
 	};
 
 	AppState g_app;
@@ -149,7 +171,7 @@ namespace
 
 	uint16_t ReadPort()
 	{
-		const auto iniPath = GetExecutableDirectory() / L"ToypadPicker.ini";
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
 		const UINT configuredPort = GetPrivateProfileIntW(L"Listener", L"Port", 9191, iniPath.c_str());
 		return configuredPort >= 1 && configuredPort <= 65535 ? static_cast<uint16_t>(configuredPort) : 9191;
 	}
@@ -217,7 +239,7 @@ namespace
 
 	void SaveShortcutToIni()
 	{
-		const auto iniPath = GetExecutableDirectory() / L"ToypadPicker.ini";
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
 		WritePrivateProfileStringW(L"Shortcut", L"Type",
 			g_app.shortcutType == ShortcutType::Controller ? L"Controller" : L"Keyboard", iniPath.c_str());
 		WritePrivateProfileStringW(L"Shortcut", L"ControllerMask",
@@ -230,7 +252,7 @@ namespace
 
 	void LoadShortcutFromIni()
 	{
-		const auto iniPath = GetExecutableDirectory() / L"ToypadPicker.ini";
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
 		std::array<wchar_t, 32> typeBuffer{};
 		GetPrivateProfileStringW(L"Shortcut", L"Type", L"Controller", typeBuffer.data(),
 			static_cast<DWORD>(typeBuffer.size()), iniPath.c_str());
@@ -468,6 +490,18 @@ namespace
 		UnregisterHotKey(window, kToggleHotkeyId);
 		if (g_app.shortcutType != ShortcutType::Keyboard || g_app.shortcutKeyCode == 0)
 			return;
+
+		// A modifier-less hotkey registers as a truly global key grab, which
+		// would swallow every press of that key in every other program. The
+		// in-app capture screen never produces one, but LegoToypad.ini can
+		// be hand-edited, so this is checked again here as a safety net.
+		if (g_app.shortcutKeyModifiers == 0)
+		{
+			g_app.status = L"Keyboard shortcut in LegoToypad.ini has no modifier (Ctrl/Alt/Shift/Win), "
+				L"so it was not registered. Set it from the in-app Settings screen instead.";
+			return;
+		}
+
 		if (!RegisterHotKey(window, kToggleHotkeyId, g_app.shortcutKeyModifiers | MOD_NOREPEAT, g_app.shortcutKeyCode))
 			g_app.status = L"Warning: could not register that keyboard shortcut (it may be in use elsewhere).";
 	}
@@ -475,7 +509,8 @@ namespace
 	void BeginShortcutCapture()
 	{
 		g_app.capturingShortcut = true;
-		g_app.status = L"Press a controller button (or hold several for a chord) or a keyboard key. Esc cancels.";
+		g_app.shortcutCaptureArmed = false;
+		g_app.status = L"Release all controller buttons, then press a combo, or press a keyboard shortcut.";
 	}
 
 	void CancelShortcutCapture()
@@ -699,8 +734,18 @@ namespace
 			if (g_app.capturingShortcut)
 			{
 				const int y = 108 + static_cast<int>(rows.size()) * 40 + 16;
-				DrawTextLine(dc, L"Listening for input: press a controller button/chord or a keyboard key. Esc cancels.",
-					24, y, width - 48, RGB(255, 204, 51), 50);
+				if (!g_app.shortcutCaptureArmed)
+				{
+					DrawTextLine(dc, L"Release every controller button first...",
+						24, y, width - 48, RGB(255, 204, 51), 26);
+				}
+				else
+				{
+					DrawTextLine(dc, L"Listening: press a controller combo, or a keyboard shortcut.",
+						24, y, width - 48, RGB(255, 204, 51), 26);
+				}
+				DrawTextLine(dc, L"Controller combo needs a non-nav button. Back+Start cancels. Keyboard needs a modifier. Esc cancels.",
+					24, y + 26, width - 48, RGB(255, 204, 51), 26);
 			}
 		}
 
@@ -717,61 +762,116 @@ namespace
 
 	void PollController(HWND window)
 	{
-		static WORD oldButtons = 0;
+		// One slot per XInput user index (0-3), so a controller plugged in
+		// as player 2/3/4 works identically to player 1. Cemu itself may be
+		// reading controller 0 for gameplay, so this app deliberately does
+		// not assume it owns that slot either.
+		static std::array<WORD, XUSER_MAX_COUNT> previousButtons{};
+		static WORD previousCombinedButtons = 0;
 		static DWORD lastNavigation = 0;
 
 		UpdateInputOwnership(window);
 
-		XINPUT_STATE state{};
-		const bool connected = XInputGetState(0, &state) == ERROR_SUCCESS;
-		const WORD buttons = connected ? state.Gamepad.wButtons : 0;
-		const WORD pressed = buttons & ~oldButtons;
+		bool anyConnected = false;
+		WORD combinedButtons = 0;
+		WORD combinedPressed = 0;
+		bool stickUp = false;
+		bool stickDown = false;
+
+		for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i)
+		{
+			XINPUT_STATE state{};
+			const bool connected = XInputGetState(i, &state) == ERROR_SUCCESS;
+			const WORD buttons = connected ? state.Gamepad.wButtons : 0;
+			if (connected)
+			{
+				anyConnected = true;
+				combinedButtons |= buttons;
+				combinedPressed |= buttons & ~previousButtons[i];
+				if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || state.Gamepad.sThumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
+					stickUp = true;
+				if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || state.Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
+					stickDown = true;
+			}
+			previousButtons[i] = buttons;
+		}
+		const WORD previousCombined = previousCombinedButtons;
+		previousCombinedButtons = combinedButtons;
+
+		// -------------------------------------------------------------
+		// Shortcut capture takes over completely while active.
+		//
+		// - Capture only "arms" once every controller has been seen fully
+		//   released, so the button that opened this screen (still held on
+		//   the very first tick) is never mistaken for the start of a new
+		//   combo.
+		// - Back+Start is a reserved chord that always cancels, so there is
+		//   always a way out from a controller alone, no keyboard needed.
+		// - A combo made entirely of navigation buttons (A/B/Y/D-pad
+		//   up-down) is rejected, since assigning one of those would make
+		//   the picker fight itself the moment it was used normally.
+		// -------------------------------------------------------------
+		if (g_app.capturingShortcut)
+		{
+			if (!g_app.shortcutCaptureArmed)
+			{
+				if (combinedButtons == 0)
+					g_app.shortcutCaptureArmed = true;
+				return;
+			}
+
+			if (anyConnected && combinedButtons != 0 && combinedPressed != 0)
+			{
+				if (combinedButtons == kShortcutCancelChord)
+				{
+					CancelShortcutCapture();
+				}
+				else if ((combinedButtons & ~kNavigationButtons) == 0)
+				{
+					g_app.status = L"That combo is only menu-navigation buttons. Add LB, RB, X, "
+						L"Back, Start, or a stick click. Back+Start cancels.";
+				}
+				else
+				{
+					ApplyControllerShortcut(window, combinedButtons);
+				}
+				InvalidateRect(window, nullptr, FALSE);
+			}
+			return;
+		}
 
 		// Global toggle: evaluated every tick regardless of focus/visibility so
 		// it also works while Cemu (not this app) owns the foreground window.
-		if (!g_app.capturingShortcut && g_app.shortcutType == ShortcutType::Controller && g_app.shortcutControllerMask != 0)
+		// Any connected controller can trigger it.
+		if (g_app.shortcutType == ShortcutType::Controller && g_app.shortcutControllerMask != 0)
 		{
-			const bool matchNow = connected && (buttons & g_app.shortcutControllerMask) == g_app.shortcutControllerMask;
-			const bool matchBefore = (oldButtons & g_app.shortcutControllerMask) == g_app.shortcutControllerMask;
+			const bool matchNow = anyConnected && (combinedButtons & g_app.shortcutControllerMask) == g_app.shortcutControllerMask;
+			const bool matchBefore = (previousCombined & g_app.shortcutControllerMask) == g_app.shortcutControllerMask;
 			if (matchNow && !matchBefore)
 			{
 				ToggleOverlay(window);
-				oldButtons = buttons;
 				return;
 			}
 		}
 
-		// Shortcut capture: assign whatever button(s) are pressed while listening.
-		if (g_app.capturingShortcut && connected && buttons != 0 && pressed != 0)
-		{
-			ApplyControllerShortcut(window, buttons);
-			oldButtons = buttons;
-			InvalidateRect(window, nullptr, FALSE);
-			return;
-		}
-
-		oldButtons = buttons;
-
 		// Menu navigation only applies while the overlay is actually shown and focused.
-		if (!g_app.overlayVisible || GetForegroundWindow() != window || IsIconic(window) || !connected)
+		if (!g_app.overlayVisible || GetForegroundWindow() != window || IsIconic(window) || !anyConnected)
 			return;
 
-		if (pressed & XINPUT_GAMEPAD_A)
+		if (combinedPressed & XINPUT_GAMEPAD_A)
 			Confirm();
-		if (pressed & XINPUT_GAMEPAD_B)
+		if (combinedPressed & XINPUT_GAMEPAD_B)
 			Back(window);
-		if ((pressed & XINPUT_GAMEPAD_Y) && g_app.screen == Screen::FigureList)
+		if ((combinedPressed & XINPUT_GAMEPAD_Y) && g_app.screen == Screen::FigureList)
 			g_app.screen = Screen::Settings;
 
-		const bool up = (buttons & XINPUT_GAMEPAD_DPAD_UP) || state.Gamepad.sThumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
-		const bool down = (buttons & XINPUT_GAMEPAD_DPAD_DOWN) || state.Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
 		const DWORD now = GetTickCount();
-		if ((up || down) && now - lastNavigation >= 180)
+		if ((stickUp || stickDown) && now - lastNavigation >= 180)
 		{
-			Navigate(up ? -1 : 1);
+			Navigate(stickUp ? -1 : 1);
 			lastNavigation = now;
 		}
-		if (!up && !down)
+		if (!stickUp && !stickDown)
 			lastNavigation = 0;
 
 		InvalidateRect(window, nullptr, FALSE);
@@ -801,7 +901,21 @@ namespace
 					if (GetKeyState(VK_MENU) & 0x8000) modifiers |= MOD_ALT;
 					if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= MOD_SHIFT;
 					if ((GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000)) modifiers |= MOD_WIN;
-					ApplyKeyboardShortcut(window, modifiers, static_cast<UINT>(wParam));
+
+					// A shortcut with no modifier registers as a truly global
+					// hotkey for that bare key, so it would swallow every
+					// press of that key in every other program while this
+					// app is running. Require at least one modifier instead
+					// of allowing that trap.
+					if (modifiers == 0)
+					{
+						g_app.status = L"Add Ctrl, Alt, Shift, or Win. A bare key would take over "
+							L"that key everywhere on your PC while this app is running.";
+					}
+					else
+					{
+						ApplyKeyboardShortcut(window, modifiers, static_cast<UINT>(wParam));
+					}
 				}
 				InvalidateRect(window, nullptr, FALSE);
 				return 0;
@@ -883,9 +997,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	g_app.port = ReadPort();
 	LoadShortcutFromIni();
 	ScanFigures();
-	g_inputOwnershipEvent = CreateEventW(nullptr, TRUE, FALSE, kToypadPickerInputEvent);
+	g_inputOwnershipEvent = CreateEventW(nullptr, TRUE, FALSE, kLegoToypadInputEvent);
 
-	const wchar_t* className = L"ToypadPickerWindow";
+	const wchar_t* className = L"LegoToypadWindow";
 	WNDCLASSW windowClass{};
 	windowClass.hInstance = instance;
 	windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
