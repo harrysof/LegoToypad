@@ -22,6 +22,8 @@ namespace
 {
 	constexpr size_t kTagSize = 180;
 	constexpr uint8_t kLoadCommand = 0x01;
+	constexpr uint8_t kRemoveCommand = 0x02;
+	constexpr uint8_t kMoveCommand = 0x03;
 	constexpr UINT_PTR kControllerTimer = 1;
 	// NOTE: this string is a cross-repo contract with the Cemu fork's
 	// Controller.cpp, which waits on the same named event to know when to
@@ -59,7 +61,7 @@ namespace
 
 	constexpr std::array<ToypadSlot, 7> kSlots = {{
 		{2, 0, L"Center"},
-		{1, 1, L"Left - upper"},
+		{1, 1, L"Left"},
 		{3, 2, L"Right - upper"},
 		{2, 3, L"Center - lower left"},
 		{2, 4, L"Center - lower right"},
@@ -106,16 +108,38 @@ namespace
 	enum class Screen
 	{
 		FigureList,
-		SlotList,
+		PadViewer,
+		PadAction,
 		Settings,
 	};
 
-	constexpr size_t kSettingsItemCount = 2; // 0: change shortcut, 1: rescan figures
+	// The 3-option dialog shown after picking a pad in PadViewer.
+	enum class PadActionKind
+	{
+		Load,
+		Clear,
+		Move,
+	};
+	constexpr size_t kPadActionCount = 3;
+
+	constexpr size_t kSettingsItemCount = 3; // 0: change shortcut, 1: rescan figures, 2: reset pad view
 
 	enum class ShortcutType
 	{
 		Controller,
 		Keyboard,
+	};
+
+	// LegoToypad's own record of what it has sent to each of the 7 pad
+	// slots. This is bookkeeping only, not verified truth - the wire
+	// protocol is fire-and-forget (no acknowledgement from Cemu), so this
+	// can drift out of sync if Cemu's native dialog is also used, if Cemu
+	// restarts without LegoToypad restarting, or if a send silently fails
+	// to actually land. See "Reset pad view" in Settings.
+	struct PadSlot
+	{
+		bool occupied = false;
+		std::wstring figureName;
 	};
 
 	struct AppState
@@ -142,6 +166,14 @@ namespace
 		// still held down from opening the Settings screen can't be
 		// mistaken for the start of the new shortcut.
 		bool shortcutCaptureArmed = false;
+
+		std::array<PadSlot, 7> padState{};
+		size_t padActionIndex = 0;
+		// True while PadViewer is being shown specifically to pick a Move's
+		// destination pad, rather than the normal "pick a pad to act on"
+		// mode. Reuses the same screen/grid per the original design intent.
+		bool selectingMoveDestination = false;
+		size_t moveSourceSlotIndex = 0;
 	};
 
 	AppState g_app;
@@ -315,6 +347,38 @@ namespace
 		return true;
 	}
 
+	// Shared connect-send-close for LOAD/REMOVE/MOVE. On failure, errorOut is
+	// set to a message suitable for g_app.status and false is returned.
+	bool SendToypadMessage(const uint8_t* data, size_t length, std::wstring& errorOut)
+	{
+		SOCKET clientSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (clientSocket == INVALID_SOCKET)
+		{
+			errorOut = L"Could not create a TCP socket.";
+			return false;
+		}
+
+		sockaddr_in address{};
+		address.sin_family = AF_INET;
+		address.sin_port = htons(g_app.port);
+		address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (connect(clientSocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR)
+		{
+			closesocket(clientSocket);
+			errorOut = L"Could not connect to Cemu. Enable the emulated Toypad and listener first.";
+			return false;
+		}
+
+		const bool sent = SendAll(clientSocket, data, length);
+		closesocket(clientSocket);
+		if (!sent)
+		{
+			errorOut = L"Connection to Cemu closed before the message was fully sent.";
+			return false;
+		}
+		return true;
+	}
+
 	void LoadSelectedFigure()
 	{
 		if (g_app.figures.empty())
@@ -334,34 +398,92 @@ namespace
 		message[2] = kSlots[g_app.slotIndex].index;
 		std::copy(tagData.begin(), tagData.end(), message.begin() + 5);
 
-		SOCKET clientSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-		if (clientSocket == INVALID_SOCKET)
+		std::wstring error;
+		if (!SendToypadMessage(message.data(), message.size(), error))
 		{
-			g_app.status = L"Could not create a TCP socket.";
+			g_app.status = error;
 			return;
 		}
 
-		sockaddr_in address{};
-		address.sin_family = AF_INET;
-		address.sin_port = htons(g_app.port);
-		address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-		if (connect(clientSocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR)
-		{
-			closesocket(clientSocket);
-			g_app.status = L"Could not connect to Cemu. Enable the emulated Toypad and listener first.";
-			return;
-		}
-
-		const bool sent = SendAll(clientSocket, message.data(), message.size());
-		closesocket(clientSocket);
-		if (!sent)
-		{
-			g_app.status = L"Connection to Cemu closed before the LOAD message was sent.";
-			return;
-		}
+		// The listener always clears the destination before loading (see
+		// LISTENER_IMPLEMENTATION.md), so an occupied pad is silently
+		// overwritten on the Cemu side too - session state just mirrors that.
+		auto& slot = g_app.padState[g_app.slotIndex];
+		slot.occupied = true;
+		slot.figureName = g_app.figures[g_app.figureIndex].label;
 
 		g_app.status = L"LOAD sent: " + g_app.figures[g_app.figureIndex].label + L" -> " + kSlots[g_app.slotIndex].label;
 		g_app.screen = Screen::FigureList;
+	}
+
+	void ClearSelectedPad()
+	{
+		std::array<uint8_t, 5> message{}; // bytes 3-4 stay zero: reserved for LOAD/REMOVE
+		message[0] = kRemoveCommand;
+		message[1] = kSlots[g_app.slotIndex].pad;
+		message[2] = kSlots[g_app.slotIndex].index;
+
+		std::wstring error;
+		if (!SendToypadMessage(message.data(), message.size(), error))
+		{
+			g_app.status = error;
+			return;
+		}
+
+		g_app.padState[g_app.slotIndex] = PadSlot{};
+		g_app.status = std::wstring(L"CLEAR sent: ") + kSlots[g_app.slotIndex].label;
+		g_app.screen = Screen::FigureList;
+	}
+
+	// Moves whatever is tracked at moveSourceSlotIndex to destIndex. Called
+	// once the user has picked a destination pad in the PadViewer's
+	// move-destination mode.
+	void MoveToDestination(size_t destIndex)
+	{
+		if (destIndex == g_app.moveSourceSlotIndex)
+		{
+			// Same pad as source: nothing to send, and updating padState
+			// below would otherwise clear the slot (occupy-destination and
+			// clear-source would target the same array entry). Stay on this
+			// screen so the user can pick a different pad or back out.
+			g_app.status = L"That is already where it is. Pick a different pad, or B/Esc to cancel.";
+			return;
+		}
+
+		std::array<uint8_t, 5> message{};
+		message[0] = kMoveCommand;
+		message[1] = kSlots[destIndex].pad;
+		message[2] = kSlots[destIndex].index;
+		message[3] = kSlots[g_app.moveSourceSlotIndex].pad;
+		message[4] = kSlots[g_app.moveSourceSlotIndex].index;
+
+		std::wstring error;
+		if (!SendToypadMessage(message.data(), message.size(), error))
+		{
+			g_app.status = error;
+			return;
+		}
+
+		// Overwrite the destination if it was occupied, same as Load does,
+		// and clear the source now that it has moved away.
+		const std::wstring movedName = g_app.padState[g_app.moveSourceSlotIndex].figureName;
+		g_app.padState[destIndex].occupied = true;
+		g_app.padState[destIndex].figureName = movedName;
+		g_app.padState[g_app.moveSourceSlotIndex] = PadSlot{};
+
+		g_app.status = L"MOVE sent: " + movedName + L" (" + kSlots[g_app.moveSourceSlotIndex].label +
+			L" -> " + kSlots[destIndex].label + L")";
+		g_app.selectingMoveDestination = false;
+		g_app.screen = Screen::FigureList;
+	}
+
+	// Clears LegoToypad's own record of what is loaded where. Does not talk
+	// to Cemu at all - see the PadSlot comment for why this can drift and
+	// this exists as a manual "start tracking from scratch" reset.
+	void ResetPadView()
+	{
+		g_app.padState = {};
+		g_app.status = L"Pad view reset. This only clears LegoToypad's own tracking - nothing was sent to Cemu.";
 	}
 
 	void SelectPrevious(size_t count, size_t& index)
@@ -376,6 +498,36 @@ namespace
 			index = (index + 1) % count;
 	}
 
+	// Directional (not flat-list) navigation for the pad viewer's 1/3/3
+	// grid: 1 slot on the left, a 3-slot cluster in the center (one upper,
+	// two lower side by side), the same 3-slot cluster shape on the right.
+	// Matches the real Toypad geometry in kSlots/TOYPAD_TECHNICAL.md, not a
+	// generic row/column grid, since the shape is irregular. -1 in any
+	// direction means "nothing that way, stay put".
+	struct PadNeighbors { int up, down, left, right; };
+	constexpr std::array<PadNeighbors, 7> kPadNeighbors = {{
+		/* 0 Center - upper       */ {-1,  3,  1,  2},
+		/* 1 Left                 */ {-1, -1, -1,  0},
+		/* 2 Right - upper        */ {-1,  5,  0, -1},
+		/* 3 Center - lower left  */ { 0, -1,  1,  4},
+		/* 4 Center - lower right */ { 0, -1,  3,  2},
+		/* 5 Right - lower left   */ { 2, -1,  4,  6},
+		/* 6 Right - lower right  */ { 2, -1,  5, -1},
+	}};
+
+	void NavigatePadGrid(int dx, int dy)
+	{
+		const PadNeighbors& neighbors = kPadNeighbors[g_app.slotIndex];
+		int target = -1;
+		if (dy < 0) target = neighbors.up;
+		else if (dy > 0) target = neighbors.down;
+		else if (dx < 0) target = neighbors.left;
+		else if (dx > 0) target = neighbors.right;
+
+		if (target >= 0)
+			g_app.slotIndex = static_cast<size_t>(target);
+	}
+
 	void Navigate(int direction)
 	{
 		switch (g_app.screen)
@@ -386,11 +538,18 @@ namespace
 			else
 				SelectNext(g_app.figures.size(), g_app.figureIndex);
 			break;
-		case Screen::SlotList:
+		case Screen::PadViewer:
+			// Up/down through the generic Navigate() entry point (keyboard
+			// arrows, controller D-pad/stick up-down); left/right go through
+			// NavigatePadGrid directly from the input handlers instead, since
+			// this function only carries a single +-1 direction.
+			NavigatePadGrid(0, direction);
+			break;
+		case Screen::PadAction:
 			if (direction < 0)
-				SelectPrevious(kSlots.size(), g_app.slotIndex);
+				SelectPrevious(kPadActionCount, g_app.padActionIndex);
 			else
-				SelectNext(kSlots.size(), g_app.slotIndex);
+				SelectNext(kPadActionCount, g_app.padActionIndex);
 			break;
 		case Screen::Settings:
 			if (direction < 0)
@@ -546,16 +705,43 @@ namespace
 		{
 		case Screen::FigureList:
 			if (!g_app.figures.empty())
-				g_app.screen = Screen::SlotList;
+			{
+				g_app.screen = Screen::PadViewer;
+				g_app.selectingMoveDestination = false;
+			}
 			break;
-		case Screen::SlotList:
-			LoadSelectedFigure();
+		case Screen::PadViewer:
+			if (g_app.selectingMoveDestination)
+				MoveToDestination(g_app.slotIndex);
+			else
+			{
+				g_app.screen = Screen::PadAction;
+				g_app.padActionIndex = 0; // default to Load
+			}
+			break;
+		case Screen::PadAction:
+			switch (static_cast<PadActionKind>(g_app.padActionIndex))
+			{
+			case PadActionKind::Load:
+				LoadSelectedFigure();
+				break;
+			case PadActionKind::Clear:
+				ClearSelectedPad();
+				break;
+			case PadActionKind::Move:
+				g_app.moveSourceSlotIndex = g_app.slotIndex;
+				g_app.selectingMoveDestination = true;
+				g_app.screen = Screen::PadViewer;
+				break;
+			}
 			break;
 		case Screen::Settings:
 			if (g_app.settingsIndex == 0)
 				BeginShortcutCapture();
 			else if (g_app.settingsIndex == 1)
 				ScanFigures();
+			else if (g_app.settingsIndex == 2)
+				ResetPadView();
 			break;
 		}
 	}
@@ -569,8 +755,24 @@ namespace
 		}
 		switch (g_app.screen)
 		{
-		case Screen::SlotList:
-			g_app.screen = Screen::FigureList;
+		case Screen::PadViewer:
+			if (g_app.selectingMoveDestination)
+			{
+				// Cancel picking a destination and return to the action
+				// dialog for the original pad, still on Move, so the user
+				// can retry or pick something else instead.
+				g_app.selectingMoveDestination = false;
+				g_app.slotIndex = g_app.moveSourceSlotIndex;
+				g_app.screen = Screen::PadAction;
+				g_app.padActionIndex = static_cast<size_t>(PadActionKind::Move);
+			}
+			else
+			{
+				g_app.screen = Screen::FigureList;
+			}
+			break;
+		case Screen::PadAction:
+			g_app.screen = Screen::PadViewer;
 			break;
 		case Screen::Settings:
 			g_app.screen = Screen::FigureList;
@@ -647,12 +849,79 @@ namespace
 			ResetEvent(g_inputOwnershipEvent);
 	}
 
+	// Cell rectangles for the 7 pad slots, matching the real 1/3/3 (left /
+	// center / right) Toypad geometry in kSlots - not the 3/1/3 grouping
+	// from the original reference image, which doesn't match how Cemu
+	// actually maps pads. Sized for the fixed kOverlayWidth x kOverlayHeight
+	// window (this app isn't resizable).
+	constexpr std::array<RECT, 7> kPadCells = {{
+		{330, 130, 570, 260}, // 0 Center - upper
+		{ 60, 220, 230, 350}, // 1 Left
+		{630, 130, 860, 260}, // 2 Right - upper
+		{330, 280, 445, 410}, // 3 Center - lower left
+		{455, 280, 570, 410}, // 4 Center - lower right
+		{630, 280, 745, 410}, // 5 Right - lower left
+		{745, 280, 860, 410}, // 6 Right - lower right
+	}};
+
+	void DrawPadGrid(HDC dc)
+	{
+		for (size_t i = 0; i < kPadCells.size(); ++i)
+		{
+			const RECT& cell = kPadCells[i];
+			const bool selected = i == g_app.slotIndex;
+			const bool occupied = g_app.padState[i].occupied;
+			// While picking a Move destination, the pad being moved FROM is
+			// shown in its own color so it reads as "the source", not just
+			// another occupied cell you might overwrite by mistake.
+			const bool isMoveSource = g_app.selectingMoveDestination && i == g_app.moveSourceSlotIndex;
+
+			const COLORREF fill = occupied ? RGB(40, 66, 48) : RGB(32, 37, 48);
+			COLORREF border = selected ? RGB(255, 204, 51) : (occupied ? RGB(88, 168, 108) : RGB(70, 76, 90));
+			if (isMoveSource)
+				border = RGB(90, 150, 230);
+
+			HBRUSH fillBrush = CreateSolidBrush(fill);
+			HPEN borderPen = CreatePen(PS_SOLID, selected ? 3 : 2, border);
+			HGDIOBJ oldBrush = SelectObject(dc, fillBrush);
+			HGDIOBJ oldPen = SelectObject(dc, borderPen);
+			RoundRect(dc, cell.left, cell.top, cell.right, cell.bottom, 14, 14);
+			SelectObject(dc, oldBrush);
+			SelectObject(dc, oldPen);
+			DeleteObject(fillBrush);
+			DeleteObject(borderPen);
+
+			const int cellWidth = cell.right - cell.left;
+			DrawTextLine(dc, kSlots[i].label, cell.left + 10, cell.top + 6, cellWidth - 20, RGB(170, 178, 190), 20);
+			const int nameY = cell.top + 30;
+			const int nameHeight = (cell.bottom - cell.top) - 36;
+			DrawTextLine(dc, occupied ? g_app.padState[i].figureName : L"(empty)",
+				cell.left + 10, nameY, cellWidth - 20,
+				occupied ? RGB(226, 240, 230) : RGB(110, 116, 128), nameHeight);
+		}
+	}
+
 	void Paint(HWND window)
 	{
 		PAINTSTRUCT paint{};
-		HDC dc = BeginPaint(window, &paint);
+		HDC windowDC = BeginPaint(window, &paint);
 		RECT client{};
 		GetClientRect(window, &client);
+		const int width = client.right - client.left;
+		const int height = client.bottom - client.top;
+
+		// Everything below is drawn into an off-screen buffer first, then
+		// presented in one BitBlt at the end. Drawing the background fill
+		// and then content directly on the window's own surface (the
+		// original approach) is visibly flickery on a layered window, since
+		// DWM can composite a half-drawn frame; building the whole frame
+		// off-screen and blitting it atomically avoids that. The local name
+		// `dc` is kept for the memory DC so none of the drawing calls below
+		// need to change - only this setup/teardown differs from before.
+		HDC dc = CreateCompatibleDC(windowDC);
+		HBITMAP bitmap = CreateCompatibleBitmap(windowDC, width, height);
+		HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+
 		HBRUSH background = CreateSolidBrush(RGB(20, 24, 33));
 		FillRect(dc, &client, background);
 		DeleteObject(background);
@@ -664,7 +933,6 @@ namespace
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
 		SelectObject(dc, font);
 
-		const int width = client.right - client.left;
 		SelectObject(dc, titleFont);
 		DrawTextLine(dc, L"LEGO Dimensions Toypad Picker", 24, 18, width - 48, RGB(255, 204, 51), 40);
 		SelectObject(dc, font);
@@ -690,23 +958,51 @@ namespace
 				DrawTextLine(dc, g_app.figures[index].label, 30, y, width - 60, selected ? RGB(255, 255, 255) : RGB(228, 232, 238));
 			}
 		}
-		else if (g_app.screen == Screen::SlotList)
+		else if (g_app.screen == Screen::PadViewer)
 		{
-			DrawTextLine(dc, L"Choose a Toypad position  |  B or Esc: back  |  A or Enter: send", 24, 64, width - 48, RGB(224, 230, 237));
-			DrawTextLine(dc, g_app.figures[g_app.figureIndex].label, 24, 96, width - 48, RGB(255, 204, 51));
-			for (size_t index = 0; index < kSlots.size(); ++index)
+			if (g_app.selectingMoveDestination)
 			{
-				const int y = 146 + static_cast<int>(index) * 40;
-				const bool selected = index == g_app.slotIndex;
+				DrawTextLine(dc, L"Choose where to move it  |  D-pad/stick: move  |  A/Enter: confirm  |  B/Esc: cancel",
+					24, 64, width - 48, RGB(224, 230, 237));
+				DrawTextLine(dc, L"Moving " + g_app.padState[g_app.moveSourceSlotIndex].figureName +
+					L" from " + kSlots[g_app.moveSourceSlotIndex].label, 24, 96, width - 48, RGB(255, 204, 51));
+			}
+			else
+			{
+				DrawTextLine(dc, L"Choose a Toypad position  |  D-pad/stick: move  |  A/Enter: select  |  B/Esc: back",
+					24, 64, width - 48, RGB(224, 230, 237));
+				DrawTextLine(dc, g_app.figures[g_app.figureIndex].label, 24, 96, width - 48, RGB(255, 204, 51));
+			}
+			DrawPadGrid(dc);
+		}
+		else if (g_app.screen == Screen::PadAction)
+		{
+			const PadSlot& target = g_app.padState[g_app.slotIndex];
+			DrawTextLine(dc, L"What do you want to do?  |  D-pad/stick: move  |  A/Enter: confirm  |  B/Esc: back",
+				24, 64, width - 48, RGB(224, 230, 237));
+			DrawTextLine(dc, g_app.figures[g_app.figureIndex].label + L"  ->  " + kSlots[g_app.slotIndex].label,
+				24, 96, width - 48, RGB(255, 204, 51));
+
+			const std::array<std::wstring, kPadActionCount> options = {
+				L"Load " + g_app.figures[g_app.figureIndex].label + L" here" +
+					(target.occupied ? (L" (overwrites " + target.figureName + L")") : L""),
+				target.occupied ? (L"Clear this pad (removes " + target.figureName + L")")
+								 : L"Clear this pad (already empty)",
+				target.occupied ? (L"Move " + target.figureName + L" from here to another pad")
+								 : L"Move (this pad is empty, nothing to move)",
+			};
+			for (size_t index = 0; index < options.size(); ++index)
+			{
+				const int y = 150 + static_cast<int>(index) * 44;
+				const bool selected = index == g_app.padActionIndex;
 				if (selected)
 				{
-					RECT selection{18, y - 2, width - 18, y + 34};
+					RECT selection{18, y - 2, width - 18, y + 36};
 					HBRUSH brush = CreateSolidBrush(RGB(36, 99, 170));
 					FillRect(dc, &selection, brush);
 					DeleteObject(brush);
 				}
-				DrawTextLine(dc, L"Slot " + std::to_wstring(kSlots[index].index) + L" (pad " + std::to_wstring(kSlots[index].pad) + L"): " + kSlots[index].label,
-					30, y, width - 60, selected ? RGB(255, 255, 255) : RGB(228, 232, 238));
+				DrawTextLine(dc, options[index], 30, y, width - 60, selected ? RGB(255, 255, 255) : RGB(228, 232, 238), 34);
 			}
 		}
 		else // Screen::Settings
@@ -716,6 +1012,7 @@ namespace
 			const std::array<std::wstring, kSettingsItemCount> rows = {
 				L"Toggle shortcut: " + DescribeShortcut(),
 				L"Rescan figures",
+				L"Reset pad view (local tracking only, does not affect Cemu)",
 			};
 			for (size_t index = 0; index < rows.size(); ++index)
 			{
@@ -753,6 +1050,12 @@ namespace
 		SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
 		DeleteObject(font);
 		DeleteObject(titleFont);
+
+		BitBlt(windowDC, 0, 0, width, height, dc, 0, 0, SRCCOPY);
+
+		SelectObject(dc, oldBitmap);
+		DeleteObject(bitmap);
+		DeleteDC(dc);
 		EndPaint(window, &paint);
 	}
 
@@ -777,6 +1080,8 @@ namespace
 		WORD combinedPressed = 0;
 		bool stickUp = false;
 		bool stickDown = false;
+		bool stickLeft = false;
+		bool stickRight = false;
 
 		for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i)
 		{
@@ -792,6 +1097,10 @@ namespace
 					stickUp = true;
 				if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || state.Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
 					stickDown = true;
+				if ((buttons & XINPUT_GAMEPAD_DPAD_LEFT) || state.Gamepad.sThumbLX < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
+					stickLeft = true;
+				if ((buttons & XINPUT_GAMEPAD_DPAD_RIGHT) || state.Gamepad.sThumbLX > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
+					stickRight = true;
 			}
 			previousButtons[i] = buttons;
 		}
@@ -858,23 +1167,54 @@ namespace
 		if (!g_app.overlayVisible || GetForegroundWindow() != window || IsIconic(window) || !anyConnected)
 			return;
 
+		// Track whether anything actually changed this tick so the repaint
+		// below only fires when needed, instead of unconditionally on every
+		// ~16ms timer tick regardless of input. The old unconditional
+		// InvalidateRect here was a real contributor to the overlay's
+		// flickering: since Paint() runs a fresh BeginPaint/EndPaint (now
+		// also a fresh off-screen buffer, see Paint()) each time, invoking
+		// it ~60 times a second while sitting idle multiplied how often a
+		// partially-composited frame could be exposed.
+		bool changed = false;
+
 		if (combinedPressed & XINPUT_GAMEPAD_A)
+		{
 			Confirm();
+			changed = true;
+		}
 		if (combinedPressed & XINPUT_GAMEPAD_B)
+		{
 			Back(window);
+			changed = true;
+		}
 		if ((combinedPressed & XINPUT_GAMEPAD_Y) && g_app.screen == Screen::FigureList)
+		{
 			g_app.screen = Screen::Settings;
+			changed = true;
+		}
 
 		const DWORD now = GetTickCount();
-		if ((stickUp || stickDown) && now - lastNavigation >= 180)
+		const bool anyDirection = stickUp || stickDown || stickLeft || stickRight;
+		if (anyDirection && now - lastNavigation >= 180)
 		{
-			Navigate(stickUp ? -1 : 1);
+			if (g_app.screen == Screen::PadViewer)
+			{
+				const int dx = stickLeft ? -1 : (stickRight ? 1 : 0);
+				const int dy = stickUp ? -1 : (stickDown ? 1 : 0);
+				NavigatePadGrid(dx, dy);
+			}
+			else if (stickUp || stickDown)
+			{
+				Navigate(stickUp ? -1 : 1);
+			}
 			lastNavigation = now;
+			changed = true;
 		}
-		if (!stickUp && !stickDown)
+		if (!anyDirection)
 			lastNavigation = 0;
 
-		InvalidateRect(window, nullptr, FALSE);
+		if (changed)
+			InvalidateRect(window, nullptr, FALSE);
 	}
 
 	LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
@@ -924,6 +1264,14 @@ namespace
 			{
 			case VK_UP: Navigate(-1); break;
 			case VK_DOWN: Navigate(1); break;
+			case VK_LEFT:
+				if (g_app.screen == Screen::PadViewer)
+					NavigatePadGrid(-1, 0);
+				break;
+			case VK_RIGHT:
+				if (g_app.screen == Screen::PadViewer)
+					NavigatePadGrid(1, 0);
+				break;
 			case VK_RETURN: Confirm(); break;
 			case VK_ESCAPE: Back(window); break;
 			case 'S':
