@@ -88,4 +88,4 @@ Sends Cemu's LOAD message: a 5-byte header (command, pad, slot, two reserved zer
 ## Notes
 
 - No CMake/compiler was available in the environment these changes were written in, so this hasn't been compiled or run — please build and test on an actual Windows machine before relying on it.
-- The controller-exclusivity handoff (neutralizing real input while this app has focus) uses a named Windows event, `Local\CemuLegoToypadInputActive`. This string must match the corresponding check in the Cemu fork's `Controller.cpp` exactly, or the handoff will silently stop working.
+- The controller-exclusivity handoff (neutralizing real input while this app has focus) uses a named Windows event, `Local\CemuToypadPickerInputActive`. This string must match the corresponding check in the Cemu fork's `Controller.cpp` exactly, or the handoff will silently stop working.

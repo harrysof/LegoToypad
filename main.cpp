@@ -26,10 +26,12 @@ namespace
 	constexpr uint8_t kMoveCommand = 0x03;
 	constexpr UINT_PTR kControllerTimer = 1;
 	// NOTE: this string is a cross-repo contract with the Cemu fork's
-	// Controller.cpp, which waits on the same named event to know when to
-	// neutralize real controller input. If you change this string, update
-	// Controller.cpp to match or the handoff will silently stop working.
-	constexpr wchar_t kLegoToypadInputEvent[] = L"Local\\CemuLegoToypadInputActive";
+	// Controller.cpp, which opens this same named event and waits on it to
+	// know when to neutralize real controller input. It must match the
+	// kToypadPickerInputEvent constant in Cemu's src/input/api/Controller.cpp
+	// exactly (currently "Local\CemuToypadPickerInputActive") or the handoff
+	// will silently stop working.
+	constexpr wchar_t kLegoToypadInputEvent[] = L"Local\\CemuToypadPickerInputActive";
 
 	// Overlay window sizing.
 	constexpr int kOverlayWidth = 900;
@@ -603,6 +605,10 @@ namespace
 		SetWindowPos(window, HWND_TOPMOST, x, y, kOverlayWidth, kOverlayHeight, SWP_NOACTIVATE);
 	}
 
+	// Defined later in this file; declared here because ShowOverlay/HideOverlay
+	// assert and release input ownership synchronously around showing/hiding.
+	void UpdateInputOwnership(HWND window);
+
 	void ShowOverlay(HWND window)
 	{
 		if (g_app.overlayVisible)
@@ -613,9 +619,13 @@ namespace
 			g_app.previousForegroundWindow = currentForeground;
 
 		PositionOverlayWindow(window);
+		// Assert input ownership before the window becomes visible so there
+		// is no tick where Cemu can read the controller while the picker is
+		// showing (the 16ms poll alone was too slow for that handoff).
+		g_app.overlayVisible = true;
+		UpdateInputOwnership(window);
 		ShowWindow(window, SW_SHOW);
 		ForceForegroundWindow(window);
-		g_app.overlayVisible = true;
 		InvalidateRect(window, nullptr, FALSE);
 	}
 
@@ -627,6 +637,9 @@ namespace
 		ShowWindow(window, SW_HIDE);
 		g_app.overlayVisible = false;
 		g_app.capturingShortcut = false;
+		// Release ownership only once the overlay is hidden, so the very
+		// button press that closed it never reaches the game either.
+		UpdateInputOwnership(window);
 
 		if (g_app.previousForegroundWindow && IsWindow(g_app.previousForegroundWindow))
 			ForceForegroundWindow(g_app.previousForegroundWindow);
@@ -842,7 +855,14 @@ namespace
 		if (!g_inputOwnershipEvent)
 			return;
 
-		const bool ownsInput = g_app.overlayVisible && GetForegroundWindow() == window && !IsIconic(window);
+		// Ownership is keyed to the overlay being visible, not to it holding
+		// foreground focus. Requiring focus was how input leaked to Cemu:
+		// SetForegroundWindow can be refused from a background process (games
+		// frequently re-grab focus), so the event silently stayed clear and
+		// Cemu kept reading the pad. There is never a reason to let the game
+		// receive input while the picker is up, so visibility is the right
+		// condition.
+		const bool ownsInput = g_app.overlayVisible;
 		if (ownsInput)
 			SetEvent(g_inputOwnershipEvent);
 		else
