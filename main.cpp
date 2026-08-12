@@ -61,12 +61,18 @@ namespace
 		const wchar_t* label;
 	};
 
+	// pad = 1 is the CENTER pad, pad = 2 is the LEFT pad, pad = 3 is the RIGHT
+	// pad (this is the real toypad convention, confirmed by the USB protocol and
+	// by Cemu's own built-in toypad window, which renders pad 2 on the left and
+	// pad 1 in the middle). The toypad geometry is 3/1/3: the left section owns
+	// slots 0/3/4, the center section is the single slot 1, the right section
+	// owns slots 2/5/6.
 	constexpr std::array<ToypadSlot, 7> kSlots = {{
-		{2, 0, L"Center"},
-		{1, 1, L"Left"},
+		{2, 0, L"Left - upper"},
+		{1, 1, L"Center"},
 		{3, 2, L"Right - upper"},
-		{2, 3, L"Center - lower left"},
-		{2, 4, L"Center - lower right"},
+		{2, 3, L"Left - lower left"},
+		{2, 4, L"Left - lower right"},
 		{3, 5, L"Right - lower left"},
 		{3, 6, L"Right - lower right"},
 	}};
@@ -500,19 +506,19 @@ namespace
 			index = (index + 1) % count;
 	}
 
-	// Directional (not flat-list) navigation for the pad viewer's 1/3/3
-	// grid: 1 slot on the left, a 3-slot cluster in the center (one upper,
-	// two lower side by side), the same 3-slot cluster shape on the right.
-	// Matches the real Toypad geometry in kSlots/TOYPAD_TECHNICAL.md, not a
-	// generic row/column grid, since the shape is irregular. -1 in any
-	// direction means "nothing that way, stay put".
+	// Directional (not flat-list) navigation for the pad viewer's 3/1/3
+	// grid: 3 slots on the left (one upper, two lower side by side), a single
+	// slot in the center, the same 3-slot cluster shape on the right.
+	// Matches the real Toypad geometry in kSlots, not a generic row/column
+	// grid, since the shape is irregular. -1 in any direction means "nothing
+	// that way, stay put".
 	struct PadNeighbors { int up, down, left, right; };
 	constexpr std::array<PadNeighbors, 7> kPadNeighbors = {{
-		/* 0 Center - upper       */ {-1,  3,  1,  2},
-		/* 1 Left                 */ {-1, -1, -1,  0},
-		/* 2 Right - upper        */ {-1,  5,  0, -1},
-		/* 3 Center - lower left  */ { 0, -1,  1,  4},
-		/* 4 Center - lower right */ { 0, -1,  3,  2},
+		/* 0 Left - upper         */ {-1,  3, -1,  1},
+		/* 1 Center               */ {-1, -1,  0,  2},
+		/* 2 Right - upper        */ {-1,  5,  1, -1},
+		/* 3 Left - lower left    */ { 0, -1, -1,  4},
+		/* 4 Left - lower right   */ { 0, -1,  3,  5},
 		/* 5 Right - lower left   */ { 2, -1,  4,  6},
 		/* 6 Right - lower right  */ { 2, -1,  5, -1},
 	}};
@@ -869,17 +875,17 @@ namespace
 			ResetEvent(g_inputOwnershipEvent);
 	}
 
-	// Cell rectangles for the 7 pad slots, matching the real 1/3/3 (left /
-	// center / right) Toypad geometry in kSlots - not the 3/1/3 grouping
-	// from the original reference image, which doesn't match how Cemu
-	// actually maps pads. Sized for the fixed kOverlayWidth x kOverlayHeight
-	// window (this app isn't resizable).
+	// Cell rectangles for the 7 pad slots, matching the real 3/1/3 (left /
+	// center / right) Toypad geometry in kSlots: the left section (pad 2) is
+	// the upper slot plus its two lower slots, the center pad (pad 1) is a
+	// single slot, and the right section (pad 3) mirrors the left. Sized for
+	// the fixed kOverlayWidth x kOverlayHeight window (this app isn't resizable).
 	constexpr std::array<RECT, 7> kPadCells = {{
-		{330, 130, 570, 260}, // 0 Center - upper
-		{ 60, 220, 230, 350}, // 1 Left
+		{ 60, 130, 230, 260}, // 0 Left - upper
+		{330, 130, 570, 260}, // 1 Center
 		{630, 130, 860, 260}, // 2 Right - upper
-		{330, 280, 445, 410}, // 3 Center - lower left
-		{455, 280, 570, 410}, // 4 Center - lower right
+		{ 60, 280, 180, 410}, // 3 Left - lower left
+		{180, 280, 300, 410}, // 4 Left - lower right
 		{630, 280, 745, 410}, // 5 Right - lower left
 		{745, 280, 860, 410}, // 6 Right - lower right
 	}};
