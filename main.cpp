@@ -400,11 +400,20 @@ namespace
 			return;
 		}
 
-		std::array<uint8_t, 5 + kTagSize> message{};
+		// Header + tag + 2-byte little-endian UTF-8 path length + path bytes.
+		// The path lets Cemu attach a real FileStream so game writes persist
+		// to the source .bin, like Cemu's built-in toypad window.
+		const std::u8string pathU8 = g_app.figures[g_app.figureIndex].path.u8string();
+		const std::string pathUtf8(reinterpret_cast<const char*>(pathU8.data()), pathU8.size());
+		const uint16_t pathLength = static_cast<uint16_t>(pathUtf8.size());
+		std::vector<uint8_t> message(5 + kTagSize + 2 + pathUtf8.size());
 		message[0] = kLoadCommand;
 		message[1] = kSlots[g_app.slotIndex].pad;
 		message[2] = kSlots[g_app.slotIndex].index;
 		std::copy(tagData.begin(), tagData.end(), message.begin() + 5);
+		message[5 + kTagSize] = static_cast<uint8_t>(pathLength & 0xFF);
+		message[5 + kTagSize + 1] = static_cast<uint8_t>(pathLength >> 8);
+		std::copy(pathUtf8.begin(), pathUtf8.end(), message.begin() + 5 + kTagSize + 2);
 
 		std::wstring error;
 		if (!SendToypadMessage(message.data(), message.size(), error))
