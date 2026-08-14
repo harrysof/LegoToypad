@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <Xinput.h>
 #include <shellapi.h>
+#include <gdiplus.h>
 
 #include <algorithm>
 #include <array>
@@ -10,13 +11,16 @@
 #include <cstdint>
 #include <cwchar>
 #include <filesystem>
-#include <fstream>
+#include <map>
 #include <string>
 #include <vector>
+
+#include "GeneratedAssetTable.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "xinput9_1_0.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "gdiplus.lib")
 
 namespace
 {
@@ -33,7 +37,9 @@ namespace
 	// will silently stop working.
 	constexpr wchar_t kLegoToypadInputEvent[] = L"Local\\CemuToypadPickerInputActive";
 
-	// Overlay window sizing.
+	// Overlay window sizing. All assets (portraits, logos, background,
+	// wordmark, tag .bins) are compiled into the exe as resources at build
+	// time by generate_assets.py - nothing is read from disk at runtime.
 	constexpr int kOverlayWidth = 900;
 	constexpr int kOverlayHeight = 610;
 	constexpr BYTE kOverlayAlpha = 235; // 0-255, uniform translucency for the whole panel.
@@ -47,12 +53,6 @@ namespace
 
 	// Global toggle hotkey id (used only when the shortcut type is Keyboard).
 	constexpr UINT kToggleHotkeyId = 1;
-
-	struct Figure
-	{
-		std::filesystem::path path;
-		std::wstring label;
-	};
 
 	struct ToypadSlot
 	{
@@ -115,13 +115,15 @@ namespace
 
 	enum class Screen
 	{
-		FigureList,
-		PadViewer,
-		PadAction,
+		PadViewer,     // 7 gloss pads; initial screen. Choose a pad.
+		PadAction,     // floating capsule menu above the pad: Load / Clear / Move
+		FranchiseList, // grid of the 30 world (franchise) tiles
+		RosterList,    // that world's characters + vehicles as circular portraits
+		PlusPicker,    // capsule listing a multi-build vehicle's builds by number
 		Settings,
 	};
 
-	// The 3-option dialog shown after picking a pad in PadViewer.
+	// The 3-option capsule shown after picking a pad in PadViewer.
 	enum class PadActionKind
 	{
 		Load,
@@ -130,7 +132,7 @@ namespace
 	};
 	constexpr size_t kPadActionCount = 3;
 
-	constexpr size_t kSettingsItemCount = 3; // 0: change shortcut, 1: rescan figures, 2: reset pad view
+	constexpr size_t kSettingsItemCount = 2; // 0: change shortcut, 1: reset pad view
 
 	enum class ShortcutType
 	{
@@ -148,15 +150,24 @@ namespace
 	{
 		bool occupied = false;
 		std::wstring figureName;
+		int portraitResourceId = 0;
+		unsigned int ringColor = 0;
+	};
+
+	// One flat slot in the roster grid: either a character portrait, a
+	// vehicle's build-1 portrait, or the "+" tile of a multi-build vehicle.
+	struct RosterSlot
+	{
+		enum class Kind { Character, Vehicle, Plus } kind = Kind::Character;
+		const RosterEntry* entry = nullptr;    // Character / Vehicle (build 1)
+		const VehicleGroup* group = nullptr;   // Plus tile
 	};
 
 	struct AppState
 	{
-		std::vector<Figure> figures;
-		std::filesystem::path binRoot;
-		Screen screen = Screen::FigureList;
-		size_t figureIndex = 0;
+		Screen screen = Screen::PadViewer;
 		size_t slotIndex = 0;
+		size_t padActionIndex = 0;
 		size_t settingsIndex = 0;
 		uint16_t port = 9191;
 		std::wstring status;
@@ -176,37 +187,635 @@ namespace
 		bool shortcutCaptureArmed = false;
 
 		std::array<PadSlot, 7> padState{};
-		size_t padActionIndex = 0;
 		// True while PadViewer is being shown specifically to pick a Move's
 		// destination pad, rather than the normal "pick a pad to act on"
 		// mode. Reuses the same screen/grid per the original design intent.
 		bool selectingMoveDestination = false;
 		size_t moveSourceSlotIndex = 0;
+
+		// Franchise / roster browsing state.
+		size_t franchiseIndex = 0;
+		std::vector<RosterSlot> rosterSlots;
+		size_t rosterIndex = 0;
+		int rosterTopRow = 0; // first visible roster row (scrolled grids)
+		const VehicleGroup* plusGroup = nullptr;
+		size_t plusBuildIndex = 0;
 	};
 
 	AppState g_app;
 	HANDLE g_inputOwnershipEvent = nullptr;
+
+	// Forward-declared here; defined later in the file. Confirm()/Back() run
+	// before those definitions appear.
+	void UpdateInputOwnership(HWND window);
+	void HideOverlay(HWND window);
+	void BeginShortcutCapture();
+	void CancelShortcutCapture();
+
+	// ---------------------------------------------------------------------
+	// GDI+ plumbing
+	// ---------------------------------------------------------------------
+
+	ULONG_PTR g_gdiplusToken = 0;
+
+	// Cached off-screen glossy/glowing bitmaps, keyed by (kind, state, ids).
+	// Every frame paints by DrawImage-ing these; the expensive gradient and
+	// glow construction below only happens once per distinct visual state.
+	enum class GlossKind : int
+	{
+		Pad,
+		Portrait,     // circular photo portrait
+		PlusTile,     // "+" tile
+		Placeholder,  // circular letter plate for entries without a portrait
+		FranchiseTile,
+		Pill,         // capsule menu background
+		PillRow,      // capsule focus highlight row
+		Background,   // full-window starfield + dark overlay
+	};
+
+	struct GlossKey
+	{
+		GlossKind kind;
+		int variant;      // per-kind state (pad visual, focused flag, row count...)
+		int resId;        // 0 when the kind has no image payload
+		unsigned int color;
+		int w;
+		int h;
+		bool operator<(const GlossKey& other) const
+		{
+			if (kind != other.kind) return static_cast<int>(kind) < static_cast<int>(other.kind);
+			if (variant != other.variant) return variant < other.variant;
+			if (resId != other.resId) return resId < other.resId;
+			if (color != other.color) return color < other.color;
+			if (w != other.w) return w < other.w;
+			return h < other.h;
+		}
+	};
+
+	std::map<GlossKey, Gdiplus::Bitmap*> g_glossCache;
+
+	struct AssetImage
+	{
+		Gdiplus::Bitmap* bitmap = nullptr;
+		IStream* stream = nullptr;
+	};
+
+	std::map<int, AssetImage> g_assetImages;
+
+	// Raw payload of an embedded resource (tag bytes, png bytes...). Owned
+	// by the module; the pointer stays valid for the app's lifetime.
+	const uint8_t* GetResourceBytes(int resId, DWORD& sizeOut)
+	{
+		const HRSRC resource = FindResourceW(nullptr, MAKEINTRESOURCEW(resId), RT_RCDATA);
+		if (!resource)
+			return nullptr;
+		const HGLOBAL loaded = LoadResource(nullptr, resource);
+		if (!loaded)
+			return nullptr;
+		sizeOut = SizeofResource(nullptr, resource);
+		return static_cast<const uint8_t*>(LockResource(loaded));
+	}
+
+	std::vector<uint8_t> LoadResourceBytes(int resId)
+	{
+		DWORD size = 0;
+		const uint8_t* data = GetResourceBytes(resId, size);
+		if (!data)
+			return {};
+		return std::vector<uint8_t>(data, data + size);
+	}
+
+	// GDI+ bitmap decoded from an embedded image resource, cached per id.
+	// GDI+ needs the IStream it was decoded from to stay alive for the
+	// Bitmap's lifetime, so both are cached together and freed at shutdown.
+	Gdiplus::Bitmap* GetAssetBitmap(int resId)
+	{
+		if (resId == 0)
+			return nullptr;
+		const auto existing = g_assetImages.find(resId);
+		if (existing != g_assetImages.end())
+			return existing->second.bitmap;
+
+		DWORD size = 0;
+		const uint8_t* data = GetResourceBytes(resId, size);
+		if (!data || size == 0)
+			return nullptr;
+
+		// CreateStreamOnHGlobal requires a GlobalAlloc handle, so the
+		// payload is staged into one (transient; freed when the stream is
+		// released).
+		const HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, size);
+		if (!hGlobal)
+			return nullptr;
+		void* const destination = GlobalLock(hGlobal);
+		if (!destination)
+		{
+			GlobalFree(hGlobal);
+			return nullptr;
+		}
+		memcpy(destination, data, size);
+		GlobalUnlock(hGlobal);
+
+		IStream* stream = nullptr;
+		if (FAILED(CreateStreamOnHGlobal(hGlobal, TRUE, &stream)) || !stream)
+		{
+			GlobalFree(hGlobal);
+			return nullptr;
+		}
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(stream, FALSE);
+		if (bitmap->GetLastStatus() != Gdiplus::Ok)
+		{
+			delete bitmap;
+			stream->Release();
+			return nullptr;
+		}
+
+		AssetImage entry;
+		entry.bitmap = bitmap;
+		entry.stream = stream;
+		g_assetImages[resId] = entry;
+		return bitmap;
+	}
+
+	void ReleaseAssetImages()
+	{
+		for (auto& [id, entry] : g_assetImages)
+		{
+			delete entry.bitmap;
+			entry.stream->Release();
+		}
+		g_assetImages.clear();
+	}
+
+	void ReleaseGlossCache()
+	{
+		for (auto& [key, bitmap] : g_glossCache)
+			delete bitmap;
+		g_glossCache.clear();
+	}
+
+	// ---------------------------------------------------------------------
+	// Glossy / glowing shape renderers (each runs ONCE per cached state)
+	// ---------------------------------------------------------------------
+
+	constexpr unsigned int kGlowGold = 0x00FFCC33;    // selection glow everywhere
+	constexpr unsigned int kGlowBlue = 0x005A96E0;    // move-source pads
+	constexpr unsigned int kPadBorderIdle = 0x00525A6A;
+	constexpr unsigned int kPadBorderOccupied = 0x0060B476;
+
+	void AddRoundedRectPath(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect, float radius)
+	{
+		const float diameter = radius * 2.0f;
+		const float right = rect.X + rect.Width;
+		const float bottom = rect.Y + rect.Height;
+		path.Reset();
+		path.AddArc(rect.X, rect.Y, diameter, diameter, 180.0f, 90.0f);
+		path.AddArc(right - diameter, rect.Y, diameter, diameter, 270.0f, 90.0f);
+		path.AddArc(right - diameter, bottom - diameter, diameter, diameter, 0.0f, 90.0f);
+		path.AddArc(rect.X, bottom - diameter, diameter, diameter, 90.0f, 90.0f);
+		path.CloseFigure();
+	}
+
+	// Concentric stroke halo around a path: widest & faintest outside,
+	// narrowing and brightening toward the edge. Cheap, no blur needed.
+	void DrawGlowPath(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& path, unsigned int color,
+		int strokes, float firstWidth, float widthStep, BYTE firstAlpha, BYTE alphaStep)
+	{
+		for (int i = 0; i < strokes; ++i)
+		{
+			const float width = firstWidth - widthStep * static_cast<float>(i);
+			const BYTE alpha = static_cast<BYTE>(firstAlpha + alphaStep * i);
+			Gdiplus::Pen pen(Gdiplus::Color(alpha, GetRValue(color), GetGValue(color), GetBValue(color)), width);
+			pen.SetLineJoin(Gdiplus::LineJoinRound);
+			g.DrawPath(&pen, &path);
+		}
+	}
+
+	void DrawTopGloss(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& clipPath, int width, int height)
+	{
+		Gdiplus::Region clip(&clipPath);
+		g.SetClip(&clip);
+		Gdiplus::LinearGradientBrush gloss(
+			Gdiplus::RectF(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)),
+			Gdiplus::Color(70, 255, 255, 255), Gdiplus::Color(0, 255, 255, 255),
+			Gdiplus::LinearGradientModeVertical);
+		g.FillRectangle(&gloss, 0, 0, width, height);
+		g.ResetClip();
+	}
+
+	enum class PadVisual : int
+	{
+		Idle,
+		IdleSelected,
+		Occupied,
+		OccupiedSelected,
+		MoveSource,
+	};
+
+	// Glossy rounded-rect pad. `cell` is the real slot rect; the returned
+	// bitmap is padded by kPadGlowMargin so the gold/blue halo has room.
+	constexpr int kPadGlowMargin = 6;
+
+	Gdiplus::Bitmap* RenderPad(const RECT& cell, PadVisual visual)
+	{
+		const int w = (cell.right - cell.left) + kPadGlowMargin * 2;
+		const int h = (cell.bottom - cell.top) + kPadGlowMargin * 2;
+		const GlossKey key{GlossKind::Pad, static_cast<int>(visual), 0, 0, w, h};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
+		Gdiplus::Graphics g(bitmap);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+		const Gdiplus::RectF rect(static_cast<float>(kPadGlowMargin), static_cast<float>(kPadGlowMargin),
+			static_cast<float>(cell.right - cell.left), static_cast<float>(cell.bottom - cell.top));
+		Gdiplus::GraphicsPath path;
+		AddRoundedRectPath(path, rect, 14.0f);
+
+		const bool selected = visual == PadVisual::IdleSelected || visual == PadVisual::OccupiedSelected;
+		const bool occupied = visual == PadVisual::Occupied || visual == PadVisual::OccupiedSelected;
+		const bool moveSource = visual == PadVisual::MoveSource;
+
+		if (selected)
+			DrawGlowPath(g, path, kGlowGold, 5, 9.0f, 1.5f, 22, 22);
+		else if (moveSource)
+			DrawGlowPath(g, path, kGlowBlue, 5, 9.0f, 1.5f, 22, 22);
+
+		const unsigned int topColor = occupied ? 0x00344A3E : 0x002A3040;
+		const unsigned int bottomColor = occupied ? 0x00182A1E : 0x00141A28;
+		Gdiplus::LinearGradientBrush fill(rect,
+			Gdiplus::Color(255, GetRValue(topColor), GetGValue(topColor), GetBValue(topColor)),
+			Gdiplus::Color(255, GetRValue(bottomColor), GetGValue(bottomColor), GetBValue(bottomColor)),
+			Gdiplus::LinearGradientModeVertical);
+		g.FillPath(&fill, &path);
+
+		DrawTopGloss(g, path, w, h);
+
+		const unsigned int border = moveSource ? kGlowBlue : (occupied ? kPadBorderOccupied : kPadBorderIdle);
+		Gdiplus::Pen borderPen(
+			Gdiplus::Color(255, GetRValue(border), GetGValue(border), GetBValue(border)),
+			selected ? 3.0f : 2.0f);
+		borderPen.SetLineJoin(Gdiplus::LineJoinRound);
+		g.DrawPath(&borderPen, &path);
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
+
+	// Circular portrait with a deterministic ring color; focused gets a
+	// brighter ring plus a colored glow. `diameter` is the circle size; the
+	// bitmap is padded by kPortraitMargin for the glow.
+	constexpr int kPortraitMargin = 8;
+
+	Gdiplus::Bitmap* RenderPortrait(int resId, unsigned int ringColor, bool focused, int diameter)
+	{
+		const int w = diameter + kPortraitMargin * 2;
+		const int h = w;
+		const int variant = focused ? 1 : 0;
+		const GlossKey key{GlossKind::Portrait, variant, resId, ringColor, w, h};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
+		Gdiplus::Graphics g(bitmap);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+
+		const float d = static_cast<float>(diameter);
+		const Gdiplus::RectF circle(static_cast<float>(kPortraitMargin), static_cast<float>(kPortraitMargin), d, d);
+		Gdiplus::GraphicsPath circlePath;
+		circlePath.AddEllipse(circle);
+
+		if (focused)
+			DrawGlowPath(g, circlePath, ringColor, 4, 8.0f, 1.5f, 26, 26);
+
+		Gdiplus::Bitmap* photo = GetAssetBitmap(resId);
+		if (photo)
+		{
+			// Cover-fit the photo inside the circle, then clip.
+			const float scale = std::max(d / photo->GetWidth(), d / photo->GetHeight());
+			const float drawW = photo->GetWidth() * scale;
+			const float drawH = photo->GetHeight() * scale;
+			const Gdiplus::RectF dest(kPortraitMargin + (d - drawW) / 2.0f,
+				kPortraitMargin + (d - drawH) / 2.0f, drawW, drawH);
+			Gdiplus::Region clip(&circlePath);
+			g.SetClip(&clip);
+			g.DrawImage(photo, dest);
+			g.ResetClip();
+		}
+		else
+		{
+			Gdiplus::LinearGradientBrush fallback(circle,
+				Gdiplus::Color(255, 46, 52, 64), Gdiplus::Color(255, 22, 26, 36),
+				Gdiplus::LinearGradientModeVertical);
+			g.FillEllipse(&fallback, circle);
+		}
+
+		// Glossy highlight on the upper-left of the sphere.
+		DrawTopGloss(g, circlePath, w, h);
+
+		// Coloring ring: idle is a thin subdued ring, focused is brighter
+		// and thicker, plus a dark inner rim for depth.
+		const BYTE ringAlpha = focused ? 255 : 170;
+		Gdiplus::Pen ringPen(Gdiplus::Color(ringAlpha, GetRValue(ringColor), GetGValue(ringColor), GetBValue(ringColor)),
+			focused ? 3.5f : 2.0f);
+		g.DrawEllipse(&ringPen, circle);
+		Gdiplus::Pen rimPen(Gdiplus::Color(70, 0, 0, 0), 1.0f);
+		g.DrawEllipse(&rimPen, circle);
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
+
+	// "+" tile for vehicles with more than one build; ring color follows
+	// the vehicle group (build 1's color).
+	Gdiplus::Bitmap* RenderPlusTile(unsigned int ringColor, bool focused, int diameter)
+	{
+		const int w = diameter + kPortraitMargin * 2;
+		const int h = w;
+		const int variant = focused ? 1 : 0;
+		const GlossKey key{GlossKind::PlusTile, variant, 0, ringColor, w, h};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
+		Gdiplus::Graphics g(bitmap);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+		const float d = static_cast<float>(diameter);
+		const Gdiplus::RectF circle(static_cast<float>(kPortraitMargin), static_cast<float>(kPortraitMargin), d, d);
+		Gdiplus::GraphicsPath circlePath;
+		circlePath.AddEllipse(circle);
+
+		if (focused)
+			DrawGlowPath(g, circlePath, ringColor, 4, 8.0f, 1.5f, 26, 26);
+
+		Gdiplus::LinearGradientBrush fill(circle,
+			Gdiplus::Color(255, 40, 46, 58), Gdiplus::Color(255, 18, 22, 30),
+			Gdiplus::LinearGradientModeVertical);
+		g.FillEllipse(&fill, circle);
+		DrawTopGloss(g, circlePath, w, h);
+
+		const float cx = kPortraitMargin + d / 2.0f;
+		const float bar = d * 0.22f;
+		Gdiplus::SolidBrush plusBrush(Gdiplus::Color(255, 235, 238, 244));
+		g.FillRectangle(&plusBrush, cx - 1.8f, kPortraitMargin + (d - bar) / 2.0f, 3.6f, bar);
+		g.FillRectangle(&plusBrush, kPortraitMargin + (d - bar) / 2.0f, cx - 1.8f, bar, 3.6f);
+
+		const BYTE ringAlpha = focused ? 255 : 170;
+		Gdiplus::Pen ringPen(Gdiplus::Color(ringAlpha, GetRValue(ringColor), GetGValue(ringColor), GetBValue(ringColor)),
+			focused ? 3.5f : 2.0f);
+		g.DrawEllipse(&ringPen, circle);
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
+
+	// Circular letter plate for entries whose portrait resource is missing.
+	Gdiplus::Bitmap* RenderPlaceholder(wchar_t initial, unsigned int ringColor, bool focused, int diameter)
+	{
+		const int w = diameter + kPortraitMargin * 2;
+		const int h = w;
+		const int variant = focused ? 1 : 0;
+		const GlossKey key{GlossKind::Placeholder, variant, static_cast<int>(initial), ringColor, w, h};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
+		Gdiplus::Graphics g(bitmap);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+		const float d = static_cast<float>(diameter);
+		const Gdiplus::RectF circle(static_cast<float>(kPortraitMargin), static_cast<float>(kPortraitMargin), d, d);
+		Gdiplus::GraphicsPath circlePath;
+		circlePath.AddEllipse(circle);
+
+		if (focused)
+			DrawGlowPath(g, circlePath, ringColor, 4, 8.0f, 1.5f, 26, 26);
+
+		Gdiplus::LinearGradientBrush fill(circle,
+			Gdiplus::Color(255, 46, 52, 64), Gdiplus::Color(255, 22, 26, 36),
+			Gdiplus::LinearGradientModeVertical);
+		g.FillEllipse(&fill, circle);
+		DrawTopGloss(g, circlePath, w, h);
+
+		Gdiplus::SolidBrush textBrush(Gdiplus::Color(255, 235, 238, 244));
+		Gdiplus::Font font(L"Segoe UI", std::max(12.0f, d * 0.32f), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+		Gdiplus::StringFormat format;
+		format.SetAlignment(Gdiplus::StringAlignmentCenter);
+		format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+		const wchar_t letter[2] = { initial == 0 ? L'?' : initial, L'\0' };
+		g.DrawString(letter, 1, &font, circle, &format, &textBrush);
+
+		const BYTE ringAlpha = focused ? 255 : 170;
+		Gdiplus::Pen ringPen(Gdiplus::Color(ringAlpha, GetRValue(ringColor), GetGValue(ringColor), GetBValue(ringColor)),
+			focused ? 3.5f : 2.0f);
+		g.DrawEllipse(&ringPen, circle);
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
+
+	// Franchise tile: rounded rect with the world logo and a gold glow
+	// stroke when focused.
+	Gdiplus::Bitmap* RenderFranchiseTile(int logoResourceId, bool focused)
+	{
+		constexpr int tileW = 140;
+		constexpr int tileH = 84;
+		constexpr int margin = 6;
+		const int w = tileW + margin * 2;
+		const int h = tileH + margin * 2;
+		const int variant = focused ? 1 : 0;
+		const GlossKey key{GlossKind::FranchiseTile, variant, logoResourceId, 0, w, h};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
+		Gdiplus::Graphics g(bitmap);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+
+		const Gdiplus::RectF rect(static_cast<float>(margin), static_cast<float>(margin),
+			static_cast<float>(tileW), static_cast<float>(tileH));
+		Gdiplus::GraphicsPath path;
+		AddRoundedRectPath(path, rect, 12.0f);
+
+		if (focused)
+			DrawGlowPath(g, path, kGlowGold, 5, 9.0f, 1.5f, 22, 22);
+
+		Gdiplus::LinearGradientBrush fill(rect,
+			Gdiplus::Color(255, 40, 46, 60), Gdiplus::Color(255, 20, 24, 34),
+			Gdiplus::LinearGradientModeVertical);
+		g.FillPath(&fill, &path);
+
+		Gdiplus::Bitmap* logo = GetAssetBitmap(logoResourceId);
+		if (logo)
+		{
+			// Contain-fit logo in the top area of the tile (name label
+			// lives below it, drawn per frame with GDI).
+			constexpr float logoAreaH = 50.0f;
+			const Gdiplus::RectF box(margin + 8.0f, margin + 4.0f, tileW - 16.0f, logoAreaH);
+			const float scale = std::min(box.Width / logo->GetWidth(), box.Height / logo->GetHeight());
+			const float drawW = logo->GetWidth() * scale;
+			const float drawH = logo->GetHeight() * scale;
+			const Gdiplus::RectF dest(box.X + (box.Width - drawW) / 2.0f, box.Y + (box.Height - drawH) / 2.0f, drawW, drawH);
+			Gdiplus::Region clip(&path);
+			g.SetClip(&clip);
+			g.DrawImage(logo, dest);
+			g.ResetClip();
+		}
+
+		DrawTopGloss(g, path, w, h);
+
+		Gdiplus::Pen borderPen(Gdiplus::Color(200, 88, 96, 112), 1.5f);
+		borderPen.SetLineJoin(Gdiplus::LineJoinRound);
+		g.DrawPath(&borderPen, &path);
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
+
+	// Capsule (pill) menu background; the focused option row is drawn on
+	// top as RenderPillRow. `rows` decides the height.
+	Gdiplus::Bitmap* RenderPill(int rows)
+	{
+		constexpr int rowH = 36;
+		constexpr int padV = 7;
+		constexpr int width = 340;
+		const int h = rows * rowH + padV * 2;
+		const GlossKey key{GlossKind::Pill, rows, 0, 0, width, h};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(width, h, PixelFormat32bppPARGB);
+		Gdiplus::Graphics g(bitmap);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+		const Gdiplus::RectF rect(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(h));
+		Gdiplus::GraphicsPath path;
+		AddRoundedRectPath(path, rect, static_cast<float>(h) / 2.0f);
+
+		Gdiplus::LinearGradientBrush fill(rect,
+			Gdiplus::Color(226, 22, 27, 38), Gdiplus::Color(226, 12, 15, 22),
+			Gdiplus::LinearGradientModeVertical);
+		g.FillPath(&fill, &path);
+
+		Gdiplus::Region clip(&path);
+		g.SetClip(&clip);
+		Gdiplus::LinearGradientBrush gloss(
+			Gdiplus::RectF(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(h)),
+			Gdiplus::Color(56, 255, 255, 255), Gdiplus::Color(0, 255, 255, 255),
+			Gdiplus::LinearGradientModeVertical);
+		g.FillRectangle(&gloss, 0, 0, width, h);
+		g.ResetClip();
+
+		Gdiplus::Pen borderPen(Gdiplus::Color(190, 104, 114, 132), 1.5f);
+		borderPen.SetLineJoin(Gdiplus::LineJoinRound);
+		g.DrawPath(&borderPen, &path);
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
+
+	Gdiplus::Bitmap* RenderPillRow(bool focused)
+	{
+		constexpr int rowW = 340 - 16;
+		constexpr int rowH = 36;
+		const int variant = focused ? 1 : 0;
+		const GlossKey key{GlossKind::PillRow, variant, 0, 0, rowW, rowH};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(rowW, rowH, PixelFormat32bppPARGB);
+		Gdiplus::Graphics g(bitmap);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+		const Gdiplus::RectF rect(0.0f, 0.0f, static_cast<float>(rowW), static_cast<float>(rowH));
+		Gdiplus::GraphicsPath path;
+		AddRoundedRectPath(path, rect, 14.0f);
+		if (focused)
+			DrawGlowPath(g, path, kGlowGold, 4, 7.0f, 1.5f, 24, 26);
+
+		if (focused)
+		{
+			Gdiplus::LinearGradientBrush fill(rect,
+				Gdiplus::Color(255, 58, 110, 176), Gdiplus::Color(255, 32, 74, 130),
+				Gdiplus::LinearGradientModeVertical);
+			g.FillPath(&fill, &path);
+		}
+		else
+		{
+			Gdiplus::SolidBrush fill(Gdiplus::Color(255, 26, 31, 42));
+			g.FillPath(&fill, &path);
+		}
+		DrawTopGloss(g, path, rowW, rowH);
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
+
+	// Full-window background: the starfield resource scaled to cover the
+	// window, with a dark overlay baked in for text legibility.
+	Gdiplus::Bitmap* RenderBackground(int width, int height)
+	{
+		const GlossKey key{GlossKind::Background, 0, kBackgroundResourceId, 0, width, height};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(width, height, PixelFormat32bppPARGB);
+		Gdiplus::Graphics g(bitmap);
+		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+
+		Gdiplus::Bitmap* background = GetAssetBitmap(kBackgroundResourceId);
+		if (background)
+		{
+			const float scale = std::max(static_cast<float>(width) / background->GetWidth(),
+				static_cast<float>(height) / background->GetHeight());
+			const float drawW = background->GetWidth() * scale;
+			const float drawH = background->GetHeight() * scale;
+			const Gdiplus::RectF dest((width - drawW) / 2.0f, (height - drawH) / 2.0f, drawW, drawH);
+			g.DrawImage(background, dest);
+		}
+		Gdiplus::SolidBrush overlay(Gdiplus::Color(96, 8, 10, 16));
+		g.FillRectangle(&overlay, 0, 0, width, height);
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
+
+	// ---------------------------------------------------------------------
+	// Basic GDI text helpers
+	// ---------------------------------------------------------------------
+
+	void DrawTextLine(HDC dc, const std::wstring& text, int x, int y, int width, COLORREF color, int height = 30)
+	{
+		SetTextColor(dc, color);
+		RECT rect{x, y, x + width, y + height};
+		DrawTextW(dc, text.c_str(), -1, &rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+	}
+
+	void DrawTextLineCentered(HDC dc, const std::wstring& text, int x, int y, int width, COLORREF color, int height = 30)
+	{
+		SetTextColor(dc, color);
+		RECT rect{x, y, x + width, y + height};
+		DrawTextW(dc, text.c_str(), -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+	}
 
 	std::filesystem::path GetExecutableDirectory()
 	{
 		std::array<wchar_t, 32768> path{};
 		const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
 		return length == 0 ? std::filesystem::current_path() : std::filesystem::path(path.data()).parent_path();
-	}
-
-	std::filesystem::path FindBinRoot()
-	{
-		std::filesystem::path directory = GetExecutableDirectory();
-		for (int i = 0; i != 10; ++i)
-		{
-			const auto candidate = directory / L"Lego Dimensions Organized bins";
-			if (std::filesystem::is_directory(candidate))
-				return candidate;
-			if (!directory.has_parent_path())
-				break;
-			directory = directory.parent_path();
-		}
-		return {};
 	}
 
 	uint16_t ReadPort()
@@ -306,41 +915,19 @@ namespace
 	}
 
 	// ---------------------------------------------------------------------
-
-	void ScanFigures()
-	{
-		g_app.figures.clear();
-		g_app.binRoot = FindBinRoot();
-		if (g_app.binRoot.empty())
-		{
-			g_app.status = L"Could not find the 'Lego Dimensions Organized bins' folder.";
-			return;
-		}
-
-		for (const auto& entry : std::filesystem::recursive_directory_iterator(g_app.binRoot))
-		{
-			if (!entry.is_regular_file() || entry.path().extension() != L".bin")
-				continue;
-			if (entry.file_size() != kTagSize)
-				continue;
-
-			const auto relative = std::filesystem::relative(entry.path(), g_app.binRoot);
-			const std::wstring theme = relative.parent_path().wstring();
-			g_app.figures.push_back({entry.path(), theme + L"  |  " + entry.path().stem().wstring()});
-		}
-
-		std::sort(g_app.figures.begin(), g_app.figures.end(), [](const Figure& left, const Figure& right) {
-			return _wcsicmp(left.label.c_str(), right.label.c_str()) < 0;
-		});
-
-		if (g_app.figureIndex >= g_app.figures.size())
-			g_app.figureIndex = 0;
-
-		g_app.status = (g_app.figures.empty()
-			? std::wstring(L"No valid 180-byte .bin files were found.")
-			: std::to_wstring(g_app.figures.size()) + L" figures ready. Listener port: " + std::to_wstring(g_app.port))
-			+ L" | Toggle: " + DescribeShortcut();
-	}
+	// Wire protocol (cross-repo contract with Cemu's toypad listener).
+	//
+	// LOAD:   5-byte header (0x01, pad, index, 0x00, 0x00) + 180 tag bytes +
+	//         2-byte little-endian path length + UTF-8 path bytes.
+	// REMOVE: 5-byte header (0x02, pad, index, 0x00, 0x00).
+	// MOVE:   5-byte header (0x03, destPad, destIndex, srcPad, srcIndex).
+	//
+	// The byte layout is unchanged from before. The one difference: tag data
+	// now comes from embedded resources, and since there is no on-disk .bin
+	// anymore the LOAD path is empty (length 0), so Cemu can't attach a
+	// persistent FileStream back to a source file - game writes stay in
+	// Cemu's memory for the session instead.
+	// ---------------------------------------------------------------------
 
 	bool SendAll(SOCKET socket, const uint8_t* data, size_t length)
 	{
@@ -387,33 +974,39 @@ namespace
 		return true;
 	}
 
-	void LoadSelectedFigure()
+	std::wstring EntryDisplayName(const RosterEntry& entry)
 	{
-		if (g_app.figures.empty())
-			return;
+		if (entry.buildNumber > 1)
+			return entry.name + L" \u00b7 Build " + std::to_wstring(entry.buildNumber);
+		return entry.name;
+	}
 
-		std::array<uint8_t, kTagSize> tagData{};
-		std::ifstream file(g_app.figures[g_app.figureIndex].path, std::ios::binary);
-		if (!file.read(reinterpret_cast<char*>(tagData.data()), tagData.size()) || file.gcount() != tagData.size())
+	// Sources the tag bytes from the embedded resource and sends the same
+	// LOAD message as before, to whatever pad slot the user picked.
+	void LoadRosterEntryToPad(const RosterEntry& entry)
+	{
+		if (entry.binResourceId == 0)
 		{
-			g_app.status = L"Could not read the selected 180-byte tag file.";
+			g_app.status = L"Missing tag data for this entry.";
 			return;
 		}
 
-		// Header + tag + 2-byte little-endian UTF-8 path length + path bytes.
-		// The path lets Cemu attach a real FileStream so game writes persist
-		// to the source .bin, like Cemu's built-in toypad window.
-		const std::u8string pathU8 = g_app.figures[g_app.figureIndex].path.u8string();
-		const std::string pathUtf8(reinterpret_cast<const char*>(pathU8.data()), pathU8.size());
-		const uint16_t pathLength = static_cast<uint16_t>(pathUtf8.size());
-		std::vector<uint8_t> message(5 + kTagSize + 2 + pathUtf8.size());
+		const std::vector<uint8_t> tagData = LoadResourceBytes(entry.binResourceId);
+		if (tagData.size() != kTagSize)
+		{
+			g_app.status = L"The embedded tag for this entry has the wrong size.";
+			return;
+		}
+
+		// Header + tag + 2-byte little-endian path length + path bytes.
+		// The path is empty now (see the wire protocol note above).
+		std::vector<uint8_t> message(5 + kTagSize + 2);
 		message[0] = kLoadCommand;
 		message[1] = kSlots[g_app.slotIndex].pad;
 		message[2] = kSlots[g_app.slotIndex].index;
 		std::copy(tagData.begin(), tagData.end(), message.begin() + 5);
-		message[5 + kTagSize] = static_cast<uint8_t>(pathLength & 0xFF);
-		message[5 + kTagSize + 1] = static_cast<uint8_t>(pathLength >> 8);
-		std::copy(pathUtf8.begin(), pathUtf8.end(), message.begin() + 5 + kTagSize + 2);
+		message[5 + kTagSize] = 0;
+		message[5 + kTagSize + 1] = 0;
 
 		std::wstring error;
 		if (!SendToypadMessage(message.data(), message.size(), error))
@@ -425,12 +1018,15 @@ namespace
 		// The listener always clears the destination before loading (see
 		// LISTENER_IMPLEMENTATION.md), so an occupied pad is silently
 		// overwritten on the Cemu side too - session state just mirrors that.
+		const std::wstring name = EntryDisplayName(entry);
 		auto& slot = g_app.padState[g_app.slotIndex];
 		slot.occupied = true;
-		slot.figureName = g_app.figures[g_app.figureIndex].label;
+		slot.figureName = name;
+		slot.portraitResourceId = entry.portraitResourceId;
+		slot.ringColor = entry.ringColor;
 
-		g_app.status = L"LOAD sent: " + g_app.figures[g_app.figureIndex].label + L" -> " + kSlots[g_app.slotIndex].label;
-		g_app.screen = Screen::FigureList;
+		g_app.status = L"LOAD sent: " + name + L" -> " + kSlots[g_app.slotIndex].label;
+		g_app.screen = Screen::PadViewer;
 	}
 
 	void ClearSelectedPad()
@@ -449,7 +1045,7 @@ namespace
 
 		g_app.padState[g_app.slotIndex] = PadSlot{};
 		g_app.status = std::wstring(L"CLEAR sent: ") + kSlots[g_app.slotIndex].label;
-		g_app.screen = Screen::FigureList;
+		g_app.screen = Screen::PadViewer;
 	}
 
 	// Moves whatever is tracked at moveSourceSlotIndex to destIndex. Called
@@ -484,14 +1080,13 @@ namespace
 		// Overwrite the destination if it was occupied, same as Load does,
 		// and clear the source now that it has moved away.
 		const std::wstring movedName = g_app.padState[g_app.moveSourceSlotIndex].figureName;
-		g_app.padState[destIndex].occupied = true;
-		g_app.padState[destIndex].figureName = movedName;
+		g_app.padState[destIndex] = g_app.padState[g_app.moveSourceSlotIndex];
 		g_app.padState[g_app.moveSourceSlotIndex] = PadSlot{};
 
 		g_app.status = L"MOVE sent: " + movedName + L" (" + kSlots[g_app.moveSourceSlotIndex].label +
 			L" -> " + kSlots[destIndex].label + L")";
 		g_app.selectingMoveDestination = false;
-		g_app.screen = Screen::FigureList;
+		g_app.screen = Screen::PadViewer;
 	}
 
 	// Clears LegoToypad's own record of what is loaded where. Does not talk
@@ -502,6 +1097,10 @@ namespace
 		g_app.padState = {};
 		g_app.status = L"Pad view reset. This only clears LegoToypad's own tracking - nothing was sent to Cemu.";
 	}
+
+	// ---------------------------------------------------------------------
+	// Navigation
+	// ---------------------------------------------------------------------
 
 	void SelectPrevious(size_t count, size_t& index)
 	{
@@ -545,28 +1144,90 @@ namespace
 			g_app.slotIndex = static_cast<size_t>(target);
 	}
 
+	// Franchise grid: 6 columns x 5 rows, exactly the 30 worlds. Both axes
+	// wrap so every tile stays reachable from the edges.
+	constexpr size_t kFranchiseCols = 6;
+	constexpr size_t kFranchiseRows = 5;
+
+	void MoveFranchiseSelection(int dx, int dy)
+	{
+		size_t row = g_app.franchiseIndex / kFranchiseCols;
+		size_t col = g_app.franchiseIndex % kFranchiseCols;
+		row = (row + static_cast<size_t>(dy) + kFranchiseRows) % kFranchiseRows;
+		col = (col + static_cast<size_t>(dx) + kFranchiseCols) % kFranchiseCols;
+		g_app.franchiseIndex = row * kFranchiseCols + col;
+	}
+
+	// Roster grid: 6 columns, variable row count, wrapped vertically.
+	// The viewport shows kRosterVisibleRows rows and follows the selection.
+	constexpr size_t kRosterCols = 6;
+	constexpr size_t kRosterVisibleRows = 3;
+
+	void MoveRosterSelection(int dx, int dy)
+	{
+		if (g_app.rosterSlots.empty())
+			return;
+		const size_t rows = (g_app.rosterSlots.size() + kRosterCols - 1) / kRosterCols;
+		size_t row = g_app.rosterIndex / kRosterCols;
+		size_t col = g_app.rosterIndex % kRosterCols;
+
+		row = (row + static_cast<size_t>(dy) + rows) % rows;
+		const size_t lastCol = std::min(kRosterCols, g_app.rosterSlots.size() - row * kRosterCols) - 1;
+		col = (col + static_cast<size_t>(dx) + lastCol + 1) % (lastCol + 1);
+
+		g_app.rosterIndex = row * kRosterCols + col;
+
+		// Keep the focused row inside the visible viewport.
+		const int focusedRow = static_cast<int>(row);
+		while (focusedRow < g_app.rosterTopRow)
+			--g_app.rosterTopRow;
+		while (focusedRow >= g_app.rosterTopRow + static_cast<int>(kRosterVisibleRows))
+			++g_app.rosterTopRow;
+		if (g_app.rosterTopRow < 0)
+			g_app.rosterTopRow = 0;
+	}
+
+	void NavigateGrid(int dx, int dy)
+	{
+		switch (g_app.screen)
+		{
+		case Screen::PadViewer:
+			NavigatePadGrid(dx, dy);
+			break;
+		case Screen::FranchiseList:
+			MoveFranchiseSelection(dx, dy);
+			break;
+		case Screen::RosterList:
+			MoveRosterSelection(dx, dy);
+			break;
+		default:
+			break;
+		}
+	}
+
 	void Navigate(int direction)
 	{
 		switch (g_app.screen)
 		{
-		case Screen::FigureList:
-			if (direction < 0)
-				SelectPrevious(g_app.figures.size(), g_app.figureIndex);
-			else
-				SelectNext(g_app.figures.size(), g_app.figureIndex);
-			break;
 		case Screen::PadViewer:
-			// Up/down through the generic Navigate() entry point (keyboard
-			// arrows, controller D-pad/stick up-down); left/right go through
-			// NavigatePadGrid directly from the input handlers instead, since
-			// this function only carries a single +-1 direction.
-			NavigatePadGrid(0, direction);
+		case Screen::FranchiseList:
+		case Screen::RosterList:
+			NavigateGrid(0, direction);
 			break;
 		case Screen::PadAction:
 			if (direction < 0)
 				SelectPrevious(kPadActionCount, g_app.padActionIndex);
 			else
 				SelectNext(kPadActionCount, g_app.padActionIndex);
+			break;
+		case Screen::PlusPicker:
+			if (g_app.plusGroup && !g_app.plusGroup->builds.empty())
+			{
+				if (direction < 0)
+					SelectPrevious(g_app.plusGroup->builds.size(), g_app.plusBuildIndex);
+				else
+					SelectNext(g_app.plusGroup->builds.size(), g_app.plusBuildIndex);
+			}
 			break;
 		case Screen::Settings:
 			if (direction < 0)
@@ -578,8 +1239,170 @@ namespace
 	}
 
 	// ---------------------------------------------------------------------
-	// Overlay show / hide
+	// Screen transitions
 	// ---------------------------------------------------------------------
+
+	void OpenFranchiseList()
+	{
+		g_app.franchiseIndex = 0;
+		g_app.screen = Screen::FranchiseList;
+	}
+
+	void OpenRosterList()
+	{
+		g_app.rosterSlots.clear();
+		const Franchise& franchise = kFranchises[g_app.franchiseIndex];
+		for (const auto& character : franchise.characters)
+			g_app.rosterSlots.push_back({RosterSlot::Kind::Character, &character, nullptr});
+		for (const auto& vehicle : franchise.vehicles)
+		{
+			if (vehicle.builds.empty())
+				continue;
+			const RosterEntry* first = &vehicle.builds.front();
+			g_app.rosterSlots.push_back({RosterSlot::Kind::Vehicle, first, &vehicle});
+			if (vehicle.builds.size() > 1)
+				g_app.rosterSlots.push_back({RosterSlot::Kind::Plus, nullptr, &vehicle});
+		}
+		g_app.rosterIndex = 0;
+		g_app.rosterTopRow = 0;
+		g_app.plusGroup = nullptr;
+		g_app.screen = Screen::RosterList;
+	}
+
+	void OpenPlusPicker(const VehicleGroup& group)
+	{
+		g_app.plusGroup = &group;
+		g_app.plusBuildIndex = 0;
+		g_app.screen = Screen::PlusPicker;
+	}
+
+	void Confirm()
+	{
+		switch (g_app.screen)
+		{
+		case Screen::PadViewer:
+			if (g_app.selectingMoveDestination)
+				MoveToDestination(g_app.slotIndex);
+			else
+			{
+				g_app.screen = Screen::PadAction;
+				g_app.padActionIndex = 0; // default to Load
+			}
+			break;
+		case Screen::PadAction:
+			switch (static_cast<PadActionKind>(g_app.padActionIndex))
+			{
+			case PadActionKind::Load:
+				OpenFranchiseList();
+				break;
+			case PadActionKind::Clear:
+				ClearSelectedPad();
+				break;
+			case PadActionKind::Move:
+				g_app.moveSourceSlotIndex = g_app.slotIndex;
+				g_app.selectingMoveDestination = true;
+				g_app.screen = Screen::PadViewer;
+				break;
+			}
+			break;
+		case Screen::FranchiseList:
+			OpenRosterList();
+			break;
+		case Screen::RosterList:
+			if (g_app.rosterIndex >= g_app.rosterSlots.size())
+				break;
+			switch (g_app.rosterSlots[g_app.rosterIndex].kind)
+			{
+			case RosterSlot::Kind::Character:
+			case RosterSlot::Kind::Vehicle:
+				if (g_app.rosterSlots[g_app.rosterIndex].entry)
+					LoadRosterEntryToPad(*g_app.rosterSlots[g_app.rosterIndex].entry);
+				break;
+			case RosterSlot::Kind::Plus:
+				if (g_app.rosterSlots[g_app.rosterIndex].group)
+					OpenPlusPicker(*g_app.rosterSlots[g_app.rosterIndex].group);
+				break;
+			}
+			break;
+		case Screen::PlusPicker:
+			if (g_app.plusGroup && g_app.plusBuildIndex < g_app.plusGroup->builds.size())
+				LoadRosterEntryToPad(g_app.plusGroup->builds[g_app.plusBuildIndex]);
+			break;
+		case Screen::Settings:
+			if (g_app.settingsIndex == 0)
+				BeginShortcutCapture();
+			else if (g_app.settingsIndex == 1)
+				ResetPadView();
+			break;
+		}
+	}
+
+	void Back(HWND window)
+	{
+		if (g_app.capturingShortcut)
+		{
+			CancelShortcutCapture();
+			return;
+		}
+		switch (g_app.screen)
+		{
+		case Screen::PadViewer:
+			if (g_app.selectingMoveDestination)
+			{
+				// Cancel picking a destination and return to the action
+				// dialog for the original pad, still on Move, so the user
+				// can retry or pick something else instead.
+				g_app.selectingMoveDestination = false;
+				g_app.slotIndex = g_app.moveSourceSlotIndex;
+				g_app.screen = Screen::PadAction;
+				g_app.padActionIndex = static_cast<size_t>(PadActionKind::Move);
+			}
+			else
+			{
+				HideOverlay(window);
+			}
+			break;
+		case Screen::PadAction:
+			g_app.screen = Screen::PadViewer;
+			break;
+		case Screen::FranchiseList:
+			g_app.screen = Screen::PadViewer;
+			break;
+		case Screen::RosterList:
+			g_app.screen = Screen::FranchiseList;
+			break;
+		case Screen::PlusPicker:
+			g_app.plusGroup = nullptr;
+			OpenRosterList();
+			break;
+		case Screen::Settings:
+			g_app.screen = Screen::PadViewer;
+			break;
+		}
+	}
+
+	// ---------------------------------------------------------------------
+	// Overlay show / hide (forward-declared above for the screen transitions)
+	// ---------------------------------------------------------------------
+
+	void UpdateInputOwnership(HWND window)
+	{
+		if (!g_inputOwnershipEvent)
+			return;
+
+		// Ownership is keyed to the overlay being visible, not to it holding
+		// foreground focus. Requiring focus was how input leaked to Cemu:
+		// SetForegroundWindow can be refused from a background process (games
+		// frequently re-grab focus), so the event silently stayed clear and
+		// Cemu kept reading the pad. There is never a reason to let the game
+		// receive input while the picker is up, so visibility is the right
+		// condition.
+		const bool ownsInput = g_app.overlayVisible;
+		if (ownsInput)
+			SetEvent(g_inputOwnershipEvent);
+		else
+			ResetEvent(g_inputOwnershipEvent);
+	}
 
 	// Windows normally refuses SetForegroundWindow() calls that don't originate
 	// from a genuine input event (e.g. a call made from our background timer
@@ -619,10 +1442,6 @@ namespace
 		const int y = info.rcMonitor.top + (monitorHeight - kOverlayHeight) / 2;
 		SetWindowPos(window, HWND_TOPMOST, x, y, kOverlayWidth, kOverlayHeight, SWP_NOACTIVATE);
 	}
-
-	// Defined later in this file; declared here because ShowOverlay/HideOverlay
-	// assert and release input ownership synchronously around showing/hiding.
-	void UpdateInputOwnership(HWND window);
 
 	void ShowOverlay(HWND window)
 	{
@@ -727,90 +1546,6 @@ namespace
 		g_app.status = L"Shortcut set to " + DescribeShortcut();
 	}
 
-	void Confirm()
-	{
-		switch (g_app.screen)
-		{
-		case Screen::FigureList:
-			if (!g_app.figures.empty())
-			{
-				g_app.screen = Screen::PadViewer;
-				g_app.selectingMoveDestination = false;
-			}
-			break;
-		case Screen::PadViewer:
-			if (g_app.selectingMoveDestination)
-				MoveToDestination(g_app.slotIndex);
-			else
-			{
-				g_app.screen = Screen::PadAction;
-				g_app.padActionIndex = 0; // default to Load
-			}
-			break;
-		case Screen::PadAction:
-			switch (static_cast<PadActionKind>(g_app.padActionIndex))
-			{
-			case PadActionKind::Load:
-				LoadSelectedFigure();
-				break;
-			case PadActionKind::Clear:
-				ClearSelectedPad();
-				break;
-			case PadActionKind::Move:
-				g_app.moveSourceSlotIndex = g_app.slotIndex;
-				g_app.selectingMoveDestination = true;
-				g_app.screen = Screen::PadViewer;
-				break;
-			}
-			break;
-		case Screen::Settings:
-			if (g_app.settingsIndex == 0)
-				BeginShortcutCapture();
-			else if (g_app.settingsIndex == 1)
-				ScanFigures();
-			else if (g_app.settingsIndex == 2)
-				ResetPadView();
-			break;
-		}
-	}
-
-	void Back(HWND window)
-	{
-		if (g_app.capturingShortcut)
-		{
-			CancelShortcutCapture();
-			return;
-		}
-		switch (g_app.screen)
-		{
-		case Screen::PadViewer:
-			if (g_app.selectingMoveDestination)
-			{
-				// Cancel picking a destination and return to the action
-				// dialog for the original pad, still on Move, so the user
-				// can retry or pick something else instead.
-				g_app.selectingMoveDestination = false;
-				g_app.slotIndex = g_app.moveSourceSlotIndex;
-				g_app.screen = Screen::PadAction;
-				g_app.padActionIndex = static_cast<size_t>(PadActionKind::Move);
-			}
-			else
-			{
-				g_app.screen = Screen::FigureList;
-			}
-			break;
-		case Screen::PadAction:
-			g_app.screen = Screen::PadViewer;
-			break;
-		case Screen::Settings:
-			g_app.screen = Screen::FigureList;
-			break;
-		case Screen::FigureList:
-			HideOverlay(window);
-			break;
-		}
-	}
-
 	// ---------------------------------------------------------------------
 	// Tray icon
 	// ---------------------------------------------------------------------
@@ -823,7 +1558,7 @@ namespace
 		icon.uID = kTrayIconId;
 		icon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
 		icon.uCallbackMessage = kTrayCallbackMessage;
-		icon.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+		icon.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
 		const wchar_t* tip = L"LEGO Dimensions Toypad Picker";
 		wcsncpy(icon.szTip, tip, std::size(icon.szTip) - 1);
 		icon.szTip[std::size(icon.szTip) - 1] = L'\0';
@@ -855,34 +1590,8 @@ namespace
 	}
 
 	// ---------------------------------------------------------------------
-	// Drawing
+	// Painting
 	// ---------------------------------------------------------------------
-
-	void DrawTextLine(HDC dc, const std::wstring& text, int x, int y, int width, COLORREF color, int height = 30)
-	{
-		SetTextColor(dc, color);
-		RECT rect{x, y, x + width, y + height};
-		DrawTextW(dc, text.c_str(), -1, &rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-	}
-
-	void UpdateInputOwnership(HWND window)
-	{
-		if (!g_inputOwnershipEvent)
-			return;
-
-		// Ownership is keyed to the overlay being visible, not to it holding
-		// foreground focus. Requiring focus was how input leaked to Cemu:
-		// SetForegroundWindow can be refused from a background process (games
-		// frequently re-grab focus), so the event silently stayed clear and
-		// Cemu kept reading the pad. There is never a reason to let the game
-		// receive input while the picker is up, so visibility is the right
-		// condition.
-		const bool ownsInput = g_app.overlayVisible;
-		if (ownsInput)
-			SetEvent(g_inputOwnershipEvent);
-		else
-			ResetEvent(g_inputOwnershipEvent);
-	}
 
 	// Cell rectangles for the 7 pad slots, matching the real 3/1/3 (left /
 	// center / right) Toypad geometry in kSlots: the left section (pad 2) is
@@ -899,40 +1608,211 @@ namespace
 		{745, 280, 860, 410}, // 6 Right - lower right
 	}};
 
-	void DrawPadGrid(HDC dc)
+	// Franchise grid layout: 6 columns x 5 rows (the fixed 30 worlds).
+	constexpr int kFranchiseOriginX = 15;
+	constexpr int kFranchiseOriginY = 106;
+	constexpr int kFranchisePitchX = 145;
+	constexpr int kFranchisePitchY = 90;
+	constexpr int kFranchiseTileW = 140;
+	constexpr int kFranchiseTileH = 84;
+	constexpr int kTileGlowMargin = 6;
+
+	// Roster grid layout: 6 columns, portrait-circles, vertical scrolling.
+	constexpr int kRosterOriginX = 15;
+	constexpr int kRosterOriginY = 112;
+	constexpr int kRosterPitchX = 145;
+	constexpr int kRosterPitchY = 132;
+	constexpr int kPortraitDiameter = 90;
+
+	// Capsule (pill) menus.
+	constexpr int kPillWidth = 340;
+	constexpr int kPillRowH = 36;
+	constexpr int kPillPadV = 7;
+
+	// The glossy pad itself plus its occupant (portrait circle + name).
+	void DrawPad(Gdiplus::Graphics& g, HDC dc, size_t index)
 	{
-		for (size_t i = 0; i < kPadCells.size(); ++i)
+		const RECT& cell = kPadCells[index];
+		const bool selected = index == g_app.slotIndex;
+		const bool occupied = g_app.padState[index].occupied;
+		const bool isMoveSource = g_app.selectingMoveDestination && index == g_app.moveSourceSlotIndex;
+
+		PadVisual visual;
+		if (isMoveSource)
+			visual = PadVisual::MoveSource;
+		else if (selected && occupied)
+			visual = PadVisual::OccupiedSelected;
+		else if (selected)
+			visual = PadVisual::IdleSelected;
+		else if (occupied)
+			visual = PadVisual::Occupied;
+		else
+			visual = PadVisual::Idle;
+
+		Gdiplus::Bitmap* pad = RenderPad(cell, visual);
+		if (pad)
+			g.DrawImage(pad, static_cast<int>(cell.left) - kPadGlowMargin, static_cast<int>(cell.top) - kPadGlowMargin);
+
+		const int cellWidth = cell.right - cell.left;
+		const PadSlot& slot = g_app.padState[index];
+
+		DrawTextLine(dc, kSlots[index].label, cell.left + 10, cell.top + 5, cellWidth - 20, RGB(158, 166, 180), 16);
+
+		constexpr int kOccupantDiameter = 58;
+		const int portraitX = cell.left + 12;
+		const int portraitY = cell.top + 26;
+		if (occupied)
 		{
-			const RECT& cell = kPadCells[i];
-			const bool selected = i == g_app.slotIndex;
-			const bool occupied = g_app.padState[i].occupied;
-			// While picking a Move destination, the pad being moved FROM is
-			// shown in its own color so it reads as "the source", not just
-			// another occupied cell you might overwrite by mistake.
-			const bool isMoveSource = g_app.selectingMoveDestination && i == g_app.moveSourceSlotIndex;
+			Gdiplus::Bitmap* portrait = RenderPortrait(slot.portraitResourceId, slot.ringColor, false, kOccupantDiameter);
+			if (portrait)
+			{
+				const int offset = (kOccupantDiameter + kPortraitMargin * 2 - kOccupantDiameter) / 2;
+				g.DrawImage(portrait, portraitX - offset, portraitY - offset);
+			}
+			DrawTextLine(dc, slot.figureName, portraitX + kOccupantDiameter + 12, portraitY + 8,
+				cellWidth - (portraitX + kOccupantDiameter + 12 + cell.left) - 8, RGB(226, 240, 230), 22);
+		}
+		else
+		{
+			Gdiplus::Bitmap* placeholder = RenderPlaceholder(L' ', kPadBorderIdle, false, kOccupantDiameter);
+			if (placeholder)
+			{
+				const int offset = (kOccupantDiameter + kPortraitMargin * 2 - kOccupantDiameter) / 2;
+				g.DrawImage(placeholder, portraitX - offset, portraitY - offset);
+			}
+			DrawTextLine(dc, L"(empty)", portraitX + kOccupantDiameter + 12, cell.top + 52,
+				cellWidth - (portraitX + kOccupantDiameter + 12 + cell.left) - 8, RGB(110, 116, 128), 20);
+		}
+	}
 
-			const COLORREF fill = occupied ? RGB(40, 66, 48) : RGB(32, 37, 48);
-			COLORREF border = selected ? RGB(255, 204, 51) : (occupied ? RGB(88, 168, 108) : RGB(70, 76, 90));
-			if (isMoveSource)
-				border = RGB(90, 150, 230);
+	// Capsule menu floating above the selected pad (PadAction) or centered
+	// (PlusPicker). The focused row is drawn in its capsule highlight.
+	void DrawPillMenu(Gdiplus::Graphics& g, HDC dc, int x, int y, size_t rows,
+		const std::vector<std::wstring>& options, size_t focusedIndex)
+	{
+		Gdiplus::Bitmap* pill = RenderPill(static_cast<int>(rows));
+		if (!pill)
+			return;
+		g.DrawImage(pill, x, y);
 
-			HBRUSH fillBrush = CreateSolidBrush(fill);
-			HPEN borderPen = CreatePen(PS_SOLID, selected ? 3 : 2, border);
-			HGDIOBJ oldBrush = SelectObject(dc, fillBrush);
-			HGDIOBJ oldPen = SelectObject(dc, borderPen);
-			RoundRect(dc, cell.left, cell.top, cell.right, cell.bottom, 14, 14);
-			SelectObject(dc, oldBrush);
-			SelectObject(dc, oldPen);
-			DeleteObject(fillBrush);
-			DeleteObject(borderPen);
+		Gdiplus::Bitmap* highlight = nullptr;
+		for (size_t row = 0; row < rows; ++row)
+		{
+			if (row == focusedIndex)
+			{
+				if (!highlight)
+					highlight = RenderPillRow(true);
+				if (highlight)
+					g.DrawImage(highlight, x + 8, y + kPillPadV + static_cast<int>(row) * kPillRowH);
+			}
+			DrawTextLineCentered(dc, options[row], x + 8, y + kPillPadV + static_cast<int>(row) * kPillRowH,
+				kPillWidth - 16, row == focusedIndex ? RGB(255, 255, 255) : RGB(196, 204, 216), kPillRowH);
+		}
+	}
 
-			const int cellWidth = cell.right - cell.left;
-			DrawTextLine(dc, kSlots[i].label, cell.left + 10, cell.top + 6, cellWidth - 20, RGB(170, 178, 190), 20);
-			const int nameY = cell.top + 30;
-			const int nameHeight = (cell.bottom - cell.top) - 36;
-			DrawTextLine(dc, occupied ? g_app.padState[i].figureName : L"(empty)",
-				cell.left + 10, nameY, cellWidth - 20,
-				occupied ? RGB(226, 240, 230) : RGB(110, 116, 128), nameHeight);
+	void DrawPadActionMenu(Gdiplus::Graphics& g, HDC dc, int width)
+	{
+		const RECT& cell = kPadCells[g_app.slotIndex];
+		const int pillH = static_cast<int>(kPadActionCount) * kPillRowH + kPillPadV * 2;
+		const int pillX = std::clamp(static_cast<int>((cell.left + cell.right) / 2) - kPillWidth / 2, 8, width - 8 - kPillWidth);
+		const int pillY = (cell.top - 12 - pillH < 0) ? 0 : static_cast<int>(cell.top) - 12 - pillH;
+
+		const PadSlot& target = g_app.padState[g_app.slotIndex];
+		const std::vector<std::wstring> options = {
+			L"Load",
+			target.occupied ? L"Clear" : L"Clear (empty)",
+			L"Move",
+		};
+		DrawPillMenu(g, dc, pillX, pillY, kPadActionCount, options, g_app.padActionIndex);
+	}
+
+	void DrawPlusPickerMenu(Gdiplus::Graphics& g, HDC dc)
+	{
+		if (!g_app.plusGroup)
+			return;
+		const size_t rows = g_app.plusGroup->builds.size();
+		if (rows == 0)
+			return;
+		std::vector<std::wstring> options;
+		for (const auto& build : g_app.plusGroup->builds)
+			options.push_back(L"Build " + std::to_wstring(build.buildNumber));
+
+		const int pillH = static_cast<int>(rows) * kPillRowH + kPillPadV * 2;
+		const int pillX = (kOverlayWidth - kPillWidth) / 2;
+		const int pillY = 166;
+		DrawPillMenu(g, dc, pillX, pillY, rows, options, g_app.plusBuildIndex);
+	}
+
+	void DrawFranchiseGrid(Gdiplus::Graphics& g, HDC dc)
+	{
+		for (size_t row = 0; row < kFranchiseRows; ++row)
+		{
+			for (size_t col = 0; col < kFranchiseCols; ++col)
+			{
+				const size_t index = row * kFranchiseCols + col;
+				if (index >= kFranchiseCount)
+					break;
+				const int x = kFranchiseOriginX + static_cast<int>(col) * kFranchisePitchX;
+				const int y = kFranchiseOriginY + static_cast<int>(row) * kFranchisePitchY;
+				const bool focused = index == g_app.franchiseIndex;
+				Gdiplus::Bitmap* tile = RenderFranchiseTile(kFranchises[index].logoResourceId, focused);
+				if (tile)
+					g.DrawImage(tile, x - kTileGlowMargin, y - kTileGlowMargin);
+				DrawTextLineCentered(dc, kFranchises[index].name, x + 4, y + kFranchiseTileH - 22,
+					kFranchiseTileW - 8, focused ? RGB(255, 226, 150) : RGB(222, 228, 236), 18);
+			}
+		}
+	}
+
+	void DrawRosterGrid(Gdiplus::Graphics& g, HDC dc)
+	{
+		if (g_app.rosterSlots.empty())
+		{
+			DrawTextLine(dc, L"No figures in this world.", 24, 200, 480, RGB(224, 230, 237));
+			return;
+		}
+
+		const size_t visibleRows = kRosterVisibleRows;
+		for (size_t row = 0; row < visibleRows; ++row)
+		{
+			for (size_t col = 0; col < kRosterCols; ++col)
+			{
+				const size_t slotIndex = (static_cast<size_t>(g_app.rosterTopRow) + row) * kRosterCols + col;
+				if (slotIndex >= g_app.rosterSlots.size())
+					break;
+				const RosterSlot& slot = g_app.rosterSlots[slotIndex];
+				const int x = kRosterOriginX + static_cast<int>(col) * kRosterPitchX;
+				const int y = kRosterOriginY + static_cast<int>(row) * kRosterPitchY;
+				const bool focused = slotIndex == g_app.rosterIndex;
+
+				Gdiplus::Bitmap* visual = nullptr;
+				std::wstring label;
+				unsigned int color = 0;
+				int resId = 0;
+				if (slot.kind == RosterSlot::Kind::Plus)
+				{
+					label = L"+";
+					color = slot.group && !slot.group->builds.empty() ? slot.group->builds[0].ringColor : kPadBorderIdle;
+					visual = RenderPlusTile(color, focused, kPortraitDiameter);
+				}
+				else if (slot.entry)
+				{
+					label = slot.entry->name;
+					color = slot.entry->ringColor;
+					resId = slot.entry->portraitResourceId;
+					visual = resId != 0
+						? RenderPortrait(resId, color, focused, kPortraitDiameter)
+						: RenderPlaceholder(label.empty() ? L'?' : label[0], color, focused, kPortraitDiameter);
+				}
+
+				const int circleX = x + (kRosterPitchX - kPortraitDiameter) / 2;
+				const int circleY = y;
+				if (visual)
+					g.DrawImage(visual, circleX - kPortraitMargin, circleY - kPortraitMargin);
+
+				DrawTextLineCentered(dc, label, x + 2, y + kPortraitDiameter + 4, kRosterPitchX - 4,
+					focused ? RGB(255, 236, 190) : RGB(214, 220, 230), 20);
+			}
 		}
 	}
 
@@ -950,103 +1830,94 @@ namespace
 		// and then content directly on the window's own surface (the
 		// original approach) is visibly flickery on a layered window, since
 		// DWM can composite a half-drawn frame; building the whole frame
-		// off-screen and blitting it atomically avoids that. The local name
-		// `dc` is kept for the memory DC so none of the drawing calls below
-		// need to change - only this setup/teardown differs from before.
+		// off-screen and blitting it atomically avoids that.
 		HDC dc = CreateCompatibleDC(windowDC);
 		HBITMAP bitmap = CreateCompatibleBitmap(windowDC, width, height);
 		HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
 
-		HBRUSH background = CreateSolidBrush(RGB(20, 24, 33));
-		FillRect(dc, &client, background);
-		DeleteObject(background);
-		SetBkMode(dc, TRANSPARENT);
+		Gdiplus::Graphics g(dc);
+		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
 
+		Gdiplus::Bitmap* background = RenderBackground(width, height);
+		if (background)
+			g.DrawImage(background, 0, 0);
+
+		SetBkMode(dc, TRANSPARENT);
 		HFONT font = CreateFontW(-22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-		HFONT titleFont = CreateFontW(-30, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
 		SelectObject(dc, font);
 
-		SelectObject(dc, titleFont);
-		DrawTextLine(dc, L"LEGO Dimensions Toypad Picker", 24, 18, width - 48, RGB(255, 204, 51), 40);
-		SelectObject(dc, font);
-
-		if (g_app.screen == Screen::FigureList)
+		// The "LEGO TOYPAD" wordmark (embedded asset) at the top of the pad
+		// grid screen, per the mockup.
+		if (g_app.screen == Screen::PadViewer)
 		{
-			DrawTextLine(dc, L"Choose a figure  |  D-pad/stick: move  |  A/Enter: select  |  Y/S: settings",
-				24, 64, width - 48, RGB(224, 230, 237));
-			const size_t visibleRows = 12;
-			const size_t first = g_app.figureIndex > visibleRows / 2 ? g_app.figureIndex - visibleRows / 2 : 0;
-			for (size_t row = 0; row < visibleRows && first + row < g_app.figures.size(); ++row)
+			Gdiplus::Bitmap* wordmark = GetAssetBitmap(kWordmarkResourceId);
+			if (wordmark)
 			{
-				const size_t index = first + row;
-				const int y = 108 + static_cast<int>(row) * 34;
-				const bool selected = index == g_app.figureIndex;
-				if (selected)
-				{
-					RECT selection{18, y - 2, width - 18, y + 30};
-					HBRUSH brush = CreateSolidBrush(RGB(36, 99, 170));
-					FillRect(dc, &selection, brush);
-					DeleteObject(brush);
-				}
-				DrawTextLine(dc, g_app.figures[index].label, 30, y, width - 60, selected ? RGB(255, 255, 255) : RGB(228, 232, 238));
+				const Gdiplus::RectF box(280.0f, 10.0f, 340.0f, 66.0f);
+				const float scale = std::min(box.Width / wordmark->GetWidth(), box.Height / wordmark->GetHeight());
+				const float drawW = wordmark->GetWidth() * scale;
+				const float drawH = wordmark->GetHeight() * scale;
+				const Gdiplus::RectF dest(box.X + (box.Width - drawW) / 2.0f,
+					box.Y + (box.Height - drawH) / 2.0f, drawW, drawH);
+				g.DrawImage(wordmark, dest);
 			}
 		}
-		else if (g_app.screen == Screen::PadViewer)
+
+		switch (g_app.screen)
+		{
+		case Screen::PadViewer:
 		{
 			if (g_app.selectingMoveDestination)
 			{
 				DrawTextLine(dc, L"Choose where to move it  |  D-pad/stick: move  |  A/Enter: confirm  |  B/Esc: cancel",
-					24, 64, width - 48, RGB(224, 230, 237));
+					24, 84, width - 48, RGB(224, 230, 237));
 				DrawTextLine(dc, L"Moving " + g_app.padState[g_app.moveSourceSlotIndex].figureName +
-					L" from " + kSlots[g_app.moveSourceSlotIndex].label, 24, 96, width - 48, RGB(255, 204, 51));
+					L" from " + kSlots[g_app.moveSourceSlotIndex].label, 24, 112, width - 48, RGB(255, 204, 51));
 			}
 			else
 			{
-				DrawTextLine(dc, L"Choose a Toypad position  |  D-pad/stick: move  |  A/Enter: select  |  B/Esc: back",
-					24, 64, width - 48, RGB(224, 230, 237));
-				DrawTextLine(dc, g_app.figures[g_app.figureIndex].label, 24, 96, width - 48, RGB(255, 204, 51));
+				DrawTextLine(dc, L"Choose a Toypad position  |  D-pad/stick: move  |  A/Enter: select  |  B/Esc: close  |  Y/S: settings",
+					24, 84, width - 48, RGB(224, 230, 237));
 			}
-			DrawPadGrid(dc);
+			for (size_t index = 0; index < kPadCells.size(); ++index)
+				DrawPad(g, dc, index);
+			break;
 		}
-		else if (g_app.screen == Screen::PadAction)
+		case Screen::PadAction:
 		{
-			const PadSlot& target = g_app.padState[g_app.slotIndex];
 			DrawTextLine(dc, L"What do you want to do?  |  D-pad/stick: move  |  A/Enter: confirm  |  B/Esc: back",
 				24, 64, width - 48, RGB(224, 230, 237));
-			DrawTextLine(dc, g_app.figures[g_app.figureIndex].label + L"  ->  " + kSlots[g_app.slotIndex].label,
-				24, 96, width - 48, RGB(255, 204, 51));
-
-			const std::array<std::wstring, kPadActionCount> options = {
-				L"Load " + g_app.figures[g_app.figureIndex].label + L" here" +
-					(target.occupied ? (L" (overwrites " + target.figureName + L")") : L""),
-				target.occupied ? (L"Clear this pad (removes " + target.figureName + L")")
-								 : L"Clear this pad (already empty)",
-				target.occupied ? (L"Move " + target.figureName + L" from here to another pad")
-								 : L"Move (this pad is empty, nothing to move)",
-			};
-			for (size_t index = 0; index < options.size(); ++index)
-			{
-				const int y = 150 + static_cast<int>(index) * 44;
-				const bool selected = index == g_app.padActionIndex;
-				if (selected)
-				{
-					RECT selection{18, y - 2, width - 18, y + 36};
-					HBRUSH brush = CreateSolidBrush(RGB(36, 99, 170));
-					FillRect(dc, &selection, brush);
-					DeleteObject(brush);
-				}
-				DrawTextLine(dc, options[index], 30, y, width - 60, selected ? RGB(255, 255, 255) : RGB(228, 232, 238), 34);
-			}
+			DrawTextLine(dc, kSlots[g_app.slotIndex].label, 24, 92, width - 48, RGB(255, 204, 51));
+			DrawPadActionMenu(g, dc, width);
+			break;
 		}
-		else // Screen::Settings
+		case Screen::FranchiseList:
+			DrawTextLine(dc, L"Choose a world  |  D-pad/stick: move  |  A/Enter: browse  |  B/Esc: back",
+				24, 64, width - 48, RGB(224, 230, 237));
+			DrawFranchiseGrid(g, dc);
+			break;
+		case Screen::RosterList:
+			DrawTextLine(dc, L"Choose a figure  |  D-pad/stick: move  |  A/Enter: load  |  B/Esc: back",
+				24, 64, width - 48, RGB(224, 230, 237));
+			DrawTextLine(dc, kFranchises[g_app.franchiseIndex].name, 24, 90, width - 48, RGB(255, 204, 51));
+			DrawRosterGrid(g, dc);
+			break;
+		case Screen::PlusPicker:
+		{
+			const std::wstring vehicleName = g_app.plusGroup ? g_app.plusGroup->baseName : L"";
+			DrawTextLine(dc, L"Choose a build  |  D-pad/stick: move  |  A/Enter: load  |  B/Esc: back",
+				24, 64, width - 48, RGB(224, 230, 237));
+			DrawTextLine(dc, vehicleName, 24, 92, width - 48, RGB(255, 204, 51));
+			DrawPlusPickerMenu(g, dc);
+			break;
+		}
+		case Screen::Settings:
 		{
 			DrawTextLine(dc, L"Settings  |  B or Esc: back  |  A or Enter: change", 24, 64, width - 48, RGB(224, 230, 237));
 
 			const std::array<std::wstring, kSettingsItemCount> rows = {
 				L"Toggle shortcut: " + DescribeShortcut(),
-				L"Rescan figures",
 				L"Reset pad view (local tracking only, does not affect Cemu)",
 			};
 			for (size_t index = 0; index < rows.size(); ++index)
@@ -1079,12 +1950,13 @@ namespace
 				DrawTextLine(dc, L"Controller combo needs a non-nav button. Back+Start cancels. Keyboard needs a modifier. Esc cancels.",
 					24, y + 26, width - 48, RGB(255, 204, 51), 26);
 			}
+			break;
+		}
 		}
 
 		DrawTextLine(dc, g_app.status, 24, client.bottom - 44, width - 48, RGB(142, 238, 171));
 		SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
 		DeleteObject(font);
-		DeleteObject(titleFont);
 
 		BitBlt(windowDC, 0, 0, width, height, dc, 0, 0, SRCCOPY);
 
@@ -1204,12 +2076,8 @@ namespace
 
 		// Track whether anything actually changed this tick so the repaint
 		// below only fires when needed, instead of unconditionally on every
-		// ~16ms timer tick regardless of input. The old unconditional
-		// InvalidateRect here was a real contributor to the overlay's
-		// flickering: since Paint() runs a fresh BeginPaint/EndPaint (now
-		// also a fresh off-screen buffer, see Paint()) each time, invoking
-		// it ~60 times a second while sitting idle multiplied how often a
-		// partially-composited frame could be exposed.
+		// ~16ms timer tick regardless of input. The changed flag keeps the
+		// ~60Hz repaint path exactly as cheap as the old bitmap draws.
 		bool changed = false;
 
 		if (combinedPressed & XINPUT_GAMEPAD_A)
@@ -1222,21 +2090,23 @@ namespace
 			Back(window);
 			changed = true;
 		}
-		if ((combinedPressed & XINPUT_GAMEPAD_Y) && g_app.screen == Screen::FigureList)
+		if ((combinedPressed & XINPUT_GAMEPAD_Y) && g_app.screen == Screen::PadViewer)
 		{
 			g_app.screen = Screen::Settings;
 			changed = true;
 		}
 
+		const bool gridScreen = g_app.screen == Screen::PadViewer ||
+			g_app.screen == Screen::FranchiseList || g_app.screen == Screen::RosterList;
 		const DWORD now = GetTickCount();
 		const bool anyDirection = stickUp || stickDown || stickLeft || stickRight;
 		if (anyDirection && now - lastNavigation >= 180)
 		{
-			if (g_app.screen == Screen::PadViewer)
+			if (gridScreen)
 			{
 				const int dx = stickLeft ? -1 : (stickRight ? 1 : 0);
 				const int dy = stickUp ? -1 : (stickDown ? 1 : 0);
-				NavigatePadGrid(dx, dy);
+				NavigateGrid(dx, dy);
 			}
 			else if (stickUp || stickDown)
 			{
@@ -1300,17 +2170,15 @@ namespace
 			case VK_UP: Navigate(-1); break;
 			case VK_DOWN: Navigate(1); break;
 			case VK_LEFT:
-				if (g_app.screen == Screen::PadViewer)
-					NavigatePadGrid(-1, 0);
+				NavigateGrid(-1, 0);
 				break;
 			case VK_RIGHT:
-				if (g_app.screen == Screen::PadViewer)
-					NavigatePadGrid(1, 0);
+				NavigateGrid(1, 0);
 				break;
 			case VK_RETURN: Confirm(); break;
 			case VK_ESCAPE: Back(window); break;
 			case 'S':
-				if (g_app.screen == Screen::FigureList)
+				if (g_app.screen == Screen::PadViewer)
 					g_app.screen = Screen::Settings;
 				break;
 			}
@@ -1377,15 +2245,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
 		return 1;
 
+	// GDI+ powers the glossy/glowing off-screen rendering; shut down after
+	// the message loop, once every cached bitmap is released.
+	Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+	Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
+
 	g_app.port = ReadPort();
 	LoadShortcutFromIni();
-	ScanFigures();
+
+	size_t embeddedTags = 0;
+	for (size_t i = 0; i < kFranchiseCount; ++i)
+	{
+		embeddedTags += kFranchises[i].characters.size();
+		for (const auto& vehicle : kFranchises[i].vehicles)
+			embeddedTags += vehicle.builds.size();
+	}
+	g_app.status = std::to_wstring(embeddedTags) +
+		L" tags embedded. Listener port: " + std::to_wstring(g_app.port) +
+		L" | Toggle: " + DescribeShortcut();
+
 	g_inputOwnershipEvent = CreateEventW(nullptr, TRUE, FALSE, kLegoToypadInputEvent);
 
 	const wchar_t* className = L"LegoToypadWindow";
 	WNDCLASSW windowClass{};
 	windowClass.hInstance = instance;
 	windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+	windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
 	windowClass.lpfnWndProc = WindowProcedure;
 	windowClass.lpszClassName = className;
 	RegisterClassW(&windowClass);
@@ -1399,6 +2284,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 		CW_USEDEFAULT, CW_USEDEFAULT, kOverlayWidth, kOverlayHeight, nullptr, nullptr, instance, nullptr);
 	if (!window)
 	{
+		ReleaseGlossCache();
+		ReleaseAssetImages();
+		Gdiplus::GdiplusShutdown(g_gdiplusToken);
 		WSACleanup();
 		return 1;
 	}
@@ -1415,6 +2303,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 		DispatchMessageW(&message);
 	}
 
+	ReleaseGlossCache();
+	ReleaseAssetImages();
+	Gdiplus::GdiplusShutdown(g_gdiplusToken);
 	WSACleanup();
 	return static_cast<int>(message.wParam);
 }
