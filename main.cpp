@@ -392,6 +392,22 @@ namespace
 		path.CloseFigure();
 	}
 
+	// Pad highlight outline: the round center pad gets a circular outline to
+	// match its art, the rest stay rounded rectangles.
+	void AddPadPath(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect, bool circular)
+	{
+		if (circular)
+		{
+			path.Reset();
+			path.AddEllipse(rect);
+			path.CloseFigure();
+		}
+		else
+		{
+			AddRoundedRectPath(path, rect, 14.0f);
+		}
+	}
+
 	// ---------------------------------------------------------------------
 	// Real glow: soft light falloff via repeated separable box blur.
 	//
@@ -528,7 +544,7 @@ namespace
 		const Gdiplus::RectF rect(static_cast<float>(kPadGlowMargin), static_cast<float>(kPadGlowMargin),
 			static_cast<float>(cell.right - cell.left), static_cast<float>(cell.bottom - cell.top));
 		Gdiplus::GraphicsPath path;
-		AddRoundedRectPath(path, rect, 14.0f);
+		AddPadPath(path, rect, slotIndex == 1);
 
 		const bool selected = visual == PadVisual::IdleSelected || visual == PadVisual::OccupiedSelected;
 		const bool occupied = visual == PadVisual::Occupied || visual == PadVisual::OccupiedSelected;
@@ -1892,15 +1908,13 @@ namespace
 			const float breathe = 0.5f + 0.5f * std::sin(phase * 2.0f * 3.14159265f);
 			const int alpha = static_cast<int>(130 + 110 * breathe);
 			const float inflate = 1.5f + 3.5f * breathe;
-			const float rad = 14.0f;
-
 			Gdiplus::GraphicsPath ringPath;
-			AddRoundedRectPath(ringPath,
+			AddPadPath(ringPath,
 				Gdiplus::RectF(static_cast<float>(cell.left) - inflate,
 					static_cast<float>(cell.top) - inflate,
 					static_cast<float>(cellWidth) + inflate * 2.0f,
 					static_cast<float>(cellHeight) + inflate * 2.0f),
-				rad);
+				index == 1);
 			Gdiplus::Pen ringPen(Gdiplus::Color(
 				alpha, GetRValue(kPadGlowRed), GetGValue(kPadGlowRed), GetBValue(kPadGlowRed)),
 				2.5f + 3.0f * breathe);
@@ -2250,9 +2264,30 @@ namespace
 		// original approach) is visibly flickery on a layered window, since
 		// DWM can composite a half-drawn frame; building the whole frame
 		// off-screen and blitting it atomically avoids that.
-		HDC dc = CreateCompatibleDC(windowDC);
-		HBITMAP bitmap = CreateCompatibleBitmap(windowDC, width, height);
-		HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+		//
+		// The buffer (and the Compacta HFONT) are created once and reused
+		// across frames; rebuilding them on every paint and font each time
+		// was measurable churn on the ~30-60fps animation path.
+		static HDC s_bufferDC = nullptr;
+		static HBITMAP s_bufferBitmap = nullptr;
+		static HGDIOBJ s_bufferOldBitmap = nullptr;
+		static int s_bufferW = 0;
+		static int s_bufferH = 0;
+		if (!s_bufferDC || s_bufferW != width || s_bufferH != height)
+		{
+			if (s_bufferDC)
+			{
+				SelectObject(s_bufferDC, s_bufferOldBitmap);
+				DeleteObject(s_bufferBitmap);
+				DeleteDC(s_bufferDC);
+			}
+			s_bufferDC = CreateCompatibleDC(windowDC);
+			s_bufferBitmap = CreateCompatibleBitmap(windowDC, width, height);
+			s_bufferOldBitmap = SelectObject(s_bufferDC, s_bufferBitmap);
+			s_bufferW = width;
+			s_bufferH = height;
+		}
+		HDC dc = s_bufferDC;
 
 		Gdiplus::Graphics g(dc);
 		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
@@ -2262,9 +2297,11 @@ namespace
 			g.DrawImage(background, 0, 0);
 
 		SetBkMode(dc, TRANSPARENT);
-		HFONT font = CreateFontW(-22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+		static HFONT s_uiFont = nullptr;
+		if (!s_uiFont)
+			s_uiFont = CreateFontW(-22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, g_uiFontFamilyName.c_str());
-		SelectObject(dc, font);
+		SelectObject(dc, s_uiFont);
 
 		// Persistent wordmark in the top-left of every screen — enlarged.
 		{
@@ -2384,13 +2421,9 @@ namespace
 		}
 
 		SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
-		DeleteObject(font);
 
 		BitBlt(windowDC, 0, 0, width, height, dc, 0, 0, SRCCOPY);
 
-		SelectObject(dc, oldBitmap);
-		DeleteObject(bitmap);
-		DeleteDC(dc);
 		EndPaint(window, &paint);
 	}
 
@@ -2498,8 +2531,13 @@ namespace
 			}
 		}
 
-		// Menu navigation only applies while the overlay is actually shown and focused.
-		if (!g_app.overlayVisible || GetForegroundWindow() != window || IsIconic(window) || !anyConnected)
+		// Menu navigation only applies while the overlay is actually visible.
+		// Foreground focus is deliberately NOT required here: the overlay is
+		// an always-on-top controller picker, Cemu (or the game) almost always
+		// holds foreground and Windows games aggressively re-grab focus, so
+		// gating on focus was silently swallowing whole button presses. Input
+		// exclusivity is handled by UpdateInputOwnership (visibility-based).
+		if (!g_app.overlayVisible || IsIconic(window) || !anyConnected)
 			return;
 
 		// Track whether anything actually changed this tick so the repaint
@@ -2527,8 +2565,29 @@ namespace
 		const bool gridScreen = g_app.screen == Screen::PadViewer ||
 			g_app.screen == Screen::FranchiseList || g_app.screen == Screen::RosterList;
 		const DWORD now = GetTickCount();
+
+		// D-pad edge presses move immediately instead of waiting out the
+		// hold-repeat throttle, so quick taps are never swallowed. Holding a
+		// direction (stick or D-pad held down) repeats at a fixed cadence.
+		constexpr int kNavRepeatMs = 150;
+		const int dxEdge = (combinedPressed & XINPUT_GAMEPAD_DPAD_RIGHT ? 1 : 0)
+			- (combinedPressed & XINPUT_GAMEPAD_DPAD_LEFT ? 1 : 0);
+		const int dyEdge = (combinedPressed & XINPUT_GAMEPAD_DPAD_UP ? -1 : 0)
+			- (combinedPressed & XINPUT_GAMEPAD_DPAD_DOWN ? -1 : 0);
+
 		const bool anyDirection = stickUp || stickDown || stickLeft || stickRight;
-		if (anyDirection && now - lastNavigation >= 180)
+		bool navigated = false;
+		if (dxEdge != 0 || dyEdge != 0)
+		{
+			if (gridScreen)
+				NavigateGrid(dxEdge, dyEdge);
+			else if (dxEdge != 0)
+				Navigate(dxEdge);
+			else
+				Navigate(dyEdge);
+			navigated = true;
+		}
+		else if (anyDirection && now - lastNavigation >= kNavRepeatMs)
 		{
 			if (gridScreen)
 			{
@@ -2545,17 +2604,25 @@ namespace
 			{
 				Navigate(stickUp ? -1 : 1);
 			}
+			navigated = true;
+		}
+		if (navigated)
+		{
 			lastNavigation = now;
 			changed = true;
 		}
 		if (!anyDirection)
 			lastNavigation = 0;
 
-		// Pad screens carry a pulsing selection ring, so they repaint every
-		// tick to keep the animation running even with no input; the other
-		// screens stay paint-on-change only.
+		// Pad screens carry a pulsing selection ring, so they keep repainting
+		// at a throttled ~30fps to animate it without hogging the CPU; the
+		// other screens stay strictly paint-on-change.
+		static DWORD lastAnimRefresh = 0;
 		const bool padScreen = g_app.screen == Screen::PadViewer || g_app.screen == Screen::PadAction;
-		if (changed || (g_app.overlayVisible && padScreen))
+		const bool animRefresh = g_app.overlayVisible && padScreen && (now - lastAnimRefresh >= 33);
+		if (animRefresh)
+			lastAnimRefresh = now;
+		if (changed || animRefresh)
 			InvalidateRect(window, nullptr, FALSE);
 	}
 
