@@ -1417,6 +1417,8 @@ namespace
 			NavigateGrid(0, direction);
 			break;
 		case Screen::PadAction:
+			// Buttons are now horizontal (Load | Clear | Move), so
+			// left/right and up/down both cycle through them.
 			if (direction < 0)
 				SelectPrevious(kPadActionCount, g_app.padActionIndex);
 			else
@@ -1800,18 +1802,27 @@ namespace
 	// the upper slot plus its two lower slots, the center pad (pad 1) is a
 	// single slot, and the right section (pad 3) mirrors the left. Sized for
 	// the fixed kOverlayWidth x kOverlayHeight window (this app isn't resizable).
+	//
+	// Each rect's width/height is the *native pixel size* of that slot's
+	// background PNG (left_upper.png/left_lower_left.png/right_upper.png/
+	// right_lower_right.png are 140x136, left_lower_right.png/
+	// right_lower_left.png are 168x136, Center.png is 188x184) - RenderPad
+	// draws the asset into this exact rect, so a mismatched size here is
+	// what stretches/distorts the art. Positions are measured off the
+	// reference Figma layout and mirrored left/right around the window's
+	// horizontal center (450) so the two sides line up exactly.
 	constexpr std::array<RECT, 7> kPadCells = {{
-		{ 60, 130, 230, 260}, // 0 Left - upper
-		{330, 130, 570, 260}, // 1 Center
-		{630, 130, 860, 260}, // 2 Right - upper
-		{ 60, 280, 180, 410}, // 3 Left - lower left
-		{180, 280, 300, 410}, // 4 Left - lower right
-		{630, 280, 745, 410}, // 5 Right - lower left
-		{745, 280, 860, 410}, // 6 Right - lower right
+		{100, 220, 240, 356}, // 0 Left - upper        (140x136)
+		{356, 103, 544, 287}, // 1 Center               (188x184)
+		{660, 220, 800, 356}, // 2 Right - upper        (140x136)
+		{100, 364, 240, 500}, // 3 Left - lower left    (140x136)
+		{240, 364, 408, 500}, // 4 Left - lower right   (168x136)
+		{492, 364, 660, 500}, // 5 Right - lower left   (168x136)
+		{660, 364, 800, 500}, // 6 Right - lower right  (140x136)
 	}};
 
 	// Franchise grid layout: 4 columns of large logo tiles, scrolled vertically.
-	constexpr int kFranchiseOriginX = 20;
+	constexpr int kFranchiseOriginX = 40;
 	constexpr int kFranchiseOriginY = 106;
 	constexpr int kFranchisePitchX = 210;
 	constexpr int kFranchisePitchY = 108;
@@ -1821,18 +1832,21 @@ namespace
 
 	// Roster grid layout: 5 columns of larger portrait-circles with wrapped
 	// name labels, vertical scrolling. Origin leaves room for the world logo.
-	constexpr int kRosterOriginX = 10;
-	constexpr int kRosterOriginY = 84;
-	constexpr int kRosterPitchX = 176;
+	constexpr int kRosterOriginX = 60;
+	constexpr int kRosterOriginY = 120;
+	constexpr int kRosterPitchX = 156;
 	constexpr int kRosterPitchY = 160;
-	constexpr int kPortraitDiameter = 108;
+	constexpr int kPortraitDiameter = 90;
 
 	// Capsule (pill) menus.
 	constexpr int kPillWidth = 340;
 	constexpr int kPillRowH = 36;
 	constexpr int kPillPadV = 7;
 
-	// The glossy pad itself plus its occupant (portrait circle + name).
+	// The glossy pad itself, plus a large centered occupant portrait when
+	// loaded. An empty pad is just the bare glass tile - no placeholder
+	// dot, no label - matching the reference design. No name text is
+	// drawn for occupied pads either; the portrait alone is the label.
 	void DrawPad(Gdiplus::Graphics& g, HDC dc, size_t index)
 	{
 		const RECT& cell = kPadCells[index];
@@ -1856,34 +1870,24 @@ namespace
 		if (pad)
 			g.DrawImage(pad, static_cast<int>(cell.left) - kPadGlowMargin, static_cast<int>(cell.top) - kPadGlowMargin);
 
+		if (!occupied)
+			return; // Empty pad: bare glass tile only, nothing drawn on top of it.
+
 		const int cellWidth = cell.right - cell.left;
 		const int cellHeight = cell.bottom - cell.top;
 		const PadSlot& slot = g_app.padState[index];
 
-		// Occupant portrait: a circle in the pad's upper portion, sized as a
-		// proportion of the cell (the 7 pads differ in size), with the name
-		// label wrapped below it. No slot-name label and no "(empty)" text -
-		// an empty pad is just its placeholder.
+		// Portrait fills most of the pad's face, centered both ways, since
+		// there is no name label underneath competing for vertical space
+		// anymore.
 		const int shorter = std::min(cellWidth, cellHeight);
-		const int kOccupantDiameter = std::clamp(static_cast<int>(shorter * 0.38f), 40, 70);
-		const int kNameAreaH = 44;   // room for a wrapped (2-line) name
+		const int kOccupantDiameter = std::clamp(static_cast<int>(shorter * 0.62f), 60, 110);
 		const int circleX = cell.left + (cellWidth - kOccupantDiameter) / 2;
-		const int circleY = cell.top + static_cast<int>(cellHeight * 0.38f) - kOccupantDiameter / 2;
+		const int circleY = cell.top + (cellHeight - kOccupantDiameter) / 2;
 
-		if (occupied)
-		{
-			Gdiplus::Bitmap* portrait = RenderPortrait(slot.portraitResourceId, slot.ringColor, false, kOccupantDiameter);
-			if (portrait)
-				g.DrawImage(portrait, circleX - kPortraitMargin, circleY - kPortraitMargin);
-			DrawTextWrappedCentered(dc, slot.figureName,
-				cell.left + 4, circleY + kOccupantDiameter + 8, cellWidth - 8, kNameAreaH, RGB(226, 240, 230));
-		}
-		else
-		{
-			Gdiplus::Bitmap* placeholder = RenderPlaceholder(L' ', kPadBorderIdle, false, kOccupantDiameter);
-			if (placeholder)
-				g.DrawImage(placeholder, circleX - kPortraitMargin, circleY - kPortraitMargin);
-		}
+		Gdiplus::Bitmap* portrait = RenderPortrait(slot.portraitResourceId, slot.ringColor, false, kOccupantDiameter);
+		if (portrait)
+			g.DrawImage(portrait, circleX - kPortraitMargin, circleY - kPortraitMargin);
 	}
 
 	// Capsule menu floating above the selected pad (PadAction) or centered
@@ -1912,31 +1916,115 @@ namespace
 		}
 	}
 
-	void DrawPadActionMenu(Gdiplus::Graphics& g, HDC dc)
+	// Action bar: textfield_bar.png background with Load, Clear, Move button
+	// images laid horizontally inside it, floating above or below the selected
+	// pad depending on the pad's position. Drawn only when the overlay is in
+	// Screen::PadAction (i.e. the user pressed A on a pad to open the menu).
+	//
+	// Placement rules (matching the user's reference screenshot):
+	//   - Left/right upper pads  (index 0, 2) : bar sits ABOVE the pad
+	//   - Center pad             (index 1)    : bar sits BELOW the pad
+	//   - All lower pads         (index 3-6)  : bar sits BELOW the pad
+	// "above/below" means ~6 px gap from the pad edge to the bar edge.
+	constexpr int kBarGap = 6;    // pixels between pad edge and bar edge
+	constexpr int kBarH = 42;    // rendered height of the bar
+	constexpr int kBtnW = 70;    // each button image width inside the bar
+	constexpr int kBtnH = 26;    // each button image height inside the bar
+	constexpr int kBarInnerPad = 8; // left/right padding inside bar before first btn
+
+	void DrawActionBar(Gdiplus::Graphics& g)
 	{
-		// Fixed bottom-left position regardless of which pad is selected
-		// (pill bottom lands ~gap above the window's bottom edge).
-		constexpr int pillX = 16;
-		constexpr int pillY = 470;
 		const RECT& cell = kPadCells[g_app.slotIndex];
+		const int cellW = cell.right - cell.left;
 
-		// Thin gold/tan connector from the pill's top up to the selected
-		// pad's bottom-center, drawn before the pill so the pill panel sits
-		// on top of the line's start.
-		Gdiplus::Pen connector(Gdiplus::Color(128,
-			GetRValue(kGlowGold), GetGValue(kGlowGold), GetBValue(kGlowGold)), 3.0f);
-		const Gdiplus::PointF from(static_cast<float>(pillX + 140), static_cast<float>(pillY));
-		const Gdiplus::PointF to(static_cast<float>((cell.left + cell.right) / 2),
-			static_cast<float>(cell.bottom));
-		g.DrawLine(&connector, from, to);
+		// The bar is perfectly matched to the width of the selected pad tile.
+		int barW = cellW;
+		int barH = 42; // default if no image
 
-		const PadSlot& target = g_app.padState[g_app.slotIndex];
-		const std::vector<std::wstring> options = {
-			L"Load",
-			target.occupied ? L"Clear" : L"Clear (empty)",
-			L"Move",
-		};
-		DrawPillMenu(g, dc, pillX, pillY, kPadActionCount, options, g_app.padActionIndex);
+		Gdiplus::Bitmap* barBg = GetAssetBitmap(kTextfieldBarResourceId);
+		if (barBg && barBg->GetWidth() > 0)
+		{
+			// Scale the bar's height so it maintains its exact image aspect ratio
+			const float aspect = static_cast<float>(barBg->GetWidth()) / static_cast<float>(barBg->GetHeight());
+			barH = static_cast<int>(barW / aspect);
+		}
+
+		const int padCenterX = (cell.left + cell.right) / 2;
+		const int barX = padCenterX - barW / 2;
+
+		constexpr int kBarGap = 6;
+		const bool barAbove = (g_app.slotIndex == 0 || g_app.slotIndex == 2);
+		const int barY = barAbove
+			? (cell.top - kBarGap - barH)
+			: (cell.bottom + kBarGap);
+
+		if (barBg)
+		{
+			g.DrawImage(barBg, barX, barY, barW, barH);
+		}
+
+		// Calculate maximum bounds for the 3 buttons inside the bar
+		const int kBarInnerPad = static_cast<int>(barW * 0.12f);
+		const int kBtnGap = static_cast<int>(barW * 0.04f);
+		const int availableW = barW - (kBarInnerPad * 2);
+		const int maxBtnW = (availableW - (kBtnGap * 2)) / 3;
+
+		// Start with an ideal height (65% of the bar's inner height)
+		int btnH = static_cast<int>(barH * 0.65f);
+		float btnAspect = 2.666f; // fallback roughly 96/36
+
+		Gdiplus::Bitmap* sampleBtn = GetAssetBitmap(kLoadButtonResourceId);
+		if (sampleBtn && sampleBtn->GetHeight() > 0)
+		{
+			btnAspect = static_cast<float>(sampleBtn->GetWidth()) / static_cast<float>(sampleBtn->GetHeight());
+		}
+
+		int btnW = static_cast<int>(btnH * btnAspect);
+
+		// If the ideal height makes the buttons too wide for the bar, proportionally scale them down
+		if (btnW > maxBtnW)
+		{
+			btnW = maxBtnW;
+			btnH = static_cast<int>(btnW / btnAspect);
+		}
+
+		// Center the cluster of 3 buttons perfectly inside the bar
+		const int totalBtnsW = (btnW * 3) + (kBtnGap * 2);
+		const int btnAreaStart = barX + (barW - totalBtnsW) / 2;
+		const int btnY = barY + (barH - btnH) / 2;
+
+		const std::array<int, 3> btnResIds = {{
+			kLoadButtonResourceId,
+			kClearButtonResourceId,
+			kMoveButtonResourceId,
+		}};
+
+		for (int i = 0; i < 3; ++i)
+		{
+			Gdiplus::Bitmap* btn = GetAssetBitmap(btnResIds[i]);
+			if (!btn)
+				continue;
+			
+			const int bx = btnAreaStart + i * (btnW + kBtnGap);
+
+			// Focused button gets a gold glow outline drawn behind it.
+			if (static_cast<size_t>(i) == g_app.padActionIndex)
+			{
+				Gdiplus::GraphicsPath hlPath;
+				AddRoundedRectPath(hlPath,
+					Gdiplus::RectF(static_cast<float>(bx - 2), static_cast<float>(btnY - 2),
+						static_cast<float>(btnW + 4), static_cast<float>(btnH + 4)),
+					10.0f);
+				Gdiplus::SolidBrush hlBrush(Gdiplus::Color(80, 255, 230, 80));
+				g.FillPath(&hlBrush, &hlPath);
+				Gdiplus::Pen hlPen(Gdiplus::Color(200,
+					GetRValue(kGlowGold), GetGValue(kGlowGold), GetBValue(kGlowGold)), 2.0f);
+				hlPen.SetLineJoin(Gdiplus::LineJoinRound);
+				g.DrawPath(&hlPen, &hlPath);
+			}
+
+			g.DrawImage(btn, bx, btnY, btnW, btnH);
+		}
 	}
 
 	// Plus-picker: the vehicle's builds as a row of portrait circles (colored
@@ -1951,21 +2039,21 @@ namespace
 		const auto& builds = g_app.plusGroup->builds;
 		const size_t count = builds.size();
 
-		constexpr int diam = 108;
-		constexpr int step = 176;
+		constexpr int diam = 90;
+		constexpr int step = 156;
 		constexpr int gapToPlus = 40;
-		constexpr int circleY = 150;
-		constexpr int labelH = 46;
+		constexpr int circleY = 160;
+		constexpr int labelH = 58;
 
 		const int groupW = static_cast<int>(count - 1) * step + diam + gapToPlus + diam;
 		const int groupX = (kOverlayWidth - groupW) / 2;
 
 		// Large translucent panel (characters_tile art) behind the circles.
-		constexpr int panelXPad = 34;
-		constexpr int panelTopPad = 26;
+		constexpr int panelXPad = 24;
+		constexpr int panelTopPad = 20;
 		const int panelX = groupX - panelXPad;
 		const int panelY = circleY - panelTopPad;
-		const int panelH = panelTopPad + diam + 8 + labelH + 24;
+		const int panelH = panelTopPad + diam + 8 + labelH + 16;
 		const int panelW = groupW + panelXPad * 2;
 		const Gdiplus::RectF panelRect(static_cast<float>(panelX), static_cast<float>(panelY),
 			static_cast<float>(panelW), static_cast<float>(panelH));
@@ -2067,7 +2155,7 @@ namespace
 				if (visual)
 					g.DrawImage(visual, circleX - kPortraitMargin, circleY - kPortraitMargin);
 
-				DrawTextWrappedCentered(dc, label, x, y + kPortraitDiameter + 8, kRosterPitchX, 46,
+				DrawTextWrappedCentered(dc, label, x, y + kPortraitDiameter + 8, kRosterPitchX, 58,
 					focused ? RGB(255, 236, 190) : RGB(214, 220, 230));
 			}
 		}
@@ -2104,12 +2192,12 @@ namespace
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, g_uiFontFamilyName.c_str());
 		SelectObject(dc, font);
 
-		// Persistent small wordmark in the top-left of every screen.
+		// Persistent wordmark in the top-left of every screen — enlarged.
 		{
 			Gdiplus::Bitmap* wordmark = GetAssetBitmap(kWordmarkResourceId);
 			if (wordmark)
 			{
-				const Gdiplus::RectF box(16.0f, 10.0f, 360.0f, 76.0f);
+				const Gdiplus::RectF box(12.0f, 8.0f, 460.0f, 90.0f);
 				const float scale = std::min(box.Width / wordmark->GetWidth(), box.Height / wordmark->GetHeight());
 				const float drawW = wordmark->GetWidth() * scale;
 				const float drawH = wordmark->GetHeight() * scale;
@@ -2127,7 +2215,7 @@ namespace
 		case Screen::PadAction:
 			for (size_t index = 0; index < kPadCells.size(); ++index)
 				DrawPad(g, dc, index);
-			DrawPadActionMenu(g, dc);
+			DrawActionBar(g);
 			break;
 		case Screen::FranchiseList:
 			DrawFranchiseGrid(g, dc);
@@ -2138,7 +2226,7 @@ namespace
 			Gdiplus::Bitmap* worldLogo = GetAssetBitmap(kFranchises[g_app.franchiseIndex].logoResourceId);
 			if (worldLogo)
 			{
-				const Gdiplus::RectF box((width - 360.0f) / 2.0f, 8.0f, 360.0f, 62.0f);
+				const Gdiplus::RectF box((width - 360.0f) / 2.0f, 24.0f, 360.0f, 62.0f);
 				const float scale = std::min(box.Width / worldLogo->GetWidth(), box.Height / worldLogo->GetHeight());
 				const float drawW = worldLogo->GetWidth() * scale;
 				const float drawH = worldLogo->GetHeight() * scale;
@@ -2151,12 +2239,12 @@ namespace
 			// whole portrait grid, spanning the roster grid's bounding box
 			// plus a margin on each side. Drawn before the grid so the
 			// portraits sit on top of it.
-			const int gridRight = kRosterOriginX + static_cast<int>(kRosterCols - 1) * kRosterPitchX + kPortraitDiameter;
-			const int gridBottom = kRosterOriginY + static_cast<int>(kRosterVisibleRows - 1) * kRosterPitchY + kPortraitDiameter + 46;
+			const int gridRight = kRosterOriginX + static_cast<int>(kRosterCols) * kRosterPitchX;
+			const int gridBottom = kRosterOriginY + static_cast<int>(kRosterVisibleRows - 1) * kRosterPitchY + kPortraitDiameter + 58;
 			const int panelX = kRosterOriginX - 16;
-			const int panelY = kRosterOriginY - 16;
+			const int panelY = kRosterOriginY - 14;
 			const Gdiplus::RectF panelRect(static_cast<float>(panelX), static_cast<float>(panelY),
-				static_cast<float>(gridRight - panelX), static_cast<float>(gridBottom - panelY));
+				static_cast<float>(gridRight - panelX + 16), static_cast<float>(gridBottom - panelY + 14));
 			Gdiplus::Bitmap* rosterPanel = GetAssetBitmap(kCharactersTileResourceId);
 			if (rosterPanel)
 			{
@@ -2373,6 +2461,11 @@ namespace
 				const int dx = stickLeft ? -1 : (stickRight ? 1 : 0);
 				const int dy = stickUp ? -1 : (stickDown ? 1 : 0);
 				NavigateGrid(dx, dy);
+			}
+			else if (stickLeft || stickRight)
+			{
+				// Horizontal: navigate action-bar buttons and similar horizontal lists.
+				Navigate(stickLeft ? -1 : 1);
 			}
 			else if (stickUp || stickDown)
 			{

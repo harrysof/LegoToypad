@@ -380,6 +380,22 @@ def generate(root: Path, out_dir: Path) -> int:
     if characters_tile:
         ascii_ok([str(characters_tile)], warnings)
 
+    # ---- action bar button assets -----------------------------------------
+    textfield_bar   = pick_named({"textfield_bar"},   "textfield bar background")
+    load_button     = pick_named({"load_button"},     "load button")
+    clear_button    = pick_named({"clear_button"},    "clear button")
+    move_button     = pick_named({"move_button"},     "move button")
+    textfield_bar_sym  = symbols.allocate("ASSET_TEXTFIELD_BAR",  textfield_bar)  if textfield_bar  else None
+    load_button_sym    = symbols.allocate("ASSET_LOAD_BUTTON",    load_button)    if load_button    else None
+    clear_button_sym   = symbols.allocate("ASSET_CLEAR_BUTTON",   clear_button)   if clear_button   else None
+    move_button_sym    = symbols.allocate("ASSET_MOVE_BUTTON",    move_button)    if move_button    else None
+    for name, asset in [("textfield_bar", textfield_bar), ("load_button", load_button),
+                        ("clear_button", clear_button), ("move_button", move_button)]:
+        if asset:
+            ascii_ok([str(asset)], warnings)
+        else:
+            warnings.append("missing action-bar asset: %s" % name)
+
     # ---- UI font -----------------------------------------------------------
     # The Compacta-typeface TTF embedded for GDI/GDI+ in-memory font loading.
     ui_font = None
@@ -488,6 +504,10 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kWorldTileResourceId;")
     header.append("extern const int kCharactersTileResourceId;")
     header.append("extern const int kPadBackgroundResourceIds[7];")
+    header.append("extern const int kTextfieldBarResourceId;")
+    header.append("extern const int kLoadButtonResourceId;")
+    header.append("extern const int kClearButtonResourceId;")
+    header.append("extern const int kMoveButtonResourceId;")
     header.append("")
     header.append("#endif  // RC_INVOKED")
     header.append("")
@@ -514,6 +534,10 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kCharactersTileResourceId = %s;" % (characters_tile_sym["name"] if characters_tile_sym else "0"))
     cpp.append("const int kPadBackgroundResourceIds[7] = { %s };"
                % ", ".join(sym["name"] if sym else "0" for sym in pad_bg_syms))
+    cpp.append("const int kTextfieldBarResourceId = %s;" % (textfield_bar_sym["name"] if textfield_bar_sym else "0"))
+    cpp.append("const int kLoadButtonResourceId = %s;" % (load_button_sym["name"] if load_button_sym else "0"))
+    cpp.append("const int kClearButtonResourceId = %s;" % (clear_button_sym["name"] if clear_button_sym else "0"))
+    cpp.append("const int kMoveButtonResourceId = %s;" % (move_button_sym["name"] if move_button_sym else "0"))
     cpp.append("")
 
     def emit_entry(entry):
