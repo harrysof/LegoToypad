@@ -1,5 +1,9 @@
 # LegoToypad
 
+<p align="center">
+  <img src="Assets/Legotoypad_Logo.png" alt="LegoToypad logo" width="220">
+</p>
+
 A controller-driven companion app for LEGO Dimensions in Cemu. Browse franchises
 and figures, pick a Toypad position, and send it straight to Cemu, no mouse
 needed. Requires a Cemu build with the local Toypad listener enabled.
@@ -7,6 +11,17 @@ needed. Requires a Cemu build with the local Toypad listener enabled.
 Every asset - figure tags, portraits, world logos, the background, the wordmark,
 the app icon - is compiled into `LegoToypad.exe` itself as a Win32 resource. The
 exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
+
+## Screenshots
+
+<p align="center">
+  <img src="Assets/Exampleimgs/img1.jpg" alt="Toypad picker" width="49%">
+  <img src="Assets/Exampleimgs/img2.jpg" alt="Action bar over pad" width="49%">
+</p>
+<p align="center">
+  <img src="Assets/Exampleimgs/img3.jpg" alt="World/franchise browser" width="49%">
+  <img src="Assets/Exampleimgs/img4.jpg" alt="Figure roster" width="49%">
+</p>
 
 ## Build
 
