@@ -603,12 +603,24 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("")
 
     # -----------------------------------------------------------------------
-    # Emit app.ico (PNG payload inside an ICO frame - supported since Vista)
+    # Emit app.ico. A real multi-resolution ICO (16/24/32/48/256) so the
+    # system tray, taskbar and title bar each get a native-size frame instead
+    # of a single 256px PNG downscaled for the small tray icon. Falls back to
+    # the old single PNG frame if Pillow isn't installed.
     # -----------------------------------------------------------------------
     png_bytes = app_icon.read_bytes()
-    ico = struct.pack("<HHH", 0, 1, 1)                      # ICONDIR
-    ico += struct.pack("<BBBBHHII", 0, 0, 0, 0, 1, 32, len(png_bytes), 22)  # ICONDIRENTRY
-    ico += png_bytes
+    try:
+        from PIL import Image
+
+        src = Image.open(io.BytesIO(png_bytes))
+        src.load()
+        buf = io.BytesIO()
+        src.save(buf, format="ICO", sizes=[(s, s) for s in (16, 24, 32, 48, 256)])
+        ico = buf.getvalue()
+    except Exception:
+        ico = struct.pack("<HHH", 0, 1, 1)                      # ICONDIR
+        ico += struct.pack("<BBBBHHII", 0, 0, 0, 0, 1, 32, len(png_bytes), 22)  # ICONDIRENTRY
+        ico += png_bytes
 
     files = {
         out_dir / "resources.rc": "\n".join(rc_lines) + "\n",

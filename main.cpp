@@ -462,19 +462,31 @@ namespace
 	// result behind everything else that draws on top. `width`/`height` are
 	// the full target bitmap dimensions (the shape is already placed in that
 	// bitmap's coordinate space).
+	void CompositeGlow(Gdiplus::Graphics& g, Gdiplus::Bitmap* mask, int radius, int width, int height);
+
 	void DrawGlow(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& path,
 		unsigned int color, int radius, int width, int height)
 	{
-		const Gdiplus::Rect lock(0, 0, width, height);
-
 		Gdiplus::Bitmap mask(width, height, PixelFormat32bppPARGB);
 		Gdiplus::Graphics mg(&mask);
 		mg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
 		Gdiplus::SolidBrush solid(Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color)));
 		mg.FillPath(&solid, &path);
+		CompositeGlow(g, &mask, radius, width, height);
+	}
 
+	// Blurs the alpha of `mask` (a PARGB bitmap holding the silhouette, RGB
+	// already premultiplied) and composites it as a soft colored halo. Shared
+	// by the path-based glow and the art-derived glow so both use identical
+	// blur quality.
+	void CompositeGlow(Gdiplus::Graphics& g, Gdiplus::Bitmap* mask, int radius, int width, int height)
+	{
+		if (!mask)
+			return;
+
+		const Gdiplus::Rect lock(0, 0, width, height);
 		Gdiplus::BitmapData data;
-		if (mask.LockBits(&lock, Gdiplus::ImageLockModeRead | Gdiplus::ImageLockModeWrite,
+		if (mask->LockBits(&lock, Gdiplus::ImageLockModeRead | Gdiplus::ImageLockModeWrite,
 				PixelFormat32bppPARGB, &data) != Gdiplus::Ok)
 			return;
 
@@ -496,9 +508,9 @@ namespace
 		for (int y = 0; y < height; ++y)
 			std::memcpy(dest + static_cast<size_t>(y) * data.Stride,
 				a.data() + static_cast<size_t>(y) * width * 4, static_cast<size_t>(width) * 4);
-		mask.UnlockBits(&data);
+		mask->UnlockBits(&data);
 
-		g.DrawImage(&mask, 0, 0, width, height);
+		g.DrawImage(mask, 0, 0, width, height);
 	}
 
 	void DrawTopGloss(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& clipPath, int width, int height)
@@ -1827,6 +1839,22 @@ namespace
 		wcsncpy(icon.szTip, tip, std::size(icon.szTip) - 1);
 		icon.szTip[std::size(icon.szTip) - 1] = L'\0';
 		Shell_NotifyIconW(NIM_ADD, &icon);
+
+		// One-time launch toast letting the user know the picker is live and
+		// how to open it (NIM_MODIFY with NIF_INFO on the same icon id).
+		NOTIFYICONDATAW note{};
+		note.cbSize = sizeof(note);
+		note.hWnd = window;
+		note.uID = kTrayIconId;
+		note.uFlags = NIF_INFO;
+		note.dwInfoFlags = NIIF_INFO;
+		const wchar_t* noteTitle = L"LEGO Dimensions Toypad Picker";
+		wcsncpy(note.szInfoTitle, noteTitle, std::size(note.szInfoTitle) - 1);
+		note.szInfoTitle[std::size(note.szInfoTitle) - 1] = L'\0';
+		const wchar_t* noteText = L"LegoToypad is running in the background. Use the toggle shortcut to show the picker.";
+		wcsncpy(note.szInfo, noteText, std::size(note.szInfo) - 1);
+		note.szInfo[std::size(note.szInfo) - 1] = L'\0';
+		Shell_NotifyIconW(NIM_MODIFY, &note);
 	}
 
 	void RemoveTrayIcon(HWND window)
@@ -1980,6 +2008,64 @@ namespace
 		Gdiplus::Bitmap* portrait = RenderPortrait(slot.portraitResourceId, slot.ringColor, false, kOccupantDiameter);
 		if (portrait)
 			g.DrawImage(portrait, circleX - kPortraitMargin, circleY - kPortraitMargin);
+	}
+
+	// The focused occupied pad's occupant name, as muted translucent text
+	// just outside the pad's edge, vertically centered on the pad. Upper and
+	// center pads have free space on their outer side, so the label lives
+	// there; the four flush lower pads leave no room beside them, so their
+	// label sits below the pad row, clear of the side-by-side tiles (and of
+	// the action bar, which also floats below them).
+	void DrawOccupantLabel(Gdiplus::Graphics& g, size_t index)
+	{
+		const PadSlot& slot = g_app.padState[index];
+		if (!slot.occupied || slot.figureName.empty())
+			return;
+
+		const RECT& cell = kPadCells[index];
+		constexpr int kPadLabelGap = 14;
+		constexpr int labelH = 28;
+		const int cellHeightPx = cell.bottom - cell.top;
+		int labelX = 0;
+		int labelW = 0;
+		int labelY = 0;
+		bool alignFar = false;
+		if (index >= 3)
+		{
+			// Below the pad row: center on the pad, spanning clear of the
+			// action bar that floats beneath these pads.
+			labelW = 260;
+			labelX = cell.left + (cell.right - cell.left - labelW) / 2;
+			labelY = cell.bottom + 52;
+		}
+		else
+		{
+			// Side placement: right of the left/center pads, left of the
+			// rightmost pad, vertically centered on the pad.
+			const bool labelOnRight = index != 2;
+			labelY = cell.top + (cellHeightPx - labelH) / 2;
+			alignFar = !labelOnRight;
+			if (labelOnRight)
+			{
+				labelX = cell.right + kPadLabelGap;
+				labelW = kOverlayWidth - labelX - 14;
+			}
+			else
+			{
+				labelW = cell.left - kPadLabelGap - 14;
+				labelX = 14;
+			}
+		}
+
+		static Gdiplus::Font s_labelFont(g_uiFontFamily, 22.0f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+		Gdiplus::StringFormat format(Gdiplus::StringFormatFlagsNoClip | Gdiplus::StringFormatFlagsNoWrap);
+		format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+		format.SetAlignment(alignFar ? Gdiplus::StringAlignmentFar : Gdiplus::StringAlignmentNear);
+		Gdiplus::SolidBrush labelBrush(Gdiplus::Color(150, 235, 240, 245));
+		g.DrawString(slot.figureName.c_str(), -1, &s_labelFont,
+			Gdiplus::RectF(static_cast<float>(labelX), static_cast<float>(labelY),
+				static_cast<float>(labelW), static_cast<float>(labelH)),
+			&format, &labelBrush);
 	}
 
 	// Capsule menu floating above the selected pad (PadAction) or centered
@@ -2463,6 +2549,11 @@ case Screen::RosterList:
 		}
 		}
 
+		// The focused occupied pad's occupant name, drawn after the pads and
+		// action bar so it stays readable on all pad screens.
+		if (g_app.screen == Screen::PadViewer || g_app.screen == Screen::PadAction)
+			DrawOccupantLabel(g, g_app.slotIndex);
+
 		SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
 
 		// "by harrysof" credit marker in the top-right of every screen, vertically
@@ -2805,6 +2896,14 @@ case Screen::RosterList:
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
+	// Single instance: the named mutex survives as long as this process, so a
+	// second launch can't grab it and quietly exits instead of running two
+	// pickers (which would fight over the socket, controller and toy-pad).
+	// Keep the handle alive for the whole lifetime by not closing it here.
+	HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\LegoToypadSingleInstance");
+	if (!instanceMutex || GetLastError() == ERROR_ALREADY_EXISTS)
+		return 0;
+
 	SetProcessDPIAware();
 
 	WSADATA wsaData{};
