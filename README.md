@@ -15,12 +15,12 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
 ## Screenshots
 
 <p align="center">
-  <img width="900" height="610" alt="img1" src="https://github.com/user-attachments/assets/c67b67d6-70d9-4037-982b-e0121c408770" />
-  <img width="900" height="610" alt="img4" src="https://github.com/user-attachments/assets/08f13a24-78a9-4016-8b84-71457e1ab586" />
+  <img width="440" height="298" alt="img1" src="https://github.com/user-attachments/assets/c67b67d6-70d9-4037-982b-e0121c408770" />
+  <img width="440" height="298" alt="img4" src="https://github.com/user-attachments/assets/08f13a24-78a9-4016-8b84-71457e1ab586" />
 </p>
 <p align="center">
-  <img width="900" height="610" alt="img3" src="https://github.com/user-attachments/assets/92582bf1-fb32-4b05-b709-68f58da14aa9" />
-  <img width="900" height="610" alt="img2" src="https://github.com/user-attachments/assets/5256bd92-6013-4a17-93fe-8dfaa866aec3" />
+  <img width="440" height="298" alt="img3" src="https://github.com/user-attachments/assets/92582bf1-fb32-4b05-b709-68f58da14aa9" />
+  <img width="440" height="298" alt="img2" src="https://github.com/user-attachments/assets/5256bd92-6013-4a17-93fe-8dfaa866aec3" />
 </p>
 
 ## Build
