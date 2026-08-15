@@ -1,4 +1,3 @@
-<img width="900" height="610" alt="img1" src="https://github.com/user-attachments/assets/df12a6a6-1cd4-444b-8122-793ef75cca39" />
 # LegoToypad
 
 <p align="center">
