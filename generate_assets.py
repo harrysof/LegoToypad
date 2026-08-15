@@ -386,14 +386,16 @@ def generate(root: Path, out_dir: Path) -> int:
     clear_button    = pick_named({"clear_button"},    "clear button")
     move_button     = pick_named({"move_button"},     "move button")
     scroll_bar      = pick_named({"scroll_bar"},      "scroll bar")
+    by_harrysof     = pick_named({"by_harrysof"},      "by harrysof watermark")
     textfield_bar_sym  = symbols.allocate("ASSET_TEXTFIELD_BAR",  textfield_bar)  if textfield_bar  else None
     load_button_sym    = symbols.allocate("ASSET_LOAD_BUTTON",    load_button)    if load_button    else None
     clear_button_sym   = symbols.allocate("ASSET_CLEAR_BUTTON",   clear_button)   if clear_button   else None
     move_button_sym    = symbols.allocate("ASSET_MOVE_BUTTON",    move_button)    if move_button    else None
     scroll_bar_sym     = symbols.allocate("ASSET_SCROLL_BAR",     scroll_bar)     if scroll_bar     else None
+    by_harrysof_sym    = symbols.allocate("ASSET_BY_HARRYSOF",    by_harrysof)    if by_harrysof    else None
     for name, asset in [("textfield_bar", textfield_bar), ("load_button", load_button),
                         ("clear_button", clear_button), ("move_button", move_button),
-                        ("scroll_bar", scroll_bar)]:
+                        ("scroll_bar", scroll_bar), ("by_harrysof", by_harrysof)]:
         if asset:
             ascii_ok([str(asset)], warnings)
         else:
@@ -543,6 +545,7 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kClearButtonResourceId;")
     header.append("extern const int kMoveButtonResourceId;")
     header.append("extern const int kScrollBarResourceId;")
+    header.append("extern const int kByHarrysofResourceId;")
     header.append("")
     header.append("#endif  // RC_INVOKED")
     header.append("")
@@ -574,6 +577,7 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kClearButtonResourceId = %s;" % (clear_button_sym["name"] if clear_button_sym else "0"))
     cpp.append("const int kMoveButtonResourceId = %s;" % (move_button_sym["name"] if move_button_sym else "0"))
     cpp.append("const int kScrollBarResourceId = %s;" % (scroll_bar_sym["name"] if scroll_bar_sym else "0"))
+    cpp.append("const int kByHarrysofResourceId = %s;" % (by_harrysof_sym["name"] if by_harrysof_sym else "0"))
     cpp.append("")
 
     def emit_entry(entry):

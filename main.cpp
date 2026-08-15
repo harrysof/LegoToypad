@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <Xinput.h>
 #include <shellapi.h>
+#include <mmsystem.h>
 #include <gdiplus.h>
 
 #include <algorithm>
@@ -245,6 +246,7 @@ namespace
 		Pill,         // capsule menu background
 		PillRow,      // capsule focus highlight row
 		Background,   // full-window starfield + dark overlay
+		ScaledImage,  // raw asset rescaled (optionally rounded-rect clipped) once
 	};
 
 	struct GlossKey
@@ -588,7 +590,45 @@ namespace
 		return bitmap;
 	}
 
-	// Circular portrait with a deterministic ring color; focused gets a
+	// Raw asset rescaled to (w, h) and cached, so the expensive bicubic
+	// filter runs once per distinct size instead of on every paint. `radius`
+	// > 0 clips the result to a rounded rectangle of that radius (panel art
+	// behind grids); 0 keeps the full rectangle. The cache key's variant
+	// encodes the radius so same-sized panels with different corners don't
+	// share an entry.
+	Gdiplus::Bitmap* RenderScaledAsset(int resId, int w, int h, int radius)
+	{
+		Gdiplus::Bitmap* src = GetAssetBitmap(resId);
+		if (!src)
+			return nullptr;
+
+		const GlossKey key{GlossKind::ScaledImage, radius, resId, 0, w, h};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
+		Gdiplus::Graphics g(bitmap);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+		const Gdiplus::RectF rect(0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h));
+		if (radius > 0)
+		{
+			Gdiplus::GraphicsPath path;
+			AddRoundedRectPath(path, rect, static_cast<float>(radius));
+			Gdiplus::Region clip(&path);
+			g.SetClip(&clip);
+			g.DrawImage(src, rect);
+			g.ResetClip();
+		}
+		else
+		{
+			g.DrawImage(src, rect);
+		}
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
 	// brighter ring plus a colored glow. `diameter` is the circle size; the
 	// bitmap is padded by kPortraitMargin for the glow.
 	constexpr int kPortraitMargin = 8;
@@ -2010,9 +2050,9 @@ namespace
 			? (cell.top - kBarGap - barH)
 			: (cell.bottom + kBarGap);
 
-		if (barBg)
+		if (Gdiplus::Bitmap* bar = RenderScaledAsset(kTextfieldBarResourceId, barW, barH, 0))
 		{
-			g.DrawImage(barBg, barX, barY, barW, barH);
+			g.DrawImage(bar, barX, barY);
 		}
 
 		// Calculate maximum bounds for the 3 buttons inside the bar
@@ -2053,7 +2093,7 @@ namespace
 
 		for (int i = 0; i < 3; ++i)
 		{
-			Gdiplus::Bitmap* btn = GetAssetBitmap(btnResIds[i]);
+			Gdiplus::Bitmap* btn = RenderScaledAsset(btnResIds[i], btnW, btnH, 0);
 			if (!btn)
 				continue;
 			
@@ -2075,7 +2115,7 @@ namespace
 				g.DrawPath(&hlPen, &hlPath);
 			}
 
-			g.DrawImage(btn, bx, btnY, btnW, btnH);
+			g.DrawImage(btn, bx, btnY);
 		}
 	}
 
@@ -2107,17 +2147,10 @@ namespace
 		const int panelY = circleY - panelTopPad;
 		const int panelH = panelTopPad + diam + 8 + labelH + 16;
 		const int panelW = groupW + panelXPad * 2;
-		const Gdiplus::RectF panelRect(static_cast<float>(panelX), static_cast<float>(panelY),
-			static_cast<float>(panelW), static_cast<float>(panelH));
-		Gdiplus::Bitmap* panelArt = GetAssetBitmap(kCharactersTileResourceId);
-		if (panelArt)
+		if (Gdiplus::Bitmap* panel = RenderScaledAsset(
+			kCharactersTileResourceId, panelW, panelH, 16))
 		{
-			Gdiplus::GraphicsPath panelPath;
-			AddRoundedRectPath(panelPath, panelRect, 16.0f);
-			Gdiplus::Region clip(&panelPath);
-			g.SetClip(&clip);
-			g.DrawImage(panelArt, panelRect);
-			g.ResetClip();
+			g.DrawImage(panel, panelX, panelY);
 		}
 
 		for (size_t i = 0; i < count; ++i)
@@ -2251,6 +2284,11 @@ namespace
 
 	void Paint(HWND window)
 	{
+		// Top-left wordmark and the "by harrysof" marker (top-right) share a
+		// single horizontal band so they sit inline, inset 20px from the edges.
+		constexpr float kTopMargin = 20.0f;
+		constexpr float kTopBarH = 90.0f;
+
 		PAINTSTRUCT paint{};
 		HDC windowDC = BeginPaint(window, &paint);
 		RECT client{};
@@ -2308,7 +2346,7 @@ namespace
 			Gdiplus::Bitmap* wordmark = GetAssetBitmap(kWordmarkResourceId);
 			if (wordmark)
 			{
-				const Gdiplus::RectF box(12.0f, 8.0f, 460.0f, 90.0f);
+				const Gdiplus::RectF box(kTopMargin, kTopMargin, 460.0f, kTopBarH);
 				const float scale = std::min(box.Width / wordmark->GetWidth(), box.Height / wordmark->GetHeight());
 				const float drawW = wordmark->GetWidth() * scale;
 				const float drawH = wordmark->GetHeight() * scale;
@@ -2331,19 +2369,24 @@ namespace
 		case Screen::FranchiseList:
 			DrawFranchiseGrid(g, dc);
 			break;
-		case Screen::RosterList:
+case Screen::RosterList:
 		{
 			// The current world's logo at top-center, above the roster grid.
-			Gdiplus::Bitmap* worldLogo = GetAssetBitmap(kFranchises[g_app.franchiseIndex].logoResourceId);
-			if (worldLogo)
 			{
 				const Gdiplus::RectF box((width - 360.0f) / 2.0f, 24.0f, 360.0f, 62.0f);
-				const float scale = std::min(box.Width / worldLogo->GetWidth(), box.Height / worldLogo->GetHeight());
-				const float drawW = worldLogo->GetWidth() * scale;
-				const float drawH = worldLogo->GetHeight() * scale;
-				const Gdiplus::RectF dest(box.X + (box.Width - drawW) / 2.0f,
-					box.Y + (box.Height - drawH) / 2.0f, drawW, drawH);
-				g.DrawImage(worldLogo, dest);
+				Gdiplus::Bitmap* worldLogo = GetAssetBitmap(kFranchises[g_app.franchiseIndex].logoResourceId);
+				if (worldLogo)
+				{
+					const float scale = std::min(box.Width / worldLogo->GetWidth(), box.Height / worldLogo->GetHeight());
+					const int drawW = static_cast<int>(worldLogo->GetWidth() * scale);
+					const int drawH = static_cast<int>(worldLogo->GetHeight() * scale);
+					if (Gdiplus::Bitmap* logo = RenderScaledAsset(
+						kFranchises[g_app.franchiseIndex].logoResourceId, drawW, drawH, 0))
+					{
+						g.DrawImage(logo, box.X + (box.Width - drawW) / 2.0f,
+							box.Y + (box.Height - drawH) / 2.0f);
+					}
+				}
 			}
 
 			// characters_tile.png: one large translucent panel behind the
@@ -2356,15 +2399,10 @@ namespace
 			const int panelY = kRosterOriginY - 14;
 			const Gdiplus::RectF panelRect(static_cast<float>(panelX), static_cast<float>(panelY),
 				static_cast<float>(gridRight - panelX + 16), static_cast<float>(gridBottom - panelY + 14));
-			Gdiplus::Bitmap* rosterPanel = GetAssetBitmap(kCharactersTileResourceId);
-			if (rosterPanel)
+			if (Gdiplus::Bitmap* panel = RenderScaledAsset(
+				kCharactersTileResourceId, static_cast<int>(panelRect.Width), static_cast<int>(panelRect.Height), 14))
 			{
-				Gdiplus::GraphicsPath panelPath;
-				AddRoundedRectPath(panelPath, panelRect, 14.0f);
-				Gdiplus::Region clip(&panelPath);
-				g.SetClip(&clip);
-				g.DrawImage(rosterPanel, panelRect);
-				g.ResetClip();
+				g.DrawImage(panel, panelX, panelY);
 			}
 			DrawRosterGrid(g, dc);
 			break;
@@ -2373,16 +2411,21 @@ namespace
 		{
 			// The current world's logo above the builds panel, the same
 			// header the roster screen (this screen's parent) uses.
-			Gdiplus::Bitmap* worldLogo = GetAssetBitmap(kFranchises[g_app.franchiseIndex].logoResourceId);
-			if (worldLogo)
 			{
 				const Gdiplus::RectF box((width - 360.0f) / 2.0f, 8.0f, 360.0f, 62.0f);
-				const float scale = std::min(box.Width / worldLogo->GetWidth(), box.Height / worldLogo->GetHeight());
-				const float drawW = worldLogo->GetWidth() * scale;
-				const float drawH = worldLogo->GetHeight() * scale;
-				const Gdiplus::RectF dest(box.X + (box.Width - drawW) / 2.0f,
-					box.Y + (box.Height - drawH) / 2.0f, drawW, drawH);
-				g.DrawImage(worldLogo, dest);
+				Gdiplus::Bitmap* worldLogo = GetAssetBitmap(kFranchises[g_app.franchiseIndex].logoResourceId);
+				if (worldLogo)
+				{
+					const float scale = std::min(box.Width / worldLogo->GetWidth(), box.Height / worldLogo->GetHeight());
+					const int drawW = static_cast<int>(worldLogo->GetWidth() * scale);
+					const int drawH = static_cast<int>(worldLogo->GetHeight() * scale);
+					if (Gdiplus::Bitmap* logo = RenderScaledAsset(
+						kFranchises[g_app.franchiseIndex].logoResourceId, drawW, drawH, 0))
+					{
+						g.DrawImage(logo, box.X + (box.Width - drawW) / 2.0f,
+							box.Y + (box.Height - drawH) / 2.0f);
+					}
+				}
 			}
 			DrawPlusPickerMenu(g, dc);
 			break;
@@ -2421,6 +2464,25 @@ namespace
 		}
 
 		SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+
+		// "by harrysof" credit marker in the top-right of every screen, vertically
+		// centered on the same band as the wordmark so the two sit inline.
+		{
+			Gdiplus::Bitmap* mark = GetAssetBitmap(kByHarrysofResourceId);
+			if (mark)
+			{
+				constexpr float kMarkH = 30.0f;
+				const float scale = kMarkH / mark->GetHeight();
+				const float drawW = mark->GetWidth() * scale;
+				const float drawH = kMarkH;
+				const float markY = kTopMargin + (kTopBarH - drawH) / 2.0f;
+				if (Gdiplus::Bitmap* cached = RenderScaledAsset(
+					kByHarrysofResourceId, static_cast<int>(drawW), static_cast<int>(drawH), 0))
+				{
+					g.DrawImage(cached, width - drawW - kTopMargin, markY);
+				}
+			}
+		}
 
 		BitBlt(windowDC, 0, 0, width, height, dc, 0, 0, SRCCOPY);
 
@@ -2801,7 +2863,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	SetLayeredWindowAttributes(window, 0, kOverlayAlpha, LWA_ALPHA);
 	AddTrayIcon(window);
 	RegisterToggleHotkeyIfNeeded(window);
-	SetTimer(window, kControllerTimer, 16, nullptr);
+	SetTimer(window, kControllerTimer, 8, nullptr);
+	// The default Windows timer granularity (~15.6ms) would round an 8ms
+	// poll back up to ~16ms, keeping the fast-tap miss window untouched, so
+	// tighten the system timer resolution to 1ms for the app's lifetime.
+	timeBeginPeriod(1);
 
 	MSG message{};
 	while (GetMessageW(&message, nullptr, 0, 0) > 0)
@@ -2809,6 +2875,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 		TranslateMessage(&message);
 		DispatchMessageW(&message);
 	}
+
+	timeEndPeriod(1);
 
 	ReleaseGlossCache();
 	ReleaseAssetImages();

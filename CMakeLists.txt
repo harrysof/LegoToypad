@@ -38,4 +38,4 @@ target_compile_features(LegoToypad PRIVATE cxx_std_20)
 # NOMINMAX keeps windows.h's min/max macros from clobbering std::min/std::max.
 target_compile_definitions(LegoToypad PRIVATE UNICODE _UNICODE NOMINMAX)
 target_include_directories(LegoToypad PRIVATE "${GENERATED_DIR}")
-target_link_libraries(LegoToypad PRIVATE ws2_32 xinput9_1_0 shell32 gdiplus)
+target_link_libraries(LegoToypad PRIVATE ws2_32 xinput9_1_0 shell32 gdiplus winmm)
