@@ -385,31 +385,65 @@ def generate(root: Path, out_dir: Path) -> int:
     load_button     = pick_named({"load_button"},     "load button")
     clear_button    = pick_named({"clear_button"},    "clear button")
     move_button     = pick_named({"move_button"},     "move button")
+    scroll_bar      = pick_named({"scroll_bar"},      "scroll bar")
     textfield_bar_sym  = symbols.allocate("ASSET_TEXTFIELD_BAR",  textfield_bar)  if textfield_bar  else None
     load_button_sym    = symbols.allocate("ASSET_LOAD_BUTTON",    load_button)    if load_button    else None
     clear_button_sym   = symbols.allocate("ASSET_CLEAR_BUTTON",   clear_button)   if clear_button   else None
     move_button_sym    = symbols.allocate("ASSET_MOVE_BUTTON",    move_button)    if move_button    else None
+    scroll_bar_sym     = symbols.allocate("ASSET_SCROLL_BAR",     scroll_bar)     if scroll_bar     else None
     for name, asset in [("textfield_bar", textfield_bar), ("load_button", load_button),
-                        ("clear_button", clear_button), ("move_button", move_button)]:
+                        ("clear_button", clear_button), ("move_button", move_button),
+                        ("scroll_bar", scroll_bar)]:
         if asset:
             ascii_ok([str(asset)], warnings)
         else:
             warnings.append("missing action-bar asset: %s" % name)
 
     # ---- UI font -----------------------------------------------------------
-    # The Compacta-typeface TTF embedded for GDI/GDI+ in-memory font loading.
+    # The Compacta-typeface font embedded for GDI/GDI+ in-memory loading.
+    # GDI/GDI+ only consume raw SFNT (.ttf/.otf) bytes in memory, so web-font
+    # formats (.woff/.woff2) are decompressed here at build time and staged
+    # into the output dir; the runtime app path is unchanged.
     ui_font = None
+    font_rc_path = None
     if assets_root:
         font_candidates = [p for p in assets_root.iterdir()
-                           if p.is_file() and p.suffix.lower() in (".ttf", ".otf")]
+                           if p.is_file() and p.suffix.lower() in (".ttf", ".otf", ".woff", ".woff2")]
         if font_candidates:
             font_candidates.sort(key=lambda p: p.stem.casefold())
             ui_font = font_candidates[0]
             if len(font_candidates) > 1:
                 warnings.append("multiple fonts in Assets, using %s" % font_candidates[0].name)
-    font_sym = symbols.allocate("ASSET_UI_FONT", ui_font) if ui_font else None
-    if ui_font:
-        ascii_ok([str(ui_font)], warnings)
+
+    if ui_font and ui_font.suffix.lower() in (".woff", ".woff2"):
+        try:
+            from io import BytesIO
+            from fontTools.ttLib import woff2
+            payload = BytesIO()
+            with open(ui_font, "rb") as f:
+                woff2.decompress(f, payload)
+            sfnt = payload.getvalue()
+            if len(sfnt) < 4:
+                raise ValueError("decompressed font is empty")
+        except ImportError:
+            print("ERROR: decompressing .woff2 UI font %s requires the Python"
+                  % ui_font)
+            print("       packages 'fonttools' and 'brotli' (pip install fonttools brotli).")
+            return 1
+        except Exception as exc:
+            print("ERROR: could not decompress UI font %s: %s" % (ui_font, exc))
+            return 1
+        # Pick a faithful extension for the staged copy (name only; the RCDATA
+        # payload is embedded verbatim either way).
+        ext = ".ttf" if sfnt[:4] in (b"\x00\x01\x00\x00", b"true", b"typ1") else ".otf"
+        font_rc_path = out_dir / ("ui_font" + ext)
+        if not font_rc_path.exists() or font_rc_path.read_bytes() != sfnt:
+            font_rc_path.write_bytes(sfnt)
+    elif ui_font:
+        font_rc_path = ui_font
+    font_sym = symbols.allocate("ASSET_UI_FONT", font_rc_path) if font_rc_path else None
+    if font_rc_path:
+        ascii_ok([str(font_rc_path)], warnings)
 
     if not wordmark:
         print("ERROR: could not find the wordmark image in %s" % assets_root)
@@ -418,7 +452,7 @@ def generate(root: Path, out_dir: Path) -> int:
         print("ERROR: could not find the app icon image (expects *logo*.png) in %s" % assets_root)
         return 1
     if not font_sym:
-        print("ERROR: could not find a .ttf/.otf UI font in %s" % assets_root)
+        print("ERROR: could not find a .ttf/.otf/.woff2 UI font in %s" % assets_root)
         return 1
 
     # colliding normalized ids are impossible per-folder (unique stems), but
@@ -508,6 +542,7 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kLoadButtonResourceId;")
     header.append("extern const int kClearButtonResourceId;")
     header.append("extern const int kMoveButtonResourceId;")
+    header.append("extern const int kScrollBarResourceId;")
     header.append("")
     header.append("#endif  // RC_INVOKED")
     header.append("")
@@ -538,6 +573,7 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kLoadButtonResourceId = %s;" % (load_button_sym["name"] if load_button_sym else "0"))
     cpp.append("const int kClearButtonResourceId = %s;" % (clear_button_sym["name"] if clear_button_sym else "0"))
     cpp.append("const int kMoveButtonResourceId = %s;" % (move_button_sym["name"] if move_button_sym else "0"))
+    cpp.append("const int kScrollBarResourceId = %s;" % (scroll_bar_sym["name"] if scroll_bar_sym else "0"))
     cpp.append("")
 
     def emit_entry(entry):

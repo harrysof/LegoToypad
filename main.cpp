@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -376,6 +377,7 @@ namespace
 	constexpr unsigned int kGlowBlue = 0x005A96E0;    // move-source pads
 	constexpr unsigned int kPadBorderIdle = 0x00525A6A;
 	constexpr unsigned int kPadBorderOccupied = 0x0060B476;
+	constexpr unsigned int kPadGlowRed = 0x005050FF;  // selected pad highlight (RGB 255,80,80)
 
 	void AddRoundedRectPath(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect, float radius)
 	{
@@ -533,7 +535,7 @@ namespace
 		const bool moveSource = visual == PadVisual::MoveSource;
 
 		if (selected)
-			DrawGlow(g, path, kGlowGold, 8, w, h);
+			DrawGlow(g, path, kPadGlowRed, 9, w, h);
 		else if (moveSource)
 			DrawGlow(g, path, kGlowBlue, 8, w, h);
 
@@ -557,7 +559,9 @@ namespace
 			g.FillPath(&tint, &path);
 		}
 
-		const unsigned int border = moveSource ? kGlowBlue : (occupied ? kPadBorderOccupied : kPadBorderIdle);
+		const unsigned int border = moveSource ? kGlowBlue
+			: (selected ? kPadGlowRed
+				: (occupied ? kPadBorderOccupied : kPadBorderIdle));
 		Gdiplus::Pen borderPen(
 			Gdiplus::Color(255, GetRValue(border), GetGValue(border), GetBValue(border)),
 			selected ? 3.0f : 2.0f);
@@ -1838,6 +1842,13 @@ namespace
 	constexpr int kRosterPitchY = 160;
 	constexpr int kPortraitDiameter = 90;
 
+	// Right-edge vertical scroll bar (Scroll_Bar.png) shown on scrollable
+	// lists when their content overflows the visible rows. Kept inside the
+	// overlay's right margin, clear of the grid panels.
+	constexpr int kScrollBarW = 14;
+	constexpr int kScrollBarMarginX = 18;
+	constexpr int kScrollBarMinThumbH = 22;
+
 	// Capsule (pill) menus.
 	constexpr int kPillWidth = 340;
 	constexpr int kPillRowH = 36;
@@ -1869,6 +1880,33 @@ namespace
 		Gdiplus::Bitmap* pad = RenderPad(static_cast<int>(index), cell, visual);
 		if (pad)
 			g.DrawImage(pad, static_cast<int>(cell.left) - kPadGlowMargin, static_cast<int>(cell.top) - kPadGlowMargin);
+
+		// Pulsing red selection ring animated on top of the already-cached
+		// highlight so the focused pad visibly "breathes" while selected.
+		if (selected)
+		{
+			const int cellWidth = cell.right - cell.left;
+			const int cellHeight = cell.bottom - cell.top;
+			const float period = 1800.0f; // ms per full breathe cycle
+			const float phase = static_cast<float>(GetTickCount() % 1800) / period;
+			const float breathe = 0.5f + 0.5f * std::sin(phase * 2.0f * 3.14159265f);
+			const int alpha = static_cast<int>(130 + 110 * breathe);
+			const float inflate = 1.5f + 3.5f * breathe;
+			const float rad = 14.0f;
+
+			Gdiplus::GraphicsPath ringPath;
+			AddRoundedRectPath(ringPath,
+				Gdiplus::RectF(static_cast<float>(cell.left) - inflate,
+					static_cast<float>(cell.top) - inflate,
+					static_cast<float>(cellWidth) + inflate * 2.0f,
+					static_cast<float>(cellHeight) + inflate * 2.0f),
+				rad);
+			Gdiplus::Pen ringPen(Gdiplus::Color(
+				alpha, GetRValue(kPadGlowRed), GetGValue(kPadGlowRed), GetBValue(kPadGlowRed)),
+				2.5f + 3.0f * breathe);
+			ringPen.SetLineJoin(Gdiplus::LineJoinRound);
+			g.DrawPath(&ringPen, &ringPath);
+		}
 
 		if (!occupied)
 			return; // Empty pad: bare glass tile only, nothing drawn on top of it.
@@ -2089,8 +2127,33 @@ namespace
 			g.DrawImage(plus, plusX - kPortraitMargin, circleY - kPortraitMargin);
 	}
 
+	// Right-edge scroll indicator for vertically scrollable grids. The track
+	// spans tractTop..trackBottom; the thumb (Scroll_Bar.png) is sized to the
+	// visible fraction and slides with the scroll offset. Hidden when the
+	// content fits in the viewport.
+	void DrawScrollBar(Gdiplus::Graphics& g, int trackTop, int trackBottom,
+		size_t totalRows, size_t visibleRows, int topRow)
+	{
+		if (totalRows <= visibleRows)
+			return;
+		const int trackH = trackBottom - trackTop;
+		int thumbH = static_cast<int>(trackH * static_cast<double>(visibleRows) / totalRows);
+		if (thumbH < kScrollBarMinThumbH)
+			thumbH = kScrollBarMinThumbH;
+		const double frac = topRow / static_cast<double>(totalRows - visibleRows);
+		const int thumbY = trackTop + static_cast<int>((trackH - thumbH) * frac);
+
+		Gdiplus::Bitmap* bar = GetAssetBitmap(kScrollBarResourceId);
+		if (!bar)
+			return;
+		const int x = kOverlayWidth - kScrollBarW - kScrollBarMarginX;
+		g.DrawImage(bar, static_cast<float>(x), static_cast<float>(thumbY),
+			static_cast<float>(kScrollBarW), static_cast<float>(thumbH));
+	}
+
 	void DrawFranchiseGrid(Gdiplus::Graphics& g, HDC dc)
 	{
+		const size_t totalRows = (kFranchiseCount + kFranchiseCols - 1) / kFranchiseCols;
 		for (size_t row = 0; row < kFranchiseVisibleRows; ++row)
 		{
 			for (size_t col = 0; col < kFranchiseCols; ++col)
@@ -2107,6 +2170,11 @@ namespace
 					g.DrawImage(tile, x - kTileGlowMargin, y - kTileGlowMargin);
 			}
 		}
+
+		const int trackTop = kFranchiseOriginY;
+		const int trackBottom = kFranchiseOriginY
+			+ static_cast<int>(kFranchiseVisibleRows - 1) * kFranchisePitchY + kFranchiseTileH;
+		DrawScrollBar(g, trackTop, trackBottom, totalRows, kFranchiseVisibleRows, g_app.franchiseTopRow);
 	}
 
 	void DrawRosterGrid(Gdiplus::Graphics& g, HDC dc)
@@ -2118,6 +2186,7 @@ namespace
 		}
 
 		const size_t visibleRows = kRosterVisibleRows;
+		const size_t totalRows = (g_app.rosterSlots.size() + kRosterCols - 1) / kRosterCols;
 		for (size_t row = 0; row < visibleRows; ++row)
 		{
 			for (size_t col = 0; col < kRosterCols; ++col)
@@ -2159,6 +2228,11 @@ namespace
 					focused ? RGB(255, 236, 190) : RGB(214, 220, 230));
 			}
 		}
+
+		const int trackTop = kRosterOriginY - 14;
+		const int trackBottom = kRosterOriginY
+			+ static_cast<int>(kRosterVisibleRows - 1) * kRosterPitchY + kPortraitDiameter + 58;
+		DrawScrollBar(g, trackTop, trackBottom, totalRows, kRosterVisibleRows, g_app.rosterTopRow);
 	}
 
 	void Paint(HWND window)
@@ -2477,7 +2551,11 @@ namespace
 		if (!anyDirection)
 			lastNavigation = 0;
 
-		if (changed)
+		// Pad screens carry a pulsing selection ring, so they repaint every
+		// tick to keep the animation running even with no input; the other
+		// screens stay paint-on-change only.
+		const bool padScreen = g_app.screen == Screen::PadViewer || g_app.screen == Screen::PadAction;
+		if (changed || (g_app.overlayVisible && padScreen))
 			InvalidateRect(window, nullptr, FALSE);
 	}
 
