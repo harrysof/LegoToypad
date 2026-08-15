@@ -9,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <cwchar>
 #include <filesystem>
 #include <map>
@@ -195,6 +196,7 @@ namespace
 
 		// Franchise / roster browsing state.
 		size_t franchiseIndex = 0;
+		int franchiseTopRow = 0; // first visible franchise row (scrolled grid)
 		std::vector<RosterSlot> rosterSlots;
 		size_t rosterIndex = 0;
 		int rosterTopRow = 0; // first visible roster row (scrolled grids)
@@ -217,6 +219,17 @@ namespace
 	// ---------------------------------------------------------------------
 
 	ULONG_PTR g_gdiplusToken = 0;
+
+	// Compacta Regular, embedded as a resource and loaded in-memory at startup.
+	// GDI gets it via AddFontMemResourceEx (usable as a normal face name by the
+	// HFONT created in Paint); GDI+ gets its own copy via PrivateFontCollection
+	// (used by RenderPlaceholder's Gdiplus::Font). Both stem from the same
+	// embedded bytes; the resolved family name below feeds the GDI HFONT.
+	Gdiplus::PrivateFontCollection g_privateFonts;
+	const Gdiplus::FontFamily* g_uiFontFamily = nullptr;  // current family (points into storage or the GDI+ fallback)
+	Gdiplus::FontFamily* g_uiFontFamilyStorage = nullptr; // owns the new[] array of private families, if any
+	std::wstring g_uiFontFamilyName = L"Segoe UI";        // resolved name used by CreateFontW
+	HANDLE g_gdiFont = nullptr;                            // AddFontMemResourceEx handle
 
 	// Cached off-screen glossy/glowing bitmaps, keyed by (kind, state, ids).
 	// Every frame paints by DrawImage-ing these; the expensive gradient and
@@ -377,19 +390,95 @@ namespace
 		path.CloseFigure();
 	}
 
-	// Concentric stroke halo around a path: widest & faintest outside,
-	// narrowing and brightening toward the edge. Cheap, no blur needed.
-	void DrawGlowPath(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& path, unsigned int color,
-		int strokes, float firstWidth, float widthStep, BYTE firstAlpha, BYTE alphaStep)
+	// ---------------------------------------------------------------------
+	// Real glow: soft light falloff via repeated separable box blur.
+	//
+	// GDI+ has no native Gaussian blur, so the glow shape is rasterized as an
+	// opaque solid silhouette and that silhouette is blurred outward with a
+	// sliding-window box blur (2 horizontal + 2 vertical passes approximate a
+	// Gaussian profile). The blurred, premultiplied silhouette is composited
+	// under the crisp shape, producing a soft halo instead of the hard
+	// concentric strokes the old DrawGlowPath drew. This only ever runs at
+	// cached-bitmap generation time, never per frame.
+	// ---------------------------------------------------------------------
+
+	// One channel of a 1-D box blur over `count` samples with `stride`
+	// bytes between samples (4 for a row, width*4 for a column) at byte
+	// offset `offset`. Edge samples are clamped (shrinking the window).
+	void BoxBlurChannel1D(const uint8_t* src, uint8_t* dst, int count, int radius, int stride, int offset)
 	{
-		for (int i = 0; i < strokes; ++i)
+		std::vector<int> prefix(count + 1);
+		prefix[0] = 0;
+		for (int i = 0; i < count; ++i)
+			prefix[i + 1] = prefix[i] + src[i * stride + offset];
+		for (int k = 0; k < count; ++k)
 		{
-			const float width = firstWidth - widthStep * static_cast<float>(i);
-			const BYTE alpha = static_cast<BYTE>(firstAlpha + alphaStep * i);
-			Gdiplus::Pen pen(Gdiplus::Color(alpha, GetRValue(color), GetGValue(color), GetBValue(color)), width);
-			pen.SetLineJoin(Gdiplus::LineJoinRound);
-			g.DrawPath(&pen, &path);
+			int lo = k - radius;
+			if (lo < 0) lo = 0;
+			int hi = k + radius;
+			if (hi > count - 1) hi = count - 1;
+			const int sum = prefix[hi + 1] - prefix[lo];
+			const int n = hi - lo + 1;
+			dst[k * stride + offset] = static_cast<uint8_t>((sum + n / 2) / n);
 		}
+	}
+
+	// Separable box blur over a premultiplied BGRA/PARGB buffer, reading from
+	// src into dst (either axis). Blurring all four channels together keeps
+	// the premultiplied data consistent so the falloff is even and clean.
+	void BoxBlurPass(const uint8_t* src, uint8_t* dst, int width, int height, int radius, bool horizontal)
+	{
+		const int n = horizontal ? width : height;
+		const int other = horizontal ? height : width;
+		for (int o = 0; o < other; ++o)
+		{
+			const int base = horizontal ? o * width * 4 : o * 4;
+			for (int c = 0; c < 4; ++c)
+				BoxBlurChannel1D(src + base, dst + base, n, radius, horizontal ? 4 : width * 4, c);
+		}
+	}
+
+	// Rasterizes `path` (a closed shape), blurs it soft, and composites the
+	// result behind everything else that draws on top. `width`/`height` are
+	// the full target bitmap dimensions (the shape is already placed in that
+	// bitmap's coordinate space).
+	void DrawGlow(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& path,
+		unsigned int color, int radius, int width, int height)
+	{
+		const Gdiplus::Rect lock(0, 0, width, height);
+
+		Gdiplus::Bitmap mask(width, height, PixelFormat32bppPARGB);
+		Gdiplus::Graphics mg(&mask);
+		mg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+		Gdiplus::SolidBrush solid(Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color)));
+		mg.FillPath(&solid, &path);
+
+		Gdiplus::BitmapData data;
+		if (mask.LockBits(&lock, Gdiplus::ImageLockModeRead | Gdiplus::ImageLockModeWrite,
+				PixelFormat32bppPARGB, &data) != Gdiplus::Ok)
+			return;
+
+		const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+		std::vector<uint8_t> a(bytes);
+		std::vector<uint8_t> b(bytes);
+		const uint8_t* source = static_cast<const uint8_t*>(data.Scan0);
+		for (int y = 0; y < height; ++y)
+			std::memcpy(a.data() + static_cast<size_t>(y) * width * 4,
+				source + static_cast<size_t>(y) * data.Stride, static_cast<size_t>(width) * 4);
+
+		for (int i = 0; i < 2; ++i)
+		{
+			BoxBlurPass(a.data(), b.data(), width, height, radius, true);
+			BoxBlurPass(b.data(), a.data(), width, height, radius, false);
+		}
+
+		uint8_t* dest = static_cast<uint8_t*>(data.Scan0);
+		for (int y = 0; y < height; ++y)
+			std::memcpy(dest + static_cast<size_t>(y) * data.Stride,
+				a.data() + static_cast<size_t>(y) * width * 4, static_cast<size_t>(width) * 4);
+		mask.UnlockBits(&data);
+
+		g.DrawImage(&mask, 0, 0, width, height);
 	}
 
 	void DrawTopGloss(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& clipPath, int width, int height)
@@ -440,9 +529,9 @@ namespace
 		const bool moveSource = visual == PadVisual::MoveSource;
 
 		if (selected)
-			DrawGlowPath(g, path, kGlowGold, 5, 9.0f, 1.5f, 22, 22);
+			DrawGlow(g, path, kGlowGold, 8, w, h);
 		else if (moveSource)
-			DrawGlowPath(g, path, kGlowBlue, 5, 9.0f, 1.5f, 22, 22);
+			DrawGlow(g, path, kGlowBlue, 8, w, h);
 
 		const unsigned int topColor = occupied ? 0x00344A3E : 0x002A3040;
 		const unsigned int bottomColor = occupied ? 0x00182A1E : 0x00141A28;
@@ -491,7 +580,7 @@ namespace
 		circlePath.AddEllipse(circle);
 
 		if (focused)
-			DrawGlowPath(g, circlePath, ringColor, 4, 8.0f, 1.5f, 26, 26);
+			DrawGlow(g, circlePath, ringColor, 7, w, h);
 
 		Gdiplus::Bitmap* photo = GetAssetBitmap(resId);
 		if (photo)
@@ -553,7 +642,7 @@ namespace
 		circlePath.AddEllipse(circle);
 
 		if (focused)
-			DrawGlowPath(g, circlePath, ringColor, 4, 8.0f, 1.5f, 26, 26);
+			DrawGlow(g, circlePath, ringColor, 7, w, h);
 
 		Gdiplus::LinearGradientBrush fill(circle,
 			Gdiplus::Color(255, 40, 46, 58), Gdiplus::Color(255, 18, 22, 30),
@@ -597,7 +686,7 @@ namespace
 		circlePath.AddEllipse(circle);
 
 		if (focused)
-			DrawGlowPath(g, circlePath, ringColor, 4, 8.0f, 1.5f, 26, 26);
+			DrawGlow(g, circlePath, ringColor, 7, w, h);
 
 		Gdiplus::LinearGradientBrush fill(circle,
 			Gdiplus::Color(255, 46, 52, 64), Gdiplus::Color(255, 22, 26, 36),
@@ -606,7 +695,7 @@ namespace
 		DrawTopGloss(g, circlePath, w, h);
 
 		Gdiplus::SolidBrush textBrush(Gdiplus::Color(255, 235, 238, 244));
-		Gdiplus::Font font(L"Segoe UI", std::max(12.0f, d * 0.32f), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+		Gdiplus::Font font(g_uiFontFamily, std::max(12.0f, d * 0.32f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
 		Gdiplus::StringFormat format;
 		format.SetAlignment(Gdiplus::StringAlignmentCenter);
 		format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
@@ -622,12 +711,12 @@ namespace
 		return bitmap;
 	}
 
-	// Franchise tile: rounded rect with the world logo and a gold glow
-	// stroke when focused.
+	// Franchise tile: rounded rect with the world logo filling it and a gold
+	// glow when focused. The logo alone identifies the world - no text label.
 	Gdiplus::Bitmap* RenderFranchiseTile(int logoResourceId, bool focused)
 	{
-		constexpr int tileW = 140;
-		constexpr int tileH = 84;
+		constexpr int tileW = 190;
+		constexpr int tileH = 100;
 		constexpr int margin = 6;
 		const int w = tileW + margin * 2;
 		const int h = tileH + margin * 2;
@@ -648,7 +737,7 @@ namespace
 		AddRoundedRectPath(path, rect, 12.0f);
 
 		if (focused)
-			DrawGlowPath(g, path, kGlowGold, 5, 9.0f, 1.5f, 22, 22);
+			DrawGlow(g, path, kGlowGold, 8, w, h);
 
 		Gdiplus::LinearGradientBrush fill(rect,
 			Gdiplus::Color(255, 40, 46, 60), Gdiplus::Color(255, 20, 24, 34),
@@ -658,10 +747,9 @@ namespace
 		Gdiplus::Bitmap* logo = GetAssetBitmap(logoResourceId);
 		if (logo)
 		{
-			// Contain-fit logo in the top area of the tile (name label
-			// lives below it, drawn per frame with GDI).
-			constexpr float logoAreaH = 50.0f;
-			const Gdiplus::RectF box(margin + 8.0f, margin + 4.0f, tileW - 16.0f, logoAreaH);
+			// Contain-fit the logo across most of the tile.
+			constexpr float logoAreaH = 84.0f;
+			const Gdiplus::RectF box(margin + 8.0f, margin + 8.0f, tileW - 16.0f, logoAreaH);
 			const float scale = std::min(box.Width / logo->GetWidth(), box.Height / logo->GetHeight());
 			const float drawW = logo->GetWidth() * scale;
 			const float drawH = logo->GetHeight() * scale;
@@ -689,19 +777,25 @@ namespace
 		constexpr int rowH = 36;
 		constexpr int padV = 7;
 		constexpr int width = 340;
+		constexpr int glowMargin = 8;
 		const int h = rows * rowH + padV * 2;
-		const GlossKey key{GlossKind::Pill, rows, 0, 0, width, h};
+		const int w = width + glowMargin * 2;
+		const int hp = h + glowMargin * 2;
+		const GlossKey key{GlossKind::Pill, rows, 0, 0, w, hp};
 		const auto cached = g_glossCache.find(key);
 		if (cached != g_glossCache.end())
 			return cached->second;
 
-		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(width, h, PixelFormat32bppPARGB);
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, hp, PixelFormat32bppPARGB);
 		Gdiplus::Graphics g(bitmap);
 		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
 
-		const Gdiplus::RectF rect(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(h));
+		const Gdiplus::RectF rect(static_cast<float>(glowMargin), static_cast<float>(glowMargin),
+			static_cast<float>(width), static_cast<float>(h));
 		Gdiplus::GraphicsPath path;
 		AddRoundedRectPath(path, rect, static_cast<float>(h) / 2.0f);
+
+		DrawGlow(g, path, kGlowGold, 5, w, hp);
 
 		Gdiplus::LinearGradientBrush fill(rect,
 			Gdiplus::Color(226, 22, 27, 38), Gdiplus::Color(226, 12, 15, 22),
@@ -711,10 +805,10 @@ namespace
 		Gdiplus::Region clip(&path);
 		g.SetClip(&clip);
 		Gdiplus::LinearGradientBrush gloss(
-			Gdiplus::RectF(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(h)),
+			Gdiplus::RectF(0.0f, 0.0f, static_cast<float>(w), static_cast<float>(hp)),
 			Gdiplus::Color(56, 255, 255, 255), Gdiplus::Color(0, 255, 255, 255),
 			Gdiplus::LinearGradientModeVertical);
-		g.FillRectangle(&gloss, 0, 0, width, h);
+		g.FillRectangle(&gloss, 0, 0, w, hp);
 		g.ResetClip();
 
 		Gdiplus::Pen borderPen(Gdiplus::Color(190, 104, 114, 132), 1.5f);
@@ -743,7 +837,7 @@ namespace
 		Gdiplus::GraphicsPath path;
 		AddRoundedRectPath(path, rect, 14.0f);
 		if (focused)
-			DrawGlowPath(g, path, kGlowGold, 4, 7.0f, 1.5f, 24, 26);
+			DrawGlow(g, path, kGlowGold, 5, rowW, rowH);
 
 		if (focused)
 		{
@@ -811,11 +905,77 @@ namespace
 		DrawTextW(dc, text.c_str(), -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 	}
 
+	// Centered word-wrap variant: shows the FULL string, wrapping onto extra
+	// lines if it doesn't fit the width - never truncates with "…". Used for
+	// names that must stay readable (roster labels, pad occupant names).
+	void DrawTextWrappedCentered(HDC dc, const std::wstring& text, int x, int y, int width, int height, COLORREF color)
+	{
+		SetTextColor(dc, color);
+		RECT rect{x, y, x + width, y + height};
+		DrawTextW(dc, text.c_str(), -1, &rect, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+	}
+
 	std::filesystem::path GetExecutableDirectory()
 	{
 		std::array<wchar_t, 32768> path{};
 		const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
 		return length == 0 ? std::filesystem::current_path() : std::filesystem::path(path.data()).parent_path();
+	}
+
+	// Loads the embedded UI font (Compacta Regular) into memory - no temp file,
+	// no system-wide install. Registers it with GDI so a normal HFONT can use it
+	// by the resolved family name, and with GDI+ for DrawString text.
+	void LoadUIFont()
+	{
+		DWORD size = 0;
+		const uint8_t* bytes = GetResourceBytes(kUIFontResourceId, size);
+		if (!bytes || size == 0)
+			return;
+
+		// GDI registration of the read-only resource payload.
+		DWORD fontsAdded = 0;
+		g_gdiFont = AddFontMemResourceEx(const_cast<uint8_t*>(bytes), size, nullptr, &fontsAdded);
+		if (fontsAdded == 0)
+			g_gdiFont = nullptr;
+
+		// GDI+ registration of the same bytes.
+		g_privateFonts.AddMemoryFont(bytes, static_cast<INT>(size));
+		const INT familyCount = g_privateFonts.GetFamilyCount();
+		if (familyCount > 0)
+		{
+			g_uiFontFamilyStorage = new Gdiplus::FontFamily[familyCount];
+			INT found = 0;
+			g_privateFonts.GetFamilies(familyCount, g_uiFontFamilyStorage, &found);
+			if (found > 0)
+			{
+				g_uiFontFamily = &g_uiFontFamilyStorage[0];
+				WCHAR name[LF_FACESIZE];
+				g_uiFontFamily->GetFamilyName(name);
+				g_uiFontFamilyName = name;
+			}
+		}
+
+		if (!g_uiFontFamily)
+		{
+			// No usable family (missing/failed resource) - fall back gracefully.
+			g_uiFontFamily = Gdiplus::FontFamily::GenericSansSerif();
+			g_uiFontFamilyName = L"Segoe UI";
+		}
+	}
+
+	void UnloadUIFont()
+	{
+		if (g_gdiFont)
+		{
+			RemoveFontMemResourceEx(g_gdiFont);
+			g_gdiFont = nullptr;
+		}
+		if (g_uiFontFamilyStorage)
+		{
+			delete[] g_uiFontFamilyStorage;
+			g_uiFontFamilyStorage = nullptr;
+		}
+		g_uiFontFamily = nullptr;
 	}
 
 	uint16_t ReadPort()
@@ -1144,23 +1304,38 @@ namespace
 			g_app.slotIndex = static_cast<size_t>(target);
 	}
 
-	// Franchise grid: 6 columns x 5 rows, exactly the 30 worlds. Both axes
-	// wrap so every tile stays reachable from the edges.
-	constexpr size_t kFranchiseCols = 6;
-	constexpr size_t kFranchiseRows = 5;
+	// Franchise grid: 4 columns of larger tiles, wrapped vertically, with a
+	// scrollable viewport (kFranchiseVisibleRows rows shown at a time).
+	constexpr size_t kFranchiseCols = 4;
+	constexpr size_t kFranchiseVisibleRows = 4;
 
 	void MoveFranchiseSelection(int dx, int dy)
 	{
+		if (kFranchiseCount == 0)
+			return;
+		const size_t rows = (kFranchiseCount + kFranchiseCols - 1) / kFranchiseCols;
 		size_t row = g_app.franchiseIndex / kFranchiseCols;
 		size_t col = g_app.franchiseIndex % kFranchiseCols;
-		row = (row + static_cast<size_t>(dy) + kFranchiseRows) % kFranchiseRows;
-		col = (col + static_cast<size_t>(dx) + kFranchiseCols) % kFranchiseCols;
+
+		row = (row + static_cast<size_t>(dy) + rows) % rows;
+		const size_t lastCol = std::min(kFranchiseCols, kFranchiseCount - row * kFranchiseCols) - 1;
+		col = (col + static_cast<size_t>(dx) + lastCol + 1) % (lastCol + 1);
+
 		g_app.franchiseIndex = row * kFranchiseCols + col;
+
+		// Keep the focused row inside the visible viewport.
+		const int focusedRow = static_cast<int>(row);
+		while (focusedRow < g_app.franchiseTopRow)
+			--g_app.franchiseTopRow;
+		while (focusedRow >= g_app.franchiseTopRow + static_cast<int>(kFranchiseVisibleRows))
+			++g_app.franchiseTopRow;
+		if (g_app.franchiseTopRow < 0)
+			g_app.franchiseTopRow = 0;
 	}
 
-	// Roster grid: 6 columns, variable row count, wrapped vertically.
-	// The viewport shows kRosterVisibleRows rows and follows the selection.
-	constexpr size_t kRosterCols = 6;
+	// Roster grid: variable row count, wrapped vertically. The viewport shows
+	// kRosterVisibleRows rows and follows the selection.
+	constexpr size_t kRosterCols = 5;
 	constexpr size_t kRosterVisibleRows = 3;
 
 	void MoveRosterSelection(int dx, int dy)
@@ -1608,21 +1783,22 @@ namespace
 		{745, 280, 860, 410}, // 6 Right - lower right
 	}};
 
-	// Franchise grid layout: 6 columns x 5 rows (the fixed 30 worlds).
-	constexpr int kFranchiseOriginX = 15;
+	// Franchise grid layout: 4 columns of large logo tiles, scrolled vertically.
+	constexpr int kFranchiseOriginX = 20;
 	constexpr int kFranchiseOriginY = 106;
-	constexpr int kFranchisePitchX = 145;
-	constexpr int kFranchisePitchY = 90;
-	constexpr int kFranchiseTileW = 140;
-	constexpr int kFranchiseTileH = 84;
+	constexpr int kFranchisePitchX = 210;
+	constexpr int kFranchisePitchY = 108;
+	constexpr int kFranchiseTileW = 190;
+	constexpr int kFranchiseTileH = 100;
 	constexpr int kTileGlowMargin = 6;
 
-	// Roster grid layout: 6 columns, portrait-circles, vertical scrolling.
-	constexpr int kRosterOriginX = 15;
-	constexpr int kRosterOriginY = 112;
-	constexpr int kRosterPitchX = 145;
-	constexpr int kRosterPitchY = 132;
-	constexpr int kPortraitDiameter = 90;
+	// Roster grid layout: 5 columns of larger portrait-circles with wrapped
+	// name labels, vertical scrolling. Origin leaves room for the world logo.
+	constexpr int kRosterOriginX = 10;
+	constexpr int kRosterOriginY = 84;
+	constexpr int kRosterPitchX = 176;
+	constexpr int kRosterPitchY = 160;
+	constexpr int kPortraitDiameter = 108;
 
 	// Capsule (pill) menus.
 	constexpr int kPillWidth = 340;
@@ -1654,34 +1830,30 @@ namespace
 			g.DrawImage(pad, static_cast<int>(cell.left) - kPadGlowMargin, static_cast<int>(cell.top) - kPadGlowMargin);
 
 		const int cellWidth = cell.right - cell.left;
+		const int cellHeight = cell.bottom - cell.top;
 		const PadSlot& slot = g_app.padState[index];
 
-		DrawTextLine(dc, kSlots[index].label, cell.left + 10, cell.top + 5, cellWidth - 20, RGB(158, 166, 180), 16);
+		// Occupant portrait, horizontally and vertically centered in the pad
+		// cell; the figure name (if any) is wrapped below it. No slot-name
+		// label and no "(empty)" text - an empty pad is just its placeholder.
+		constexpr int kOccupantDiameter = 64;
+		constexpr int kNameAreaH = 44;   // room for a wrapped (2-line) name
+		const int circleX = cell.left + (cellWidth - kOccupantDiameter) / 2;
+		const int circleY = cell.top + std::max(6, (cellHeight - kOccupantDiameter - 4 - kNameAreaH) / 2);
 
-		constexpr int kOccupantDiameter = 58;
-		const int portraitX = cell.left + 12;
-		const int portraitY = cell.top + 26;
 		if (occupied)
 		{
 			Gdiplus::Bitmap* portrait = RenderPortrait(slot.portraitResourceId, slot.ringColor, false, kOccupantDiameter);
 			if (portrait)
-			{
-				const int offset = (kOccupantDiameter + kPortraitMargin * 2 - kOccupantDiameter) / 2;
-				g.DrawImage(portrait, portraitX - offset, portraitY - offset);
-			}
-			DrawTextLine(dc, slot.figureName, portraitX + kOccupantDiameter + 12, portraitY + 8,
-				cellWidth - (portraitX + kOccupantDiameter + 12 + cell.left) - 8, RGB(226, 240, 230), 22);
+				g.DrawImage(portrait, circleX - kPortraitMargin, circleY - kPortraitMargin);
+			DrawTextWrappedCentered(dc, slot.figureName,
+				cell.left + 4, circleY + kOccupantDiameter + 2, cellWidth - 8, kNameAreaH, RGB(226, 240, 230));
 		}
 		else
 		{
 			Gdiplus::Bitmap* placeholder = RenderPlaceholder(L' ', kPadBorderIdle, false, kOccupantDiameter);
 			if (placeholder)
-			{
-				const int offset = (kOccupantDiameter + kPortraitMargin * 2 - kOccupantDiameter) / 2;
-				g.DrawImage(placeholder, portraitX - offset, portraitY - offset);
-			}
-			DrawTextLine(dc, L"(empty)", portraitX + kOccupantDiameter + 12, cell.top + 52,
-				cellWidth - (portraitX + kOccupantDiameter + 12 + cell.left) - 8, RGB(110, 116, 128), 20);
+				g.DrawImage(placeholder, circleX - kPortraitMargin, circleY - kPortraitMargin);
 		}
 	}
 
@@ -1693,7 +1865,8 @@ namespace
 		Gdiplus::Bitmap* pill = RenderPill(static_cast<int>(rows));
 		if (!pill)
 			return;
-		g.DrawImage(pill, x, y);
+		constexpr int glowMargin = 8;
+		g.DrawImage(pill, x - glowMargin, y - glowMargin);
 
 		Gdiplus::Bitmap* highlight = nullptr;
 		for (size_t row = 0; row < rows; ++row)
@@ -1713,9 +1886,22 @@ namespace
 	void DrawPadActionMenu(Gdiplus::Graphics& g, HDC dc, int width)
 	{
 		const RECT& cell = kPadCells[g_app.slotIndex];
-		const int pillH = static_cast<int>(kPadActionCount) * kPillRowH + kPillPadV * 2;
+
+		// The pill sits in the lower band of the overlay, horizontally
+		// centered on the selected pad, with a tapered pointer connecting it
+		// back up to the pad so it reads as anchored rather than floating.
 		const int pillX = std::clamp(static_cast<int>((cell.left + cell.right) / 2) - kPillWidth / 2, 8, width - 8 - kPillWidth);
-		const int pillY = (cell.top - 12 - pillH < 0) ? 0 : static_cast<int>(cell.top) - 12 - pillH;
+		const int pillY = 468;
+
+		const int sx = (cell.left + cell.right) / 2;
+		const int tx = pillX + kPillWidth / 2;
+		Gdiplus::SolidBrush connector(Gdiplus::Color(150, 255, 204, 51));
+		const Gdiplus::PointF triangle[3] = {
+			{static_cast<float>(sx), static_cast<float>(cell.bottom)},
+			{static_cast<float>(tx - 9), static_cast<float>(pillY + 5)},
+			{static_cast<float>(tx + 9), static_cast<float>(pillY + 5)},
+		};
+		g.FillPolygon(&connector, triangle, 3);
 
 		const PadSlot& target = g_app.padState[g_app.slotIndex];
 		const std::vector<std::wstring> options = {
@@ -1737,7 +1923,6 @@ namespace
 		for (const auto& build : g_app.plusGroup->builds)
 			options.push_back(L"Build " + std::to_wstring(build.buildNumber));
 
-		const int pillH = static_cast<int>(rows) * kPillRowH + kPillPadV * 2;
 		const int pillX = (kOverlayWidth - kPillWidth) / 2;
 		const int pillY = 166;
 		DrawPillMenu(g, dc, pillX, pillY, rows, options, g_app.plusBuildIndex);
@@ -1745,11 +1930,12 @@ namespace
 
 	void DrawFranchiseGrid(Gdiplus::Graphics& g, HDC dc)
 	{
-		for (size_t row = 0; row < kFranchiseRows; ++row)
+		for (size_t row = 0; row < kFranchiseVisibleRows; ++row)
 		{
 			for (size_t col = 0; col < kFranchiseCols; ++col)
 			{
-				const size_t index = row * kFranchiseCols + col;
+				const size_t index =
+					(static_cast<size_t>(g_app.franchiseTopRow) + row) * kFranchiseCols + col;
 				if (index >= kFranchiseCount)
 					break;
 				const int x = kFranchiseOriginX + static_cast<int>(col) * kFranchisePitchX;
@@ -1758,8 +1944,6 @@ namespace
 				Gdiplus::Bitmap* tile = RenderFranchiseTile(kFranchises[index].logoResourceId, focused);
 				if (tile)
 					g.DrawImage(tile, x - kTileGlowMargin, y - kTileGlowMargin);
-				DrawTextLineCentered(dc, kFranchises[index].name, x + 4, y + kFranchiseTileH - 22,
-					kFranchiseTileW - 8, focused ? RGB(255, 226, 150) : RGB(222, 228, 236), 18);
 			}
 		}
 	}
@@ -1810,8 +1994,8 @@ namespace
 				if (visual)
 					g.DrawImage(visual, circleX - kPortraitMargin, circleY - kPortraitMargin);
 
-				DrawTextLineCentered(dc, label, x + 2, y + kPortraitDiameter + 4, kRosterPitchX - 4,
-					focused ? RGB(255, 236, 190) : RGB(214, 220, 230), 20);
+				DrawTextWrappedCentered(dc, label, x, y + kPortraitDiameter + 8, kRosterPitchX, 46,
+					focused ? RGB(255, 236, 190) : RGB(214, 220, 230));
 			}
 		}
 	}
@@ -1844,22 +2028,19 @@ namespace
 
 		SetBkMode(dc, TRANSPARENT);
 		HFONT font = CreateFontW(-22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, g_uiFontFamilyName.c_str());
 		SelectObject(dc, font);
 
-		// The "LEGO TOYPAD" wordmark (embedded asset) at the top of the pad
-		// grid screen, per the mockup.
-		if (g_app.screen == Screen::PadViewer)
+		// Persistent small wordmark in the top-left of every screen.
 		{
 			Gdiplus::Bitmap* wordmark = GetAssetBitmap(kWordmarkResourceId);
 			if (wordmark)
 			{
-				const Gdiplus::RectF box(280.0f, 10.0f, 340.0f, 66.0f);
+				const Gdiplus::RectF box(16.0f, 10.0f, 170.0f, 40.0f);
 				const float scale = std::min(box.Width / wordmark->GetWidth(), box.Height / wordmark->GetHeight());
 				const float drawW = wordmark->GetWidth() * scale;
 				const float drawH = wordmark->GetHeight() * scale;
-				const Gdiplus::RectF dest(box.X + (box.Width - drawW) / 2.0f,
-					box.Y + (box.Height - drawH) / 2.0f, drawW, drawH);
+				const Gdiplus::RectF dest(box.X, box.Y + (box.Height - drawH) / 2.0f, drawW, drawH);
 				g.DrawImage(wordmark, dest);
 			}
 		}
@@ -1867,55 +2048,44 @@ namespace
 		switch (g_app.screen)
 		{
 		case Screen::PadViewer:
-		{
-			if (g_app.selectingMoveDestination)
-			{
-				DrawTextLine(dc, L"Choose where to move it  |  D-pad/stick: move  |  A/Enter: confirm  |  B/Esc: cancel",
-					24, 84, width - 48, RGB(224, 230, 237));
-				DrawTextLine(dc, L"Moving " + g_app.padState[g_app.moveSourceSlotIndex].figureName +
-					L" from " + kSlots[g_app.moveSourceSlotIndex].label, 24, 112, width - 48, RGB(255, 204, 51));
-			}
-			else
-			{
-				DrawTextLine(dc, L"Choose a Toypad position  |  D-pad/stick: move  |  A/Enter: select  |  B/Esc: close  |  Y/S: settings",
-					24, 84, width - 48, RGB(224, 230, 237));
-			}
 			for (size_t index = 0; index < kPadCells.size(); ++index)
 				DrawPad(g, dc, index);
 			break;
-		}
 		case Screen::PadAction:
-		{
-			DrawTextLine(dc, L"What do you want to do?  |  D-pad/stick: move  |  A/Enter: confirm  |  B/Esc: back",
-				24, 64, width - 48, RGB(224, 230, 237));
-			DrawTextLine(dc, kSlots[g_app.slotIndex].label, 24, 92, width - 48, RGB(255, 204, 51));
+			for (size_t index = 0; index < kPadCells.size(); ++index)
+				DrawPad(g, dc, index);
 			DrawPadActionMenu(g, dc, width);
 			break;
-		}
 		case Screen::FranchiseList:
-			DrawTextLine(dc, L"Choose a world  |  D-pad/stick: move  |  A/Enter: browse  |  B/Esc: back",
-				24, 64, width - 48, RGB(224, 230, 237));
 			DrawFranchiseGrid(g, dc);
 			break;
 		case Screen::RosterList:
-			DrawTextLine(dc, L"Choose a figure  |  D-pad/stick: move  |  A/Enter: load  |  B/Esc: back",
-				24, 64, width - 48, RGB(224, 230, 237));
-			DrawTextLine(dc, kFranchises[g_app.franchiseIndex].name, 24, 90, width - 48, RGB(255, 204, 51));
+		{
+			// The current world's logo at top-center, above the roster grid.
+			Gdiplus::Bitmap* worldLogo = GetAssetBitmap(kFranchises[g_app.franchiseIndex].logoResourceId);
+			if (worldLogo)
+			{
+				const Gdiplus::RectF box((width - 360.0f) / 2.0f, 8.0f, 360.0f, 62.0f);
+				const float scale = std::min(box.Width / worldLogo->GetWidth(), box.Height / worldLogo->GetHeight());
+				const float drawW = worldLogo->GetWidth() * scale;
+				const float drawH = worldLogo->GetHeight() * scale;
+				const Gdiplus::RectF dest(box.X + (box.Width - drawW) / 2.0f,
+					box.Y + (box.Height - drawH) / 2.0f, drawW, drawH);
+				g.DrawImage(worldLogo, dest);
+			}
 			DrawRosterGrid(g, dc);
 			break;
+		}
 		case Screen::PlusPicker:
 		{
 			const std::wstring vehicleName = g_app.plusGroup ? g_app.plusGroup->baseName : L"";
-			DrawTextLine(dc, L"Choose a build  |  D-pad/stick: move  |  A/Enter: load  |  B/Esc: back",
-				24, 64, width - 48, RGB(224, 230, 237));
-			DrawTextLine(dc, vehicleName, 24, 92, width - 48, RGB(255, 204, 51));
+			if (!vehicleName.empty())
+				DrawTextLineCentered(dc, vehicleName, 24, 108, width - 48, RGB(255, 204, 51));
 			DrawPlusPickerMenu(g, dc);
 			break;
 		}
 		case Screen::Settings:
 		{
-			DrawTextLine(dc, L"Settings  |  B or Esc: back  |  A or Enter: change", 24, 64, width - 48, RGB(224, 230, 237));
-
 			const std::array<std::wstring, kSettingsItemCount> rows = {
 				L"Toggle shortcut: " + DescribeShortcut(),
 				L"Reset pad view (local tracking only, does not affect Cemu)",
@@ -1938,23 +2108,15 @@ namespace
 			{
 				const int y = 108 + static_cast<int>(rows.size()) * 40 + 16;
 				if (!g_app.shortcutCaptureArmed)
-				{
-					DrawTextLine(dc, L"Release every controller button first...",
-						24, y, width - 48, RGB(255, 204, 51), 26);
-				}
+					DrawTextLine(dc, L"Release every controller button first...", 24, y, width - 48, RGB(255, 204, 51), 26);
 				else
-				{
-					DrawTextLine(dc, L"Listening: press a controller combo, or a keyboard shortcut.",
-						24, y, width - 48, RGB(255, 204, 51), 26);
-				}
-				DrawTextLine(dc, L"Controller combo needs a non-nav button. Back+Start cancels. Keyboard needs a modifier. Esc cancels.",
-					24, y + 26, width - 48, RGB(255, 204, 51), 26);
+					DrawTextLine(dc, L"Listening: press a controller combo, or a keyboard shortcut.", 24, y, width - 48, RGB(255, 204, 51), 26);
+				DrawTextLine(dc, L"Controller combo needs a non-nav button. Back+Start cancels. Keyboard needs a modifier. Esc cancels.", 24, y + 26, width - 48, RGB(255, 204, 51), 26);
 			}
 			break;
 		}
 		}
 
-		DrawTextLine(dc, g_app.status, 24, client.bottom - 44, width - 48, RGB(142, 238, 171));
 		SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
 		DeleteObject(font);
 
@@ -2250,6 +2412,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	Gdiplus::GdiplusStartupInput gdiplusStartupInput;
 	Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
 
+	LoadUIFont();
+
 	g_app.port = ReadPort();
 	LoadShortcutFromIni();
 
@@ -2286,6 +2450,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	{
 		ReleaseGlossCache();
 		ReleaseAssetImages();
+		UnloadUIFont();
 		Gdiplus::GdiplusShutdown(g_gdiplusToken);
 		WSACleanup();
 		return 1;
@@ -2305,6 +2470,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
 	ReleaseGlossCache();
 	ReleaseAssetImages();
+	UnloadUIFont();
 	Gdiplus::GdiplusShutdown(g_gdiplusToken);
 	WSACleanup();
 	return static_cast<int>(message.wParam);

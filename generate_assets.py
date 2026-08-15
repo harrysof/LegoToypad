@@ -341,11 +341,29 @@ def generate(root: Path, out_dir: Path) -> int:
     if app_icon:
         ascii_ok([str(app_icon)], warnings)
 
+    # ---- UI font -----------------------------------------------------------
+    # The Compacta-typeface TTF embedded for GDI/GDI+ in-memory font loading.
+    ui_font = None
+    if assets_root:
+        font_candidates = [p for p in assets_root.iterdir()
+                           if p.is_file() and p.suffix.lower() in (".ttf", ".otf")]
+        if font_candidates:
+            font_candidates.sort(key=lambda p: p.stem.casefold())
+            ui_font = font_candidates[0]
+            if len(font_candidates) > 1:
+                warnings.append("multiple fonts in Assets, using %s" % font_candidates[0].name)
+    font_sym = symbols.allocate("ASSET_UI_FONT", ui_font) if ui_font else None
+    if ui_font:
+        ascii_ok([str(ui_font)], warnings)
+
     if not wordmark:
         print("ERROR: could not find the wordmark image in %s" % assets_root)
         return 1
     if not icon_sym:
         print("ERROR: could not find the app icon image (expects *logo*.png) in %s" % assets_root)
+        return 1
+    if not font_sym:
+        print("ERROR: could not find a .ttf/.otf UI font in %s" % assets_root)
         return 1
 
     # colliding normalized ids are impossible per-folder (unique stems), but
@@ -427,6 +445,7 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kWordmarkResourceId;")
     header.append("extern const int kBackgroundResourceId;")
     header.append("extern const int kAppIconResourceId;")
+    header.append("extern const int kUIFontResourceId;")
     header.append("")
     header.append("#endif  // RC_INVOKED")
     header.append("")
@@ -448,6 +467,7 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kWordmarkResourceId = %s;" % (wordmark_sym["name"] if wordmark_sym else "0"))
     cpp.append("const int kBackgroundResourceId = %s;" % (background_sym["name"] if background_sym else "0"))
     cpp.append("const int kAppIconResourceId = %s;" % icon_sym["name"])
+    cpp.append("const int kUIFontResourceId = %s;" % (font_sym["name"] if font_sym else "0"))
     cpp.append("")
 
     def emit_entry(entry):
