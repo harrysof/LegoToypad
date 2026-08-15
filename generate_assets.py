@@ -341,6 +341,45 @@ def generate(root: Path, out_dir: Path) -> int:
     if app_icon:
         ascii_ok([str(app_icon)], warnings)
 
+    # ---- pad backgrounds + tile panels ------------------------------------
+    # Per-toypad-slot background art, one PNG per slot in kPadCells index
+    # order (left-upper, center, right-upper, left-lower-left,
+    # left-lower-right, right-lower-left, right-lower-right), plus the
+    # single franchise-tile background and the full roster-grid panel.
+    def pick_named(expected_stems, what):
+        for candidate in sorted(assets_files, key=lambda p: p.stem.casefold()):
+            if candidate.stem.casefold() in expected_stems:
+                return candidate
+        warnings.append("missing %s image in Assets (expected filename: %s)"
+                        % (what, " or ".join(sorted(expected_stems))))
+        return None
+
+    pad_bg_spec = [
+        ("ASSET_PAD_BG_LEFT_UPPER", "left_upper"),
+        ("ASSET_PAD_BG_CENTER", "center"),
+        ("ASSET_PAD_BG_RIGHT_UPPER", "right_upper"),
+        ("ASSET_PAD_BG_LEFT_LOWER_LEFT", "left_lower_left"),
+        ("ASSET_PAD_BG_LEFT_LOWER_RIGHT", "left_lower_right"),
+        ("ASSET_PAD_BG_RIGHT_LOWER_LEFT", "right_lower_left"),
+        ("ASSET_PAD_BG_RIGHT_LOWER_RIGHT", "right_lower_right"),
+    ]
+    pad_bg_syms = []
+    for asset_name, stem in pad_bg_spec:
+        file = pick_named({stem}, "pad background")
+        sym = symbols.allocate(asset_name, file) if file else None
+        if file:
+            ascii_ok([str(file)], warnings)
+        pad_bg_syms.append(sym)
+
+    world_tile = pick_named({"world_tile"}, "world tile background")
+    characters_tile = pick_named({"characters_tile"}, "characters tile background")
+    world_tile_sym = symbols.allocate("ASSET_WORLD_TILE", world_tile) if world_tile else None
+    characters_tile_sym = symbols.allocate("ASSET_CHARACTERS_TILE", characters_tile) if characters_tile else None
+    if world_tile:
+        ascii_ok([str(world_tile)], warnings)
+    if characters_tile:
+        ascii_ok([str(characters_tile)], warnings)
+
     # ---- UI font -----------------------------------------------------------
     # The Compacta-typeface TTF embedded for GDI/GDI+ in-memory font loading.
     ui_font = None
@@ -446,6 +485,9 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kBackgroundResourceId;")
     header.append("extern const int kAppIconResourceId;")
     header.append("extern const int kUIFontResourceId;")
+    header.append("extern const int kWorldTileResourceId;")
+    header.append("extern const int kCharactersTileResourceId;")
+    header.append("extern const int kPadBackgroundResourceIds[7];")
     header.append("")
     header.append("#endif  // RC_INVOKED")
     header.append("")
@@ -468,6 +510,10 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kBackgroundResourceId = %s;" % (background_sym["name"] if background_sym else "0"))
     cpp.append("const int kAppIconResourceId = %s;" % icon_sym["name"])
     cpp.append("const int kUIFontResourceId = %s;" % (font_sym["name"] if font_sym else "0"))
+    cpp.append("const int kWorldTileResourceId = %s;" % (world_tile_sym["name"] if world_tile_sym else "0"))
+    cpp.append("const int kCharactersTileResourceId = %s;" % (characters_tile_sym["name"] if characters_tile_sym else "0"))
+    cpp.append("const int kPadBackgroundResourceIds[7] = { %s };"
+               % ", ".join(sym["name"] if sym else "0" for sym in pad_bg_syms))
     cpp.append("")
 
     def emit_entry(entry):

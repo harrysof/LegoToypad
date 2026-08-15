@@ -502,15 +502,18 @@ namespace
 		MoveSource,
 	};
 
-	// Glossy rounded-rect pad. `cell` is the real slot rect; the returned
-	// bitmap is padded by kPadGlowMargin so the gold/blue halo has room.
+	// Glossy rounded-rect pad backed by the per-slot background PNG.
+	// `cell` is the real slot rect; the returned bitmap is padded by
+	// kPadGlowMargin so the gold/blue halo has room. The cache key includes
+	// the slot's background resource id, since each of the 7 pads renders a
+	// different base image even at identical visuals/size.
 	constexpr int kPadGlowMargin = 6;
 
-	Gdiplus::Bitmap* RenderPad(const RECT& cell, PadVisual visual)
+	Gdiplus::Bitmap* RenderPad(int slotIndex, const RECT& cell, PadVisual visual)
 	{
 		const int w = (cell.right - cell.left) + kPadGlowMargin * 2;
 		const int h = (cell.bottom - cell.top) + kPadGlowMargin * 2;
-		const GlossKey key{GlossKind::Pad, static_cast<int>(visual), 0, 0, w, h};
+		const GlossKey key{GlossKind::Pad, static_cast<int>(visual), kPadBackgroundResourceIds[slotIndex], 0, w, h};
 		const auto cached = g_glossCache.find(key);
 		if (cached != g_glossCache.end())
 			return cached->second;
@@ -518,6 +521,7 @@ namespace
 		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
 		Gdiplus::Graphics g(bitmap);
 		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
 
 		const Gdiplus::RectF rect(static_cast<float>(kPadGlowMargin), static_cast<float>(kPadGlowMargin),
 			static_cast<float>(cell.right - cell.left), static_cast<float>(cell.bottom - cell.top));
@@ -533,15 +537,25 @@ namespace
 		else if (moveSource)
 			DrawGlow(g, path, kGlowBlue, 8, w, h);
 
-		const unsigned int topColor = occupied ? 0x00344A3E : 0x002A3040;
-		const unsigned int bottomColor = occupied ? 0x00182A1E : 0x00141A28;
-		Gdiplus::LinearGradientBrush fill(rect,
-			Gdiplus::Color(255, GetRValue(topColor), GetGValue(topColor), GetBValue(topColor)),
-			Gdiplus::Color(255, GetRValue(bottomColor), GetGValue(bottomColor), GetBValue(bottomColor)),
-			Gdiplus::LinearGradientModeVertical);
-		g.FillPath(&fill, &path);
+		// The real pad art (already includes the glass/gloss look) fills the
+		// cell rect; the procedural gradient and synthetic glossy streak are
+		// gone. The rounded-rect clip keeps the shape's outline crisp.
+		Gdiplus::Bitmap* padImage = GetAssetBitmap(kPadBackgroundResourceIds[slotIndex]);
+		if (padImage)
+		{
+			Gdiplus::Region clip(&path);
+			g.SetClip(&clip);
+			g.DrawImage(padImage, rect);
+			g.ResetClip();
+		}
 
-		DrawTopGloss(g, path, w, h);
+		// Occupied has no dedicated art, so it's a soft green tint over the
+		// same background clear enough to keep the pad's own texture visible.
+		if (occupied)
+		{
+			Gdiplus::SolidBrush tint(Gdiplus::Color(40, 52, 168, 110));
+			g.FillPath(&tint, &path);
+		}
 
 		const unsigned int border = moveSource ? kGlowBlue : (occupied ? kPadBorderOccupied : kPadBorderIdle);
 		Gdiplus::Pen borderPen(
@@ -711,8 +725,9 @@ namespace
 		return bitmap;
 	}
 
-	// Franchise tile: rounded rect with the world logo filling it and a gold
-	// glow when focused. The logo alone identifies the world - no text label.
+	// Franchise tile: the world_tile background image with the world logo
+	// drawn on top of it, plus a gold glow when focused. The logo alone
+	// identifies the world - no text label.
 	Gdiplus::Bitmap* RenderFranchiseTile(int logoResourceId, bool focused)
 	{
 		constexpr int tileW = 190;
@@ -739,10 +754,24 @@ namespace
 		if (focused)
 			DrawGlow(g, path, kGlowGold, 8, w, h);
 
-		Gdiplus::LinearGradientBrush fill(rect,
-			Gdiplus::Color(255, 40, 46, 60), Gdiplus::Color(255, 20, 24, 34),
-			Gdiplus::LinearGradientModeVertical);
-		g.FillPath(&fill, &path);
+		// The real tile art (the translucent world-tile panel) fills the
+		// tile rect; the procedural gradient/gloss base is gone. The logo is
+		// layered over this background below.
+		Gdiplus::Bitmap* tileBase = GetAssetBitmap(kWorldTileResourceId);
+		if (tileBase)
+		{
+			// Cover-fit: fill the whole tile area, cropping overflow.
+			const float scale = std::max(rect.Width / tileBase->GetWidth(),
+				rect.Height / tileBase->GetHeight());
+			const float drawW = tileBase->GetWidth() * scale;
+			const float drawH = tileBase->GetHeight() * scale;
+			const Gdiplus::RectF dest(rect.X + (rect.Width - drawW) / 2.0f,
+				rect.Y + (rect.Height - drawH) / 2.0f, drawW, drawH);
+			Gdiplus::Region clip(&path);
+			g.SetClip(&clip);
+			g.DrawImage(tileBase, dest);
+			g.ResetClip();
+		}
 
 		Gdiplus::Bitmap* logo = GetAssetBitmap(logoResourceId);
 		if (logo)
@@ -759,8 +788,6 @@ namespace
 			g.DrawImage(logo, dest);
 			g.ResetClip();
 		}
-
-		DrawTopGloss(g, path, w, h);
 
 		Gdiplus::Pen borderPen(Gdiplus::Color(200, 88, 96, 112), 1.5f);
 		borderPen.SetLineJoin(Gdiplus::LineJoinRound);
@@ -1825,7 +1852,7 @@ namespace
 		else
 			visual = PadVisual::Idle;
 
-		Gdiplus::Bitmap* pad = RenderPad(cell, visual);
+		Gdiplus::Bitmap* pad = RenderPad(static_cast<int>(index), cell, visual);
 		if (pad)
 			g.DrawImage(pad, static_cast<int>(cell.left) - kPadGlowMargin, static_cast<int>(cell.top) - kPadGlowMargin);
 
@@ -1833,13 +1860,15 @@ namespace
 		const int cellHeight = cell.bottom - cell.top;
 		const PadSlot& slot = g_app.padState[index];
 
-		// Occupant portrait, horizontally and vertically centered in the pad
-		// cell; the figure name (if any) is wrapped below it. No slot-name
-		// label and no "(empty)" text - an empty pad is just its placeholder.
-		constexpr int kOccupantDiameter = 64;
-		constexpr int kNameAreaH = 44;   // room for a wrapped (2-line) name
+		// Occupant portrait: a circle in the pad's upper portion, sized as a
+		// proportion of the cell (the 7 pads differ in size), with the name
+		// label wrapped below it. No slot-name label and no "(empty)" text -
+		// an empty pad is just its placeholder.
+		const int shorter = std::min(cellWidth, cellHeight);
+		const int kOccupantDiameter = std::clamp(static_cast<int>(shorter * 0.38f), 40, 70);
+		const int kNameAreaH = 44;   // room for a wrapped (2-line) name
 		const int circleX = cell.left + (cellWidth - kOccupantDiameter) / 2;
-		const int circleY = cell.top + std::max(6, (cellHeight - kOccupantDiameter - 4 - kNameAreaH) / 2);
+		const int circleY = cell.top + static_cast<int>(cellHeight * 0.38f) - kOccupantDiameter / 2;
 
 		if (occupied)
 		{
@@ -1847,7 +1876,7 @@ namespace
 			if (portrait)
 				g.DrawImage(portrait, circleX - kPortraitMargin, circleY - kPortraitMargin);
 			DrawTextWrappedCentered(dc, slot.figureName,
-				cell.left + 4, circleY + kOccupantDiameter + 2, cellWidth - 8, kNameAreaH, RGB(226, 240, 230));
+				cell.left + 4, circleY + kOccupantDiameter + 8, cellWidth - 8, kNameAreaH, RGB(226, 240, 230));
 		}
 		else
 		{
@@ -1883,25 +1912,23 @@ namespace
 		}
 	}
 
-	void DrawPadActionMenu(Gdiplus::Graphics& g, HDC dc, int width)
+	void DrawPadActionMenu(Gdiplus::Graphics& g, HDC dc)
 	{
+		// Fixed bottom-left position regardless of which pad is selected
+		// (pill bottom lands ~gap above the window's bottom edge).
+		constexpr int pillX = 16;
+		constexpr int pillY = 470;
 		const RECT& cell = kPadCells[g_app.slotIndex];
 
-		// The pill sits in the lower band of the overlay, horizontally
-		// centered on the selected pad, with a tapered pointer connecting it
-		// back up to the pad so it reads as anchored rather than floating.
-		const int pillX = std::clamp(static_cast<int>((cell.left + cell.right) / 2) - kPillWidth / 2, 8, width - 8 - kPillWidth);
-		const int pillY = 468;
-
-		const int sx = (cell.left + cell.right) / 2;
-		const int tx = pillX + kPillWidth / 2;
-		Gdiplus::SolidBrush connector(Gdiplus::Color(150, 255, 204, 51));
-		const Gdiplus::PointF triangle[3] = {
-			{static_cast<float>(sx), static_cast<float>(cell.bottom)},
-			{static_cast<float>(tx - 9), static_cast<float>(pillY + 5)},
-			{static_cast<float>(tx + 9), static_cast<float>(pillY + 5)},
-		};
-		g.FillPolygon(&connector, triangle, 3);
+		// Thin gold/tan connector from the pill's top up to the selected
+		// pad's bottom-center, drawn before the pill so the pill panel sits
+		// on top of the line's start.
+		Gdiplus::Pen connector(Gdiplus::Color(128,
+			GetRValue(kGlowGold), GetGValue(kGlowGold), GetBValue(kGlowGold)), 3.0f);
+		const Gdiplus::PointF from(static_cast<float>(pillX + 140), static_cast<float>(pillY));
+		const Gdiplus::PointF to(static_cast<float>((cell.left + cell.right) / 2),
+			static_cast<float>(cell.bottom));
+		g.DrawLine(&connector, from, to);
 
 		const PadSlot& target = g_app.padState[g_app.slotIndex];
 		const std::vector<std::wstring> options = {
@@ -1912,20 +1939,66 @@ namespace
 		DrawPillMenu(g, dc, pillX, pillY, kPadActionCount, options, g_app.padActionIndex);
 	}
 
+	// Plus-picker: the vehicle's builds as a row of portrait circles (colored
+	// ring + name below), plus a trailing "+" glyph - the same visual
+	// language as the franchise roster grid, on a shared characters_tile
+	// panel. The franchise logo is drawn above this in the screen painter.
 	void DrawPlusPickerMenu(Gdiplus::Graphics& g, HDC dc)
 	{
-		if (!g_app.plusGroup)
+		if (!g_app.plusGroup || g_app.plusGroup->builds.empty())
 			return;
-		const size_t rows = g_app.plusGroup->builds.size();
-		if (rows == 0)
-			return;
-		std::vector<std::wstring> options;
-		for (const auto& build : g_app.plusGroup->builds)
-			options.push_back(L"Build " + std::to_wstring(build.buildNumber));
 
-		const int pillX = (kOverlayWidth - kPillWidth) / 2;
-		const int pillY = 166;
-		DrawPillMenu(g, dc, pillX, pillY, rows, options, g_app.plusBuildIndex);
+		const auto& builds = g_app.plusGroup->builds;
+		const size_t count = builds.size();
+
+		constexpr int diam = 108;
+		constexpr int step = 176;
+		constexpr int gapToPlus = 40;
+		constexpr int circleY = 150;
+		constexpr int labelH = 46;
+
+		const int groupW = static_cast<int>(count - 1) * step + diam + gapToPlus + diam;
+		const int groupX = (kOverlayWidth - groupW) / 2;
+
+		// Large translucent panel (characters_tile art) behind the circles.
+		constexpr int panelXPad = 34;
+		constexpr int panelTopPad = 26;
+		const int panelX = groupX - panelXPad;
+		const int panelY = circleY - panelTopPad;
+		const int panelH = panelTopPad + diam + 8 + labelH + 24;
+		const int panelW = groupW + panelXPad * 2;
+		const Gdiplus::RectF panelRect(static_cast<float>(panelX), static_cast<float>(panelY),
+			static_cast<float>(panelW), static_cast<float>(panelH));
+		Gdiplus::Bitmap* panelArt = GetAssetBitmap(kCharactersTileResourceId);
+		if (panelArt)
+		{
+			Gdiplus::GraphicsPath panelPath;
+			AddRoundedRectPath(panelPath, panelRect, 16.0f);
+			Gdiplus::Region clip(&panelPath);
+			g.SetClip(&clip);
+			g.DrawImage(panelArt, panelRect);
+			g.ResetClip();
+		}
+
+		for (size_t i = 0; i < count; ++i)
+		{
+			const RosterEntry& build = builds[i];
+			const int x = groupX + static_cast<int>(i) * step;
+			const bool focused = i == g_app.plusBuildIndex;
+			Gdiplus::Bitmap* visual = build.portraitResourceId != 0
+				? RenderPortrait(build.portraitResourceId, build.ringColor, focused, diam)
+				: RenderPlaceholder(build.name.empty() ? L'?' : build.name[0], build.ringColor, focused, diam);
+			if (visual)
+				g.DrawImage(visual, x - kPortraitMargin, circleY - kPortraitMargin);
+			DrawTextWrappedCentered(dc, EntryDisplayName(build), x - 16, circleY + diam + 8, step, labelH,
+				focused ? RGB(255, 236, 190) : RGB(214, 220, 230));
+		}
+
+		// Trailing "+" glyph (non-interactive), matching the roster marker.
+		const int plusX = groupX + static_cast<int>(count - 1) * step + diam + gapToPlus;
+		Gdiplus::Bitmap* plus = RenderPlusTile(builds[0].ringColor, false, diam);
+		if (plus)
+			g.DrawImage(plus, plusX - kPortraitMargin, circleY - kPortraitMargin);
 	}
 
 	void DrawFranchiseGrid(Gdiplus::Graphics& g, HDC dc)
@@ -2036,7 +2109,7 @@ namespace
 			Gdiplus::Bitmap* wordmark = GetAssetBitmap(kWordmarkResourceId);
 			if (wordmark)
 			{
-				const Gdiplus::RectF box(16.0f, 10.0f, 170.0f, 40.0f);
+				const Gdiplus::RectF box(16.0f, 10.0f, 360.0f, 76.0f);
 				const float scale = std::min(box.Width / wordmark->GetWidth(), box.Height / wordmark->GetHeight());
 				const float drawW = wordmark->GetWidth() * scale;
 				const float drawH = wordmark->GetHeight() * scale;
@@ -2054,7 +2127,7 @@ namespace
 		case Screen::PadAction:
 			for (size_t index = 0; index < kPadCells.size(); ++index)
 				DrawPad(g, dc, index);
-			DrawPadActionMenu(g, dc, width);
+			DrawPadActionMenu(g, dc);
 			break;
 		case Screen::FranchiseList:
 			DrawFranchiseGrid(g, dc);
@@ -2073,14 +2146,45 @@ namespace
 					box.Y + (box.Height - drawH) / 2.0f, drawW, drawH);
 				g.DrawImage(worldLogo, dest);
 			}
+
+			// characters_tile.png: one large translucent panel behind the
+			// whole portrait grid, spanning the roster grid's bounding box
+			// plus a margin on each side. Drawn before the grid so the
+			// portraits sit on top of it.
+			const int gridRight = kRosterOriginX + static_cast<int>(kRosterCols - 1) * kRosterPitchX + kPortraitDiameter;
+			const int gridBottom = kRosterOriginY + static_cast<int>(kRosterVisibleRows - 1) * kRosterPitchY + kPortraitDiameter + 46;
+			const int panelX = kRosterOriginX - 16;
+			const int panelY = kRosterOriginY - 16;
+			const Gdiplus::RectF panelRect(static_cast<float>(panelX), static_cast<float>(panelY),
+				static_cast<float>(gridRight - panelX), static_cast<float>(gridBottom - panelY));
+			Gdiplus::Bitmap* rosterPanel = GetAssetBitmap(kCharactersTileResourceId);
+			if (rosterPanel)
+			{
+				Gdiplus::GraphicsPath panelPath;
+				AddRoundedRectPath(panelPath, panelRect, 14.0f);
+				Gdiplus::Region clip(&panelPath);
+				g.SetClip(&clip);
+				g.DrawImage(rosterPanel, panelRect);
+				g.ResetClip();
+			}
 			DrawRosterGrid(g, dc);
 			break;
 		}
 		case Screen::PlusPicker:
 		{
-			const std::wstring vehicleName = g_app.plusGroup ? g_app.plusGroup->baseName : L"";
-			if (!vehicleName.empty())
-				DrawTextLineCentered(dc, vehicleName, 24, 108, width - 48, RGB(255, 204, 51));
+			// The current world's logo above the builds panel, the same
+			// header the roster screen (this screen's parent) uses.
+			Gdiplus::Bitmap* worldLogo = GetAssetBitmap(kFranchises[g_app.franchiseIndex].logoResourceId);
+			if (worldLogo)
+			{
+				const Gdiplus::RectF box((width - 360.0f) / 2.0f, 8.0f, 360.0f, 62.0f);
+				const float scale = std::min(box.Width / worldLogo->GetWidth(), box.Height / worldLogo->GetHeight());
+				const float drawW = worldLogo->GetWidth() * scale;
+				const float drawH = worldLogo->GetHeight() * scale;
+				const Gdiplus::RectF dest(box.X + (box.Width - drawW) / 2.0f,
+					box.Y + (box.Height - drawH) / 2.0f, drawW, drawH);
+				g.DrawImage(worldLogo, dest);
+			}
 			DrawPlusPickerMenu(g, dc);
 			break;
 		}
