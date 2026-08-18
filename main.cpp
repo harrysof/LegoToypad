@@ -119,23 +119,23 @@ namespace
 	enum class Screen
 	{
 		PadViewer,     // 7 gloss pads; initial screen. Choose a pad.
-		PadAction,     // floating capsule menu above the pad: Load / Clear / Move
+		PadAction,     // bottom action bar inside the selected pad: Load / Move / Clear
 		FranchiseList, // grid of the 30 world (franchise) tiles
 		RosterList,    // that world's characters + vehicles as circular portraits
 		PlusPicker,    // capsule listing a multi-build vehicle's builds by number
 		Settings,
 	};
 
-	// The 3-option capsule shown after picking a pad in PadViewer.
+	// The 3 actions in the selected pad's bottom action bar.
 	enum class PadActionKind
 	{
 		Load,
-		Clear,
 		Move,
+		Clear,
 	};
 	constexpr size_t kPadActionCount = 3;
 
-	constexpr size_t kSettingsItemCount = 2; // 0: change shortcut, 1: reset pad view
+	constexpr size_t kSettingsItemCount = 2; // 0: change shortcut, 1: clear all pad slots
 
 	enum class ShortcutType
 	{
@@ -148,11 +148,12 @@ namespace
 	// protocol is fire-and-forget (no acknowledgement from Cemu), so this
 	// can drift out of sync if Cemu's native dialog is also used, if Cemu
 	// restarts without LegoToypad restarting, or if a send silently fails
-	// to actually land. See "Reset pad view" in Settings.
+	// to actually land. See "Clear all pad" in Settings.
 	struct PadSlot
 	{
 		bool occupied = false;
 		std::wstring figureName;
+		int binResourceId = 0;
 		int portraitResourceId = 0;
 		unsigned int ringColor = 0;
 	};
@@ -171,6 +172,8 @@ namespace
 		Screen screen = Screen::PadViewer;
 		size_t slotIndex = 0;
 		size_t padActionIndex = 0;
+		int hoveredPadActionIndex = -1;
+		int pressedPadActionIndex = -1;
 		size_t settingsIndex = 0;
 		uint16_t port = 9191;
 		std::wstring status;
@@ -1240,47 +1243,74 @@ namespace
 		return entry.name;
 	}
 
-	// Sources the tag bytes from the embedded resource and sends the same
-	// LOAD message as before, to whatever pad slot the user picked.
-	void LoadRosterEntryToPad(const RosterEntry& entry)
+	bool SendLoadResourceToSlot(int binResourceId, size_t slotIndex, std::wstring& errorOut)
 	{
-		if (entry.binResourceId == 0)
+		if (binResourceId == 0)
 		{
-			g_app.status = L"Missing tag data for this entry.";
-			return;
+			errorOut = L"Missing tag data for this entry.";
+			return false;
 		}
 
-		const std::vector<uint8_t> tagData = LoadResourceBytes(entry.binResourceId);
+		const std::vector<uint8_t> tagData = LoadResourceBytes(binResourceId);
 		if (tagData.size() != kTagSize)
 		{
-			g_app.status = L"The embedded tag for this entry has the wrong size.";
-			return;
+			errorOut = L"The embedded tag for this entry has the wrong size.";
+			return false;
 		}
 
 		// Header + tag + 2-byte little-endian path length + path bytes.
 		// The path is empty now (see the wire protocol note above).
 		std::vector<uint8_t> message(5 + kTagSize + 2);
 		message[0] = kLoadCommand;
-		message[1] = kSlots[g_app.slotIndex].pad;
-		message[2] = kSlots[g_app.slotIndex].index;
+		message[1] = kSlots[slotIndex].pad;
+		message[2] = kSlots[slotIndex].index;
 		std::copy(tagData.begin(), tagData.end(), message.begin() + 5);
 		message[5 + kTagSize] = 0;
 		message[5 + kTagSize + 1] = 0;
 
+		return SendToypadMessage(message.data(), message.size(), errorOut);
+	}
+
+	bool SendMoveSlotToSlot(size_t sourceIndex, size_t destIndex, std::wstring& errorOut)
+	{
+		std::array<uint8_t, 5> message{};
+		message[0] = kMoveCommand;
+		message[1] = kSlots[destIndex].pad;
+		message[2] = kSlots[destIndex].index;
+		message[3] = kSlots[sourceIndex].pad;
+		message[4] = kSlots[sourceIndex].index;
+
+		return SendToypadMessage(message.data(), message.size(), errorOut);
+	}
+
+	bool SendClearSlot(size_t slotIndex, std::wstring& errorOut)
+	{
+		std::array<uint8_t, 5> message{}; // bytes 3-4 stay zero: reserved for LOAD/REMOVE
+		message[0] = kRemoveCommand;
+		message[1] = kSlots[slotIndex].pad;
+		message[2] = kSlots[slotIndex].index;
+
+		return SendToypadMessage(message.data(), message.size(), errorOut);
+	}
+
+	// Sources the tag bytes from the embedded resource and sends the same
+	// LOAD message as before, to whatever pad slot the user picked.
+	void LoadRosterEntryToPad(const RosterEntry& entry)
+	{
 		std::wstring error;
-		if (!SendToypadMessage(message.data(), message.size(), error))
+		if (!SendLoadResourceToSlot(entry.binResourceId, g_app.slotIndex, error))
 		{
 			g_app.status = error;
 			return;
 		}
 
-		// The listener always clears the destination before loading (see
-		// LISTENER_IMPLEMENTATION.md), so an occupied pad is silently
-		// overwritten on the Cemu side too - session state just mirrors that.
+		// The listener always clears the destination before loading, so a
+		// direct Load action still intentionally overwrites that pad.
 		const std::wstring name = EntryDisplayName(entry);
 		auto& slot = g_app.padState[g_app.slotIndex];
 		slot.occupied = true;
 		slot.figureName = name;
+		slot.binResourceId = entry.binResourceId;
 		slot.portraitResourceId = entry.portraitResourceId;
 		slot.ringColor = entry.ringColor;
 
@@ -1290,13 +1320,8 @@ namespace
 
 	void ClearSelectedPad()
 	{
-		std::array<uint8_t, 5> message{}; // bytes 3-4 stay zero: reserved for LOAD/REMOVE
-		message[0] = kRemoveCommand;
-		message[1] = kSlots[g_app.slotIndex].pad;
-		message[2] = kSlots[g_app.slotIndex].index;
-
 		std::wstring error;
-		if (!SendToypadMessage(message.data(), message.size(), error))
+		if (!SendClearSlot(g_app.slotIndex, error))
 		{
 			g_app.status = error;
 			return;
@@ -1307,54 +1332,83 @@ namespace
 		g_app.screen = Screen::PadViewer;
 	}
 
+	void ClearAllPads()
+	{
+		std::wstring error;
+		size_t clearedCount = 0;
+		for (size_t index = 0; index < kSlots.size(); ++index)
+		{
+			if (!SendClearSlot(index, error))
+			{
+				g_app.status = L"Clear all stopped after " + std::to_wstring(clearedCount) + L" pads: " + error;
+				g_app.screen = Screen::Settings;
+				return;
+			}
+
+			g_app.padState[index] = PadSlot{};
+			++clearedCount;
+		}
+
+		g_app.status = L"Clear all pad sent: all 7 slots cleared.";
+		g_app.screen = Screen::PadViewer;
+	}
+
 	// Moves whatever is tracked at moveSourceSlotIndex to destIndex. Called
 	// once the user has picked a destination pad in the PadViewer's
 	// move-destination mode.
 	void MoveToDestination(size_t destIndex)
 	{
-		if (destIndex == g_app.moveSourceSlotIndex)
+		if (!g_app.padState[g_app.moveSourceSlotIndex].occupied)
 		{
-			// Same pad as source: nothing to send, and updating padState
-			// below would otherwise clear the slot (occupy-destination and
-			// clear-source would target the same array entry). Stay on this
-			// screen so the user can pick a different pad or back out.
-			g_app.status = L"That is already where it is. Pick a different pad, or B/Esc to cancel.";
+			g_app.status = L"There is nothing tracked on that pad to move.";
+			g_app.selectingMoveDestination = false;
+			g_app.screen = Screen::PadViewer;
 			return;
 		}
 
-		std::array<uint8_t, 5> message{};
-		message[0] = kMoveCommand;
-		message[1] = kSlots[destIndex].pad;
-		message[2] = kSlots[destIndex].index;
-		message[3] = kSlots[g_app.moveSourceSlotIndex].pad;
-		message[4] = kSlots[g_app.moveSourceSlotIndex].index;
-
 		std::wstring error;
-		if (!SendToypadMessage(message.data(), message.size(), error))
+		if (!SendMoveSlotToSlot(g_app.moveSourceSlotIndex, destIndex, error))
 		{
 			g_app.status = error;
 			return;
 		}
 
-		// Overwrite the destination if it was occupied, same as Load does,
-		// and clear the source now that it has moved away.
-		const std::wstring movedName = g_app.padState[g_app.moveSourceSlotIndex].figureName;
-		g_app.padState[destIndex] = g_app.padState[g_app.moveSourceSlotIndex];
-		g_app.padState[g_app.moveSourceSlotIndex] = PadSlot{};
+		const PadSlot sourceSlot = g_app.padState[g_app.moveSourceSlotIndex];
+		const PadSlot destSlot = g_app.padState[destIndex];
+		const std::wstring movedName = sourceSlot.figureName;
+		if (destIndex != g_app.moveSourceSlotIndex)
+		{
+			if (destSlot.occupied)
+			{
+				if (!SendLoadResourceToSlot(destSlot.binResourceId, g_app.moveSourceSlotIndex, error))
+				{
+					g_app.padState[destIndex] = sourceSlot;
+					g_app.padState[g_app.moveSourceSlotIndex] = PadSlot{};
+					g_app.status = L"MOVE sent, but swap reload failed: " + error;
+					g_app.selectingMoveDestination = false;
+					g_app.screen = Screen::PadViewer;
+					return;
+				}
 
-		g_app.status = L"MOVE sent: " + movedName + L" (" + kSlots[g_app.moveSourceSlotIndex].label +
-			L" -> " + kSlots[destIndex].label + L")";
+				g_app.padState[destIndex] = sourceSlot;
+				g_app.padState[g_app.moveSourceSlotIndex] = destSlot;
+				g_app.status = L"SWAP sent: " + sourceSlot.figureName + L" <-> " + destSlot.figureName;
+				g_app.selectingMoveDestination = false;
+				g_app.screen = Screen::PadViewer;
+				return;
+			}
+
+			g_app.padState[destIndex] = sourceSlot;
+			g_app.padState[g_app.moveSourceSlotIndex] = PadSlot{};
+		}
+
+		if (destIndex == g_app.moveSourceSlotIndex)
+			g_app.status = L"REFRESH sent: " + movedName + L" on " + kSlots[destIndex].label;
+		else
+			g_app.status = L"MOVE sent: " + movedName + L" (" + kSlots[g_app.moveSourceSlotIndex].label +
+				L" -> " + kSlots[destIndex].label + L")";
 		g_app.selectingMoveDestination = false;
 		g_app.screen = Screen::PadViewer;
-	}
-
-	// Clears LegoToypad's own record of what is loaded where. Does not talk
-	// to Cemu at all - see the PadSlot comment for why this can drift and
-	// this exists as a manual "start tracking from scratch" reset.
-	void ResetPadView()
-	{
-		g_app.padState = {};
-		g_app.status = L"Pad view reset. This only clears LegoToypad's own tracking - nothing was sent to Cemu.";
 	}
 
 	// ---------------------------------------------------------------------
@@ -1383,10 +1437,10 @@ namespace
 	constexpr std::array<PadNeighbors, 7> kPadNeighbors = {{
 		/* 0 Left - upper         */ {-1,  3, -1,  1},
 		/* 1 Center               */ {-1, -1,  0,  2},
-		/* 2 Right - upper        */ {-1,  5,  1, -1},
+		/* 2 Right - upper        */ {-1,  6,  1, -1},
 		/* 3 Left - lower left    */ { 0, -1, -1,  4},
 		/* 4 Left - lower right   */ { 0, -1,  3,  5},
-		/* 5 Right - lower left   */ { 2, -1,  4,  6},
+		/* 5 Right - lower left   */ { 1, -1,  4,  6},
 		/* 6 Right - lower right  */ { 2, -1,  5, -1},
 	}};
 
@@ -1489,7 +1543,7 @@ namespace
 			NavigateGrid(0, direction);
 			break;
 		case Screen::PadAction:
-			// Buttons are now horizontal (Load | Clear | Move), so
+			// The bottom bar is horizontal (Load | Move | Clear), so
 			// left/right and up/down both cycle through them.
 			if (direction < 0)
 				SelectPrevious(kPadActionCount, g_app.padActionIndex);
@@ -1575,6 +1629,12 @@ namespace
 				ClearSelectedPad();
 				break;
 			case PadActionKind::Move:
+				if (!g_app.padState[g_app.slotIndex].occupied)
+				{
+					g_app.status = L"There is nothing tracked on that pad to move.";
+					g_app.screen = Screen::PadViewer;
+					break;
+				}
 				g_app.moveSourceSlotIndex = g_app.slotIndex;
 				g_app.selectingMoveDestination = true;
 				g_app.screen = Screen::PadViewer;
@@ -1608,7 +1668,7 @@ namespace
 			if (g_app.settingsIndex == 0)
 				BeginShortcutCapture();
 			else if (g_app.settingsIndex == 1)
-				ResetPadView();
+				ClearAllPads();
 			break;
 		}
 	}
@@ -1639,6 +1699,8 @@ namespace
 			}
 			break;
 		case Screen::PadAction:
+			g_app.hoveredPadActionIndex = -1;
+			g_app.pressedPadActionIndex = -1;
 			g_app.screen = Screen::PadViewer;
 			break;
 		case Screen::FranchiseList:
@@ -2094,115 +2156,135 @@ namespace
 		}
 	}
 
-	// Action bar: textfield_bar.png background with Load, Clear, Move button
-	// images laid horizontally inside it, floating above or below the selected
-	// pad depending on the pad's position. Drawn only when the overlay is in
-	// Screen::PadAction (i.e. the user pressed A on a pad to open the menu).
-	//
-	// Placement rules (matching the user's reference screenshot):
-	//   - Left/right upper pads  (index 0, 2) : bar sits ABOVE the pad
-	//   - Center pad             (index 1)    : bar sits BELOW the pad
-	//   - All lower pads         (index 3-6)  : bar sits BELOW the pad
-	// "above/below" means ~6 px gap from the pad edge to the bar edge.
-	constexpr int kBarGap = 6;    // pixels between pad edge and bar edge
-	constexpr int kBarH = 42;    // rendered height of the bar
-	constexpr int kBtnW = 70;    // each button image width inside the bar
-	constexpr int kBtnH = 26;    // each button image height inside the bar
-	constexpr int kBarInnerPad = 8; // left/right padding inside bar before first btn
+	// The action bar belongs to the selected pad itself: it is clipped to the
+	// pad outline and occupies the bottom edge, with no tiny floating pills.
+	constexpr int kActionBarHeight = 48;
+
+	RECT GetActionBarRect(size_t slotIndex)
+	{
+		const RECT& cell = kPadCells[slotIndex];
+		return {cell.left, cell.bottom - kActionBarHeight, cell.right, cell.bottom};
+	}
+
+	int ActionBarIndexAt(POINT point)
+	{
+		if (g_app.screen != Screen::PadAction)
+			return -1;
+
+		const RECT bar = GetActionBarRect(g_app.slotIndex);
+		if (!PtInRect(&bar, point))
+			return -1;
+		const RECT& cell = kPadCells[g_app.slotIndex];
+		Gdiplus::GraphicsPath padPath;
+		AddPadPath(padPath,
+			Gdiplus::RectF(static_cast<float>(cell.left), static_cast<float>(cell.top),
+				static_cast<float>(cell.right - cell.left), static_cast<float>(cell.bottom - cell.top)),
+			g_app.slotIndex == 1);
+		if (!padPath.IsVisible(static_cast<float>(point.x), static_cast<float>(point.y)))
+			return -1;
+
+		const int width = bar.right - bar.left;
+		return std::min<int>(kPadActionCount - 1,
+			(point.x - bar.left) * static_cast<int>(kPadActionCount) / width);
+	}
+
+	void DrawActionIcon(Gdiplus::Graphics& g, PadActionKind action, float centerX, float centerY,
+		const Gdiplus::Color& color)
+	{
+		Gdiplus::Pen pen(color, 1.8f);
+		pen.SetStartCap(Gdiplus::LineCapRound);
+		pen.SetEndCap(Gdiplus::LineCapRound);
+		pen.SetLineJoin(Gdiplus::LineJoinRound);
+
+		switch (action)
+		{
+		case PadActionKind::Load:
+			g.DrawLine(&pen, centerX, centerY + 5.5f, centerX, centerY - 5.0f);
+			g.DrawLine(&pen, centerX, centerY - 5.0f, centerX - 3.5f, centerY - 1.5f);
+			g.DrawLine(&pen, centerX, centerY - 5.0f, centerX + 3.5f, centerY - 1.5f);
+			g.DrawLine(&pen, centerX - 5.5f, centerY + 6.0f, centerX - 5.5f, centerY + 8.0f);
+			g.DrawLine(&pen, centerX - 5.5f, centerY + 8.0f, centerX + 5.5f, centerY + 8.0f);
+			g.DrawLine(&pen, centerX + 5.5f, centerY + 8.0f, centerX + 5.5f, centerY + 6.0f);
+			break;
+		case PadActionKind::Move:
+			g.DrawLine(&pen, centerX - 6.5f, centerY, centerX + 6.5f, centerY);
+			g.DrawLine(&pen, centerX + 6.5f, centerY, centerX + 3.0f, centerY - 3.5f);
+			g.DrawLine(&pen, centerX + 6.5f, centerY, centerX + 3.0f, centerY + 3.5f);
+			g.DrawLine(&pen, centerX, centerY - 6.5f, centerX, centerY + 6.5f);
+			g.DrawLine(&pen, centerX, centerY - 6.5f, centerX - 3.5f, centerY - 3.0f);
+			g.DrawLine(&pen, centerX, centerY - 6.5f, centerX + 3.5f, centerY - 3.0f);
+			break;
+		case PadActionKind::Clear:
+			g.DrawLine(&pen, centerX - 5.0f, centerY - 5.0f, centerX + 5.0f, centerY + 5.0f);
+			g.DrawLine(&pen, centerX + 5.0f, centerY - 5.0f, centerX - 5.0f, centerY + 5.0f);
+			break;
+		}
+	}
 
 	void DrawActionBar(Gdiplus::Graphics& g)
 	{
 		const RECT& cell = kPadCells[g_app.slotIndex];
-		const int cellW = cell.right - cell.left;
+		const RECT bar = GetActionBarRect(g_app.slotIndex);
+		const Gdiplus::RectF barRect(static_cast<float>(bar.left), static_cast<float>(bar.top),
+			static_cast<float>(bar.right - bar.left), static_cast<float>(bar.bottom - bar.top));
 
-		// The bar is perfectly matched to the width of the selected pad tile.
-		int barW = cellW;
-		int barH = 42; // default if no image
+		Gdiplus::GraphicsPath padPath;
+		AddPadPath(padPath,
+			Gdiplus::RectF(static_cast<float>(cell.left), static_cast<float>(cell.top),
+				static_cast<float>(cell.right - cell.left), static_cast<float>(cell.bottom - cell.top)),
+			g_app.slotIndex == 1);
+		Gdiplus::Region padClip(&padPath);
+		const Gdiplus::GraphicsState state = g.Save();
+		g.SetClip(&padClip);
 
-		Gdiplus::Bitmap* barBg = GetAssetBitmap(kTextfieldBarResourceId);
-		if (barBg && barBg->GetWidth() > 0)
+		Gdiplus::LinearGradientBrush backdrop(barRect,
+			Gdiplus::Color(195, 3, 9, 18), Gdiplus::Color(180, 8, 18, 33),
+			Gdiplus::LinearGradientModeVertical);
+		g.FillRectangle(&backdrop, barRect);
+
+		Gdiplus::Pen divider(Gdiplus::Color(72, 220, 235, 255), 1.0f);
+		g.DrawLine(&divider, static_cast<float>(bar.left), static_cast<float>(bar.top) + 0.5f,
+			static_cast<float>(bar.right), static_cast<float>(bar.top) + 0.5f);
+
+		const std::array<std::wstring, kPadActionCount> labels = {L"Load", L"Move", L"Clear"};
+		static Gdiplus::Font labelFont(g_uiFontFamily, 12.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+		Gdiplus::StringFormat labelFormat;
+		labelFormat.SetAlignment(Gdiplus::StringAlignmentCenter);
+		labelFormat.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+
+		for (size_t index = 0; index < kPadActionCount; ++index)
 		{
-			// Scale the bar's height so it maintains its exact image aspect ratio
-			const float aspect = static_cast<float>(barBg->GetWidth()) / static_cast<float>(barBg->GetHeight());
-			barH = static_cast<int>(barW / aspect);
-		}
-
-		const int padCenterX = (cell.left + cell.right) / 2;
-		const int barX = padCenterX - barW / 2;
-
-		constexpr int kBarGap = 6;
-		const bool barAbove = (g_app.slotIndex == 0 || g_app.slotIndex == 2);
-		const int barY = barAbove
-			? (cell.top - kBarGap - barH)
-			: (cell.bottom + kBarGap);
-
-		if (Gdiplus::Bitmap* bar = RenderScaledAsset(kTextfieldBarResourceId, barW, barH, 0))
-		{
-			g.DrawImage(bar, barX, barY);
-		}
-
-		// Calculate maximum bounds for the 3 buttons inside the bar
-		const int kBarInnerPad = static_cast<int>(barW * 0.12f);
-		const int kBtnGap = static_cast<int>(barW * 0.04f);
-		const int availableW = barW - (kBarInnerPad * 2);
-		const int maxBtnW = (availableW - (kBtnGap * 2)) / 3;
-
-		// Start with an ideal height (65% of the bar's inner height)
-		int btnH = static_cast<int>(barH * 0.65f);
-		float btnAspect = 2.666f; // fallback roughly 96/36
-
-		Gdiplus::Bitmap* sampleBtn = GetAssetBitmap(kLoadButtonResourceId);
-		if (sampleBtn && sampleBtn->GetHeight() > 0)
-		{
-			btnAspect = static_cast<float>(sampleBtn->GetWidth()) / static_cast<float>(sampleBtn->GetHeight());
-		}
-
-		int btnW = static_cast<int>(btnH * btnAspect);
-
-		// If the ideal height makes the buttons too wide for the bar, proportionally scale them down
-		if (btnW > maxBtnW)
-		{
-			btnW = maxBtnW;
-			btnH = static_cast<int>(btnW / btnAspect);
-		}
-
-		// Center the cluster of 3 buttons perfectly inside the bar
-		const int totalBtnsW = (btnW * 3) + (kBtnGap * 2);
-		const int btnAreaStart = barX + (barW - totalBtnsW) / 2;
-		const int btnY = barY + (barH - btnH) / 2;
-
-		const std::array<int, 3> btnResIds = {{
-			kLoadButtonResourceId,
-			kClearButtonResourceId,
-			kMoveButtonResourceId,
-		}};
-
-		for (int i = 0; i < 3; ++i)
-		{
-			Gdiplus::Bitmap* btn = RenderScaledAsset(btnResIds[i], btnW, btnH, 0);
-			if (!btn)
-				continue;
-			
-			const int bx = btnAreaStart + i * (btnW + kBtnGap);
-
-			// Focused button gets a gold glow outline drawn behind it.
-			if (static_cast<size_t>(i) == g_app.padActionIndex)
+			const int segmentLeft = bar.left + static_cast<int>(index) * (bar.right - bar.left) / static_cast<int>(kPadActionCount);
+			const int segmentRight = bar.left + static_cast<int>(index + 1) * (bar.right - bar.left) / static_cast<int>(kPadActionCount);
+			const bool pressed = static_cast<int>(index) == g_app.pressedPadActionIndex;
+			const bool hovered = static_cast<int>(index) == g_app.hoveredPadActionIndex;
+			const bool focused = index == g_app.padActionIndex;
+			if (pressed || hovered || focused)
 			{
-				Gdiplus::GraphicsPath hlPath;
-				AddRoundedRectPath(hlPath,
-					Gdiplus::RectF(static_cast<float>(bx - 2), static_cast<float>(btnY - 2),
-						static_cast<float>(btnW + 4), static_cast<float>(btnH + 4)),
-					10.0f);
-				Gdiplus::SolidBrush hlBrush(Gdiplus::Color(80, 255, 230, 80));
-				g.FillPath(&hlBrush, &hlPath);
-				Gdiplus::Pen hlPen(Gdiplus::Color(200,
-					GetRValue(kGlowGold), GetGValue(kGlowGold), GetBValue(kGlowGold)), 2.0f);
-				hlPen.SetLineJoin(Gdiplus::LineJoinRound);
-				g.DrawPath(&hlPen, &hlPath);
+				const BYTE alpha = pressed ? 82 : (hovered ? 54 : 34);
+				Gdiplus::SolidBrush highlight(Gdiplus::Color(alpha, 104, 174, 236));
+				g.FillRectangle(&highlight, segmentLeft, bar.top + 1, segmentRight - segmentLeft, bar.bottom - bar.top - 1);
 			}
 
-			g.DrawImage(btn, bx, btnY);
+			if (index > 0)
+				g.DrawLine(&divider, static_cast<float>(segmentLeft) + 0.5f, static_cast<float>(bar.top),
+					static_cast<float>(segmentLeft) + 0.5f, static_cast<float>(bar.bottom));
+
+			const PadActionKind action = static_cast<PadActionKind>(index);
+			const bool destructive = action == PadActionKind::Clear;
+			const Gdiplus::Color actionColor = destructive
+				? Gdiplus::Color(235, 255, 164, 174)
+				: Gdiplus::Color(235, 191, 220, 249);
+			const float centerX = (segmentLeft + segmentRight) / 2.0f;
+			DrawActionIcon(g, action, centerX, static_cast<float>(bar.top) + 14.0f, actionColor);
+			Gdiplus::SolidBrush textBrush(actionColor);
+			g.DrawString(labels[index].c_str(), -1, &labelFont,
+				Gdiplus::RectF(static_cast<float>(segmentLeft), static_cast<float>(bar.top) + 26.0f,
+					static_cast<float>(segmentRight - segmentLeft), 18.0f),
+				&labelFormat, &textBrush);
 		}
+
+		g.Restore(state);
 	}
 
 	// Plus-picker: the vehicle's builds as a row of portrait circles (colored
@@ -2520,7 +2602,7 @@ case Screen::RosterList:
 		{
 			const std::array<std::wstring, kSettingsItemCount> rows = {
 				L"Toggle shortcut: " + DescribeShortcut(),
-				L"Reset pad view (local tracking only, does not affect Cemu)",
+				L"Clear all pad",
 			};
 			for (size_t index = 0; index < rows.size(); ++index)
 			{
@@ -2841,6 +2923,78 @@ case Screen::RosterList:
 			}
 			InvalidateRect(window, nullptr, FALSE);
 			return 0;
+		case WM_MOUSEMOVE:
+		{
+			const POINT point{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))};
+			const int hoveredAction = ActionBarIndexAt(point);
+			if (hoveredAction != g_app.hoveredPadActionIndex)
+			{
+				g_app.hoveredPadActionIndex = hoveredAction;
+				InvalidateRect(window, nullptr, FALSE);
+			}
+			TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+			TrackMouseEvent(&tracking);
+			return 0;
+		}
+		case WM_MOUSELEAVE:
+			if (g_app.hoveredPadActionIndex != -1 || g_app.pressedPadActionIndex != -1)
+			{
+				g_app.hoveredPadActionIndex = -1;
+				g_app.pressedPadActionIndex = -1;
+				InvalidateRect(window, nullptr, FALSE);
+			}
+			return 0;
+		case WM_LBUTTONDOWN:
+		{
+			const POINT point{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))};
+			const int actionIndex = ActionBarIndexAt(point);
+			if (actionIndex >= 0)
+			{
+				g_app.pressedPadActionIndex = actionIndex;
+				g_app.padActionIndex = static_cast<size_t>(actionIndex);
+				SetCapture(window);
+				InvalidateRect(window, nullptr, FALSE);
+			}
+			return 0;
+		}
+		case WM_LBUTTONUP:
+		{
+			const POINT point{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))};
+			const int actionIndex = ActionBarIndexAt(point);
+			if (g_app.pressedPadActionIndex >= 0)
+			{
+				const bool activate = actionIndex == g_app.pressedPadActionIndex;
+				g_app.pressedPadActionIndex = -1;
+				if (GetCapture() == window)
+					ReleaseCapture();
+				if (activate)
+				{
+					g_app.padActionIndex = static_cast<size_t>(actionIndex);
+					Confirm();
+				}
+				InvalidateRect(window, nullptr, FALSE);
+				return 0;
+			}
+
+			for (size_t index = 0; index < kPadCells.size(); ++index)
+			{
+				if (!PtInRect(&kPadCells[index], point))
+					continue;
+
+				g_app.slotIndex = index;
+				g_app.hoveredPadActionIndex = -1;
+				if (g_app.screen == Screen::PadViewer && g_app.selectingMoveDestination)
+					MoveToDestination(index);
+				else if (g_app.screen == Screen::PadViewer || g_app.screen == Screen::PadAction)
+				{
+					g_app.screen = Screen::PadAction;
+					g_app.padActionIndex = 0;
+				}
+				InvalidateRect(window, nullptr, FALSE);
+				return 0;
+			}
+			return 0;
+		}
 		case WM_HOTKEY:
 			if (wParam == kToggleHotkeyId)
 				ToggleOverlay(window);
