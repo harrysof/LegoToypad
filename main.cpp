@@ -2675,6 +2675,13 @@ case Screen::RosterList:
 		static std::array<WORD, XUSER_MAX_COUNT> previousButtons{};
 		static WORD previousCombinedButtons = 0;
 		static DWORD lastNavigation = 0;
+		// XInputGetState on an EMPTY slot performs a slow device enumeration
+		// (documented XInput behavior), and doing that for up to three empty
+		// slots on every 8ms tick stalls the poll loop - badly so when an
+		// emulator is saturating the CPU. Empty slots are probed at most once
+		// every 2s; connected slots keep the full 8ms cadence.
+		static std::array<DWORD, XUSER_MAX_COUNT> nextEmptyProbe{};
+		static std::array<bool, XUSER_MAX_COUNT> slotWasConnected{};
 
 		UpdateInputOwnership(window);
 
@@ -2686,10 +2693,20 @@ case Screen::RosterList:
 		bool stickLeft = false;
 		bool stickRight = false;
 
+		const DWORD pollTick = GetTickCount();
 		for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i)
 		{
+			if (!slotWasConnected[i] && pollTick < nextEmptyProbe[i])
+			{
+				previousButtons[i] = 0;
+				continue;
+			}
+
 			XINPUT_STATE state{};
 			const bool connected = XInputGetState(i, &state) == ERROR_SUCCESS;
+			slotWasConnected[i] = connected;
+			if (!connected)
+				nextEmptyProbe[i] = pollTick + 2000;
 			const WORD buttons = connected ? state.Gamepad.wButtons : 0;
 			if (connected)
 			{
@@ -3059,6 +3076,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 		return 0;
 
 	SetProcessDPIAware();
+
+	// Keep the overlay responsive while an emulator saturates the CPU: at
+	// normal priority the 8ms poll timer and repaints get starved into
+	// visible input lag whenever the game pegs every core.
+	SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
 
 	WSADATA wsaData{};
 	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
