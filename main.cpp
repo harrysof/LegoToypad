@@ -137,7 +137,7 @@ namespace
 	};
 	constexpr size_t kPadActionCount = 3;
 
-	constexpr size_t kSettingsItemCount = 3; // 0: change shortcut, 1: A/B confirm style, 2: clear all pad slots
+	constexpr size_t kSettingsItemCount = 4; // shortcut, A/B confirm style, background, clear all pad slots
 
 	enum class ShortcutType
 	{
@@ -188,6 +188,7 @@ namespace
 		UINT shortcutKeyModifiers = 0;
 		UINT shortcutKeyCode = 0;
 		bool swapConfirmBackButtons = false;
+		size_t backgroundIndex = 0;
 		bool capturingShortcut = false;
 		// Stays false until every controller button has been seen released
 		// at least once after entering capture mode, so whatever button was
@@ -221,6 +222,7 @@ namespace
 	void HideOverlay(HWND window);
 	void BeginShortcutCapture();
 	void CancelShortcutCapture();
+	int CurrentBackgroundResourceId();
 
 	// ---------------------------------------------------------------------
 	// GDI+ plumbing
@@ -1034,11 +1036,12 @@ namespace
 		return bitmap;
 	}
 
-	// Full-window background: the starfield resource scaled to cover the
+	// Full-window background: the selected resource scaled to cover the
 	// window, with a dark overlay baked in for text legibility.
 	Gdiplus::Bitmap* RenderBackground(int width, int height)
 	{
-		const GlossKey key{GlossKind::Background, 0, kBackgroundResourceId, 0, width, height};
+		const int backgroundResourceId = CurrentBackgroundResourceId();
+		const GlossKey key{GlossKind::Background, 0, backgroundResourceId, 0, width, height};
 		const auto cached = g_glossCache.find(key);
 		if (cached != g_glossCache.end())
 			return cached->second;
@@ -1047,7 +1050,7 @@ namespace
 		Gdiplus::Graphics g(bitmap);
 		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
 
-		Gdiplus::Bitmap* background = GetAssetBitmap(kBackgroundResourceId);
+		Gdiplus::Bitmap* background = GetAssetBitmap(backgroundResourceId);
 		if (background)
 		{
 			const float scale = std::max(static_cast<float>(width) / background->GetWidth(),
@@ -1294,7 +1297,9 @@ namespace
 			"[Input]\n"
 			"; SwapConfirmBackButtons = 0 uses A to enter and B to go back (RPCS3 style).\n"
 			"; SwapConfirmBackButtons = 1 uses B to enter and A to go back (Cemu style).\n"
-			"SwapConfirmBackButtons=0\n";
+			"SwapConfirmBackButtons=0\n"
+			"; BackgroundIndex selects the app background from bundled Assets/background*. images.\n"
+			"BackgroundIndex=0\n";
 	}
 
 	// ---------------------------------------------------------------------
@@ -1365,11 +1370,38 @@ namespace
 			: L"A (RPCS3)";
 	}
 
+	size_t ClampBackgroundIndex(size_t index)
+	{
+		return kBackgroundChoiceCount == 0 ? 0 : std::min(index, kBackgroundChoiceCount - 1);
+	}
+
+	const BackgroundChoice* CurrentBackgroundChoice()
+	{
+		if (kBackgroundChoiceCount == 0)
+			return nullptr;
+		g_app.backgroundIndex = ClampBackgroundIndex(g_app.backgroundIndex);
+		return &kBackgroundChoices[g_app.backgroundIndex];
+	}
+
+	int CurrentBackgroundResourceId()
+	{
+		const BackgroundChoice* choice = CurrentBackgroundChoice();
+		return choice ? choice->resourceId : kBackgroundResourceId;
+	}
+
+	std::wstring DescribeBackgroundChoice()
+	{
+		const BackgroundChoice* choice = CurrentBackgroundChoice();
+		return choice ? choice->name : L"(none)";
+	}
+
 	void SaveInputSettingsToIni()
 	{
 		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
 		WritePrivateProfileStringW(L"Input", L"SwapConfirmBackButtons",
 			g_app.swapConfirmBackButtons ? L"1" : L"0", iniPath.c_str());
+		WritePrivateProfileStringW(L"Input", L"BackgroundIndex",
+			std::to_wstring(ClampBackgroundIndex(g_app.backgroundIndex)).c_str(), iniPath.c_str());
 	}
 
 	void LoadInputSettingsFromIni()
@@ -1377,6 +1409,8 @@ namespace
 		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
 		g_app.swapConfirmBackButtons =
 			GetPrivateProfileIntW(L"Input", L"SwapConfirmBackButtons", 0, iniPath.c_str()) != 0;
+		g_app.backgroundIndex = ClampBackgroundIndex(static_cast<size_t>(
+			GetPrivateProfileIntW(L"Input", L"BackgroundIndex", 0, iniPath.c_str())));
 	}
 
 	void ToggleConfirmButtonMode()
@@ -1384,6 +1418,18 @@ namespace
 		g_app.swapConfirmBackButtons = !g_app.swapConfirmBackButtons;
 		SaveInputSettingsToIni();
 		g_app.status = L"Confirm button: " + DescribeConfirmButtonMode();
+	}
+
+	void CycleBackgroundChoice()
+	{
+		if (kBackgroundChoiceCount <= 1)
+		{
+			g_app.status = L"No extra backgrounds are bundled in Assets.";
+			return;
+		}
+		g_app.backgroundIndex = (g_app.backgroundIndex + 1) % kBackgroundChoiceCount;
+		SaveInputSettingsToIni();
+		g_app.status = L"Background: " + DescribeBackgroundChoice();
 	}
 
 	void SaveShortcutToIni()
@@ -2097,6 +2143,8 @@ namespace
 			else if (g_app.settingsIndex == 1)
 				ToggleConfirmButtonMode();
 			else if (g_app.settingsIndex == 2)
+				CycleBackgroundChoice();
+			else if (g_app.settingsIndex == 3)
 				ClearAllPads();
 			break;
 		}
@@ -3009,6 +3057,7 @@ case Screen::RosterList:
 			const std::array<std::wstring, kSettingsItemCount> rows = {
 				L"Toggle shortcut: " + DescribeShortcut(),
 				L"Confirm button: " + DescribeConfirmButtonMode(),
+				L"Background: " + DescribeBackgroundChoice(),
 				L"Clear all pad",
 			};
 			for (size_t index = 0; index < rows.size(); ++index)
@@ -3530,7 +3579,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	g_app.status = std::to_wstring(embeddedTags) +
 		L" tags embedded. Listener port: " + std::to_wstring(g_app.port) +
 		L" | Toggle: " + DescribeShortcut() +
-		L" | Confirm: " + DescribeConfirmButtonMode();
+		L" | Confirm: " + DescribeConfirmButtonMode() +
+		L" | Background: " + DescribeBackgroundChoice();
 
 	g_inputOwnershipEvent = CreateEventW(nullptr, TRUE, FALSE, kLegoToypadInputEvent);
 

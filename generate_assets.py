@@ -328,16 +328,42 @@ def generate(root: Path, out_dir: Path) -> int:
 
     wordmark = pick_asset({"lego_toypad_wordmark", "wordmark"}, "wordmark", "wordmark")
     background = pick_asset({"background"}, "background", "background")
+
+    def background_sort_key(path):
+        stem = path.stem.casefold()
+        if stem == "background":
+            return (0, 0, path.name.casefold())
+        match = re.match(r"^background_(\d+)$", stem)
+        if match:
+            return (1, int(match.group(1)), path.name.casefold())
+        return (2, 0, path.name.casefold())
+
+    numbered_backgrounds = [
+        p for p in assets_files
+        if re.match(r"^background_(\d+)$", p.stem.casefold())
+    ]
+    background_choices = []
+    if background:
+        background_choices.append(("Default", background, "ASSET_BACKGROUND"))
+    for candidate in sorted(numbered_backgrounds, key=background_sort_key):
+        number = re.match(r"^background_(\d+)$", candidate.stem.casefold()).group(1)
+        background_choices.append(("Background %s" % number, candidate,
+                                   "ASSET_BACKGROUND_%s" % sanitize(number)))
+
     app_icon = pick_asset({"legotoypad_logo", "app_icon", "app_logo", "appicon"},
                           "logo", "app icon")
 
     wordmark_sym = symbols.allocate("ASSET_WORDMARK", wordmark) if wordmark else None
-    background_sym = symbols.allocate("ASSET_BACKGROUND", background) if background else None
+    background_choice_syms = [
+        {"label": label, "symbol": symbols.allocate(symbol_name, path)}
+        for label, path, symbol_name in background_choices
+    ]
+    background_sym = background_choice_syms[0]["symbol"] if background_choice_syms else None
     icon_sym = symbols.allocate("ASSET_APPICON", app_icon) if app_icon else None
     if wordmark:
         ascii_ok([str(wordmark)], warnings)
-    if background:
-        ascii_ok([str(background)], warnings)
+    for _, path, _ in background_choices:
+        ascii_ok([str(path)], warnings)
     if app_icon:
         ascii_ok([str(app_icon)], warnings)
 
@@ -531,8 +557,16 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("    std::vector<VehicleGroup> vehicles;")
     header.append("};")
     header.append("")
+    header.append("struct BackgroundChoice")
+    header.append("{")
+    header.append("    std::wstring name;")
+    header.append("    int resourceId;")
+    header.append("};")
+    header.append("")
     header.append("extern const Franchise kFranchises[];")
     header.append("extern const size_t kFranchiseCount;")
+    header.append("extern const BackgroundChoice kBackgroundChoices[];")
+    header.append("extern const size_t kBackgroundChoiceCount;")
     header.append("extern const int kWordmarkResourceId;")
     header.append("extern const int kBackgroundResourceId;")
     header.append("extern const int kAppIconResourceId;")
@@ -578,6 +612,12 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kMoveButtonResourceId = %s;" % (move_button_sym["name"] if move_button_sym else "0"))
     cpp.append("const int kScrollBarResourceId = %s;" % (scroll_bar_sym["name"] if scroll_bar_sym else "0"))
     cpp.append("const int kByHarrysofResourceId = %s;" % (by_harrysof_sym["name"] if by_harrysof_sym else "0"))
+    cpp.append("")
+    cpp.append("const BackgroundChoice kBackgroundChoices[] = {")
+    for item in background_choice_syms:
+        cpp.append("    { %s, %s }," % (wstr(item["label"]), item["symbol"]["name"]))
+    cpp.append("};")
+    cpp.append("const size_t kBackgroundChoiceCount = sizeof(kBackgroundChoices) / sizeof(kBackgroundChoices[0]);")
     cpp.append("")
 
     def emit_entry(entry):
