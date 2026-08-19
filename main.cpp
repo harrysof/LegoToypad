@@ -5,6 +5,7 @@
 #include <shellapi.h>
 #include <mmsystem.h>
 #include <gdiplus.h>
+#include <SDL.h>
 
 #include <algorithm>
 #include <array>
@@ -17,12 +18,12 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "GeneratedAssetTable.h"
 
 #pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "xinput9_1_0.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "gdiplus.lib")
 
@@ -3122,22 +3123,54 @@ case Screen::RosterList:
 	// Input polling
 	// ---------------------------------------------------------------------
 
-	void PollController(HWND window)
+void PollController(HWND window)
 	{
-		// One slot per XInput user index (0-3), so a controller plugged in
-		// as player 2/3/4 works identically to player 1. Cemu itself may be
-		// reading controller 0 for gameplay, so this app deliberately does
-		// not assume it owns that slot either.
-		static std::array<WORD, XUSER_MAX_COUNT> previousButtons{};
+		// Controllers are tracked per SDL joystick instance id and opened /
+		// closed from SDL_CONTROLLERDEVICEADDED / REMOVED events drained
+		// below. SDL delivers hotplug notifications through SDL_PollEvent,
+		// which is a cheap no-op when nothing changed - replacing XInput's
+		// slow empty-slot enumeration and its 2s probe backoff entirely.
+		struct ControllerState
+		{
+			SDL_GameController* handle = nullptr;
+			WORD previousButtons = 0;
+		};
+		static std::unordered_map<SDL_JoystickID, ControllerState> controllers;
 		static WORD previousCombinedButtons = 0;
 		static DWORD lastNavigation = 0;
-		// XInputGetState on an EMPTY slot performs a slow device enumeration
-		// (documented XInput behavior), and doing that for up to three empty
-		// slots on every 8ms tick stalls the poll loop - badly so when an
-		// emulator is saturating the CPU. Empty slots are probed at most once
-		// every 2s; connected slots keep the full 8ms cadence.
-		static std::array<DWORD, XUSER_MAX_COUNT> nextEmptyProbe{};
-		static std::array<bool, XUSER_MAX_COUNT> slotWasConnected{};
+
+		SDL_Event event;
+		while (SDL_PollEvent(&event))
+		{
+			if (event.type == SDL_CONTROLLERDEVICEADDED)
+			{
+				// which = joystick device index, only valid this tick.
+				SDL_GameController* controller = SDL_GameControllerOpen(event.cdevice.which);
+				if (!controller)
+					continue;
+				// Every connected controller is read, not just the first:
+				// Cemu itself may be reading one pad for gameplay, so this
+				// app deliberately does not assume it owns any slot.
+				const SDL_JoystickID instanceId =
+					SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller));
+				if (controllers.contains(instanceId))
+				{
+					SDL_GameControllerClose(controller);
+					continue;
+				}
+				controllers[instanceId] = ControllerState{controller, 0};
+			}
+			else if (event.type == SDL_CONTROLLERDEVICEREMOVED)
+			{
+				// which = joystick instance id on removal.
+				const auto it = controllers.find(event.cdevice.which);
+				if (it != controllers.end())
+				{
+					SDL_GameControllerClose(it->second.handle);
+					controllers.erase(it);
+				}
+			}
+		}
 
 		UpdateInputOwnership(window);
 
@@ -3149,36 +3182,62 @@ case Screen::RosterList:
 		bool stickLeft = false;
 		bool stickRight = false;
 
-		const DWORD pollTick = GetTickCount();
-		for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i)
+		for (auto& [deviceId, state] : controllers)
 		{
-			if (!slotWasConnected[i] && pollTick < nextEmptyProbe[i])
-			{
-				previousButtons[i] = 0;
-				continue;
-			}
+			(void)deviceId;
+			SDL_GameController* controller = state.handle;
+			WORD buttons = 0;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_UP))
+				buttons |= XINPUT_GAMEPAD_DPAD_UP;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN))
+				buttons |= XINPUT_GAMEPAD_DPAD_DOWN;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT))
+				buttons |= XINPUT_GAMEPAD_DPAD_LEFT;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT))
+				buttons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_START))
+				buttons |= XINPUT_GAMEPAD_START;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_BACK))
+				buttons |= XINPUT_GAMEPAD_BACK;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_LEFTSTICK))
+				buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_RIGHTSTICK))
+				buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))
+				buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER))
+				buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+			// XInput.h exports no constant for the guide bit; keep the
+			// documented XINPUT_GAMEPAD_GUIDE value (0x0400) as plain data.
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_GUIDE))
+				buttons |= 0x0400;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_A))
+				buttons |= XINPUT_GAMEPAD_A;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_B))
+				buttons |= XINPUT_GAMEPAD_B;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_X))
+				buttons |= XINPUT_GAMEPAD_X;
+			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_Y))
+				buttons |= XINPUT_GAMEPAD_Y;
 
-			XINPUT_STATE state{};
-			const bool connected = XInputGetState(i, &state) == ERROR_SUCCESS;
-			slotWasConnected[i] = connected;
-			if (!connected)
-				nextEmptyProbe[i] = pollTick + 2000;
-			const WORD buttons = connected ? state.Gamepad.wButtons : 0;
-			if (connected)
-			{
-				anyConnected = true;
-				combinedButtons |= buttons;
-				combinedPressed |= buttons & ~previousButtons[i];
-				if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || state.Gamepad.sThumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
-					stickUp = true;
-				if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || state.Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
-					stickDown = true;
-				if ((buttons & XINPUT_GAMEPAD_DPAD_LEFT) || state.Gamepad.sThumbLX < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
-					stickLeft = true;
-				if ((buttons & XINPUT_GAMEPAD_DPAD_RIGHT) || state.Gamepad.sThumbLX > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
-					stickRight = true;
-			}
-			previousButtons[i] = buttons;
+			// SDL2 reports stick Y negative = up / positive = down, inverted
+			// relative to XInput's sThumbLY; the 7849 deadzone threshold
+			// itself matches XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE and is kept.
+			const int16_t leftX = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTX);
+			const int16_t leftY = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY);
+
+			anyConnected = true;
+			combinedButtons |= buttons;
+			combinedPressed |= buttons & ~state.previousButtons;
+			if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || leftY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
+				stickUp = true;
+			if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || leftY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
+				stickDown = true;
+			if ((buttons & XINPUT_GAMEPAD_DPAD_LEFT) || leftX < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
+				stickLeft = true;
+			if ((buttons & XINPUT_GAMEPAD_DPAD_RIGHT) || leftX > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
+				stickRight = true;
+			state.previousButtons = buttons;
 		}
 		const WORD previousCombined = previousCombinedButtons;
 		previousCombinedButtons = combinedButtons;
@@ -3536,6 +3595,27 @@ case Screen::RosterList:
 	}
 }
 
+	// Loads gamecontrollerdb.txt from the exe's own directory, if present.
+	// The bundled SDL2 mappings already cover Xbox / DualShock / DualSense /
+	// Switch Pro; this file is the escape hatch for unrecognized pads
+	// (community DB from github.com/gabomdq/SDL_GameControllerDB, or one
+	// generated by SDL's mapping tools). Missing file is a silent no-op.
+	void LoadExtraControllerMappings()
+	{
+		wchar_t modulePath[MAX_PATH];
+		if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) == 0)
+			return;
+		std::filesystem::path dbPath(modulePath);
+		dbPath.replace_filename(L"gamecontrollerdb.txt");
+		if (!std::filesystem::exists(dbPath))
+			return;
+
+		char utf8Path[MAX_PATH * 2];
+		if (WideCharToMultiByte(CP_UTF8, 0, dbPath.c_str(), -1, utf8Path,
+				static_cast<int>(sizeof(utf8Path)), nullptr, nullptr) > 0)
+			SDL_GameControllerAddMappingsFromFile(utf8Path);
+	}
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
 	// Single instance: the named mutex survives as long as this process, so a
@@ -3561,6 +3641,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	// the message loop, once every cached bitmap is released.
 	Gdiplus::GdiplusStartupInput gdiplusStartupInput;
 	Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
+
+	// SDL2 provides the unified controller input (Xbox / PS4 / PS5 / Switch
+	// Pro) via its GameController API. SDL_INIT_GAMECONTROLLER implies the
+	// joystick subsystem. If SDL itself fails to start, clean up what was
+	// already initialized and bail non-zero, mirroring the CreateWindowExW
+	// failure path below.
+	if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0)
+	{
+		Gdiplus::GdiplusShutdown(g_gdiplusToken);
+		WSACleanup();
+		return 1;
+	}
+	LoadExtraControllerMappings();
 
 	LoadUIFont();
 
@@ -3632,6 +3725,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	ReleaseGlossCache();
 	ReleaseAssetImages();
 	UnloadUIFont();
+	SDL_Quit();
 	Gdiplus::GdiplusShutdown(g_gdiplusToken);
 	WSACleanup();
 	return static_cast<int>(message.wParam);
