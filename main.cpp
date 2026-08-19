@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -382,7 +381,8 @@ namespace
 	constexpr unsigned int kGlowBlue = 0x005A96E0;    // move-source pads
 	constexpr unsigned int kPadBorderIdle = 0x00525A6A;
 	constexpr unsigned int kPadBorderOccupied = 0x0060B476;
-	constexpr unsigned int kPadGlowRed = 0x005050FF;  // selected pad highlight (RGB 255,80,80)
+	constexpr unsigned int kPadFocusBloom = 0x00F3DDB8; // selected pad bloom (RGB 184,221,243)
+	constexpr unsigned int kPadFocusEdge = 0x0098D8F6; // selected pad edge (RGB 246,216,152)
 
 	void AddRoundedRectPath(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect, float radius)
 	{
@@ -468,14 +468,20 @@ namespace
 	void CompositeGlow(Gdiplus::Graphics& g, Gdiplus::Bitmap* mask, int radius, int width, int height);
 
 	void DrawGlow(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& path,
-		unsigned int color, int radius, int width, int height)
+		unsigned int color, int radius, int width, int height, BYTE alpha)
 	{
 		Gdiplus::Bitmap mask(width, height, PixelFormat32bppPARGB);
 		Gdiplus::Graphics mg(&mask);
 		mg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-		Gdiplus::SolidBrush solid(Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color)));
+		Gdiplus::SolidBrush solid(Gdiplus::Color(alpha, GetRValue(color), GetGValue(color), GetBValue(color)));
 		mg.FillPath(&solid, &path);
 		CompositeGlow(g, &mask, radius, width, height);
+	}
+
+	void DrawGlow(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& path,
+		unsigned int color, int radius, int width, int height)
+	{
+		DrawGlow(g, path, color, radius, width, height, 255);
 	}
 
 	// Blurs the alpha of `mask` (a PARGB bitmap holding the silhouette, RGB
@@ -539,10 +545,10 @@ namespace
 
 	// Glossy rounded-rect pad backed by the per-slot background PNG.
 	// `cell` is the real slot rect; the returned bitmap is padded by
-	// kPadGlowMargin so the gold/blue halo has room. The cache key includes
+	// kPadGlowMargin so the champagne/blue halo has room. The cache key includes
 	// the slot's background resource id, since each of the 7 pads renders a
 	// different base image even at identical visuals/size.
-	constexpr int kPadGlowMargin = 6;
+	constexpr int kPadGlowMargin = 20;
 
 	Gdiplus::Bitmap* RenderPad(int slotIndex, const RECT& cell, PadVisual visual)
 	{
@@ -568,7 +574,7 @@ namespace
 		const bool moveSource = visual == PadVisual::MoveSource;
 
 		if (selected)
-			DrawGlow(g, path, kPadGlowRed, 9, w, h);
+			DrawGlow(g, path, kPadFocusBloom, 18, w, h, 72);
 		else if (moveSource)
 			DrawGlow(g, path, kGlowBlue, 8, w, h);
 
@@ -591,13 +597,20 @@ namespace
 			Gdiplus::SolidBrush tint(Gdiplus::Color(40, 52, 168, 110));
 			g.FillPath(&tint, &path);
 		}
+		if (selected)
+		{
+			Gdiplus::LinearGradientBrush focusWash(rect,
+				Gdiplus::Color(34, 255, 255, 255), Gdiplus::Color(10, 142, 196, 238),
+				Gdiplus::LinearGradientModeForwardDiagonal);
+			g.FillPath(&focusWash, &path);
+		}
 
 		const unsigned int border = moveSource ? kGlowBlue
-			: (selected ? kPadGlowRed
+			: (selected ? kPadFocusEdge
 				: (occupied ? kPadBorderOccupied : kPadBorderIdle));
 		Gdiplus::Pen borderPen(
-			Gdiplus::Color(255, GetRValue(border), GetGValue(border), GetBValue(border)),
-			selected ? 3.0f : 2.0f);
+			Gdiplus::Color(selected ? 175 : 255, GetRValue(border), GetGValue(border), GetBValue(border)),
+			selected ? 1.25f : 2.0f);
 		borderPen.SetLineJoin(Gdiplus::LineJoinRound);
 		g.DrawPath(&borderPen, &path);
 
@@ -1953,22 +1966,18 @@ namespace
 	// single slot, and the right section (pad 3) mirrors the left. Sized for
 	// the fixed kOverlayWidth x kOverlayHeight window (this app isn't resizable).
 	//
-	// Each rect's width/height is the *native pixel size* of that slot's
-	// background PNG (left_upper.png/left_lower_left.png/right_upper.png/
-	// right_lower_right.png are 140x136, left_lower_right.png/
-	// right_lower_left.png are 168x136, Center.png is 188x184) - RenderPad
-	// draws the asset into this exact rect, so a mismatched size here is
-	// what stretches/distorts the art. Positions are measured off the
-	// reference Figma layout and mirrored left/right around the window's
-	// horizontal center (450) so the two sides line up exactly.
+	// Positions are measured off the reference layout and mirrored left/right
+	// around the window's horizontal center (450) so the two sides line up.
+	// The paired lower pads keep a small gutter between them instead of
+	// touching, which preserves the separate glass-tile read.
 	constexpr std::array<RECT, 7> kPadCells = {{
 		{100, 220, 240, 356}, // 0 Left - upper        (140x136)
 		{356, 103, 544, 287}, // 1 Center               (188x184)
 		{660, 220, 800, 356}, // 2 Right - upper        (140x136)
-		{100, 364, 240, 500}, // 3 Left - lower left    (140x136)
-		{240, 364, 408, 500}, // 4 Left - lower right   (168x136)
-		{492, 364, 660, 500}, // 5 Right - lower left   (168x136)
-		{660, 364, 800, 500}, // 6 Right - lower right  (140x136)
+		{100, 364, 236, 500}, // 3 Left - lower left
+		{244, 364, 408, 500}, // 4 Left - lower right
+		{492, 364, 656, 500}, // 5 Right - lower left
+		{664, 364, 800, 500}, // 6 Right - lower right
 	}};
 
 	// Franchise grid layout: 4 columns of large logo tiles, scrolled vertically.
@@ -2027,31 +2036,6 @@ namespace
 		if (pad)
 			g.DrawImage(pad, static_cast<int>(cell.left) - kPadGlowMargin, static_cast<int>(cell.top) - kPadGlowMargin);
 
-		// Pulsing red selection ring animated on top of the already-cached
-		// highlight so the focused pad visibly "breathes" while selected.
-		if (selected)
-		{
-			const int cellWidth = cell.right - cell.left;
-			const int cellHeight = cell.bottom - cell.top;
-			const float period = 1800.0f; // ms per full breathe cycle
-			const float phase = static_cast<float>(GetTickCount() % 1800) / period;
-			const float breathe = 0.5f + 0.5f * std::sin(phase * 2.0f * 3.14159265f);
-			const int alpha = static_cast<int>(130 + 110 * breathe);
-			const float inflate = 1.5f + 3.5f * breathe;
-			Gdiplus::GraphicsPath ringPath;
-			AddPadPath(ringPath,
-				Gdiplus::RectF(static_cast<float>(cell.left) - inflate,
-					static_cast<float>(cell.top) - inflate,
-					static_cast<float>(cellWidth) + inflate * 2.0f,
-					static_cast<float>(cellHeight) + inflate * 2.0f),
-				index == 1);
-			Gdiplus::Pen ringPen(Gdiplus::Color(
-				alpha, GetRValue(kPadGlowRed), GetGValue(kPadGlowRed), GetBValue(kPadGlowRed)),
-				2.5f + 3.0f * breathe);
-			ringPen.SetLineJoin(Gdiplus::LineJoinRound);
-			g.DrawPath(&ringPen, &ringPath);
-		}
-
 		if (!occupied)
 			return; // Empty pad: bare glass tile only, nothing drawn on top of it.
 
@@ -2063,7 +2047,7 @@ namespace
 		// there is no name label underneath competing for vertical space
 		// anymore.
 		const int shorter = std::min(cellWidth, cellHeight);
-		const int kOccupantDiameter = std::clamp(static_cast<int>(shorter * 0.62f), 60, 110);
+		const int kOccupantDiameter = std::clamp(static_cast<int>(shorter * 0.80f), 84, 148);
 		const int circleX = cell.left + (cellWidth - kOccupantDiameter) / 2;
 		const int circleY = cell.top + (cellHeight - kOccupantDiameter) / 2;
 
@@ -2156,135 +2140,89 @@ namespace
 		}
 	}
 
-	// The action bar belongs to the selected pad itself: it is clipped to the
-	// pad outline and occupies the bottom edge, with no tiny floating pills.
-	constexpr int kActionBarHeight = 48;
+	// Three floating circular image buttons for the selected pad's actions.
+	// Upper side pads tuck the row against the pad's lower edge so the buttons
+	// sit in the gap before the lower pads; center/lower pads place the row
+	// just beneath the selected piece of glass.
+	constexpr int kActionButtonSize = 42;
+	constexpr int kActionButtonGap = 4;
+	constexpr int kActionButtonFocusedGrow = 4;
 
-	RECT GetActionBarRect(size_t slotIndex)
+	int ResourceIdForAction(PadActionKind action)
 	{
-		const RECT& cell = kPadCells[slotIndex];
-		return {cell.left, cell.bottom - kActionBarHeight, cell.right, cell.bottom};
+		switch (action)
+		{
+		case PadActionKind::Load:
+			return kLoadButtonResourceId;
+		case PadActionKind::Move:
+			return kMoveButtonResourceId;
+		case PadActionKind::Clear:
+			return kClearButtonResourceId;
+		}
+		return 0;
 	}
 
-	int ActionBarIndexAt(POINT point)
+	RECT GetActionButtonRect(size_t slotIndex, size_t actionIndex)
+	{
+		const RECT& cell = kPadCells[slotIndex];
+		const int cellW = cell.right - cell.left;
+		const int rowW = static_cast<int>(kPadActionCount) * kActionButtonSize +
+			static_cast<int>(kPadActionCount - 1) * kActionButtonGap;
+		const int rowX = cell.left + (cellW - rowW) / 2;
+		int rowY = cell.bottom + 4;
+		if (slotIndex == 0 || slotIndex == 2)
+			rowY = cell.bottom - kActionButtonSize + 4;
+
+		const int x = rowX + static_cast<int>(actionIndex) * (kActionButtonSize + kActionButtonGap);
+		return {x, rowY, x + kActionButtonSize, rowY + kActionButtonSize};
+	}
+
+	int ActionButtonIndexAt(POINT point)
 	{
 		if (g_app.screen != Screen::PadAction)
 			return -1;
 
-		const RECT bar = GetActionBarRect(g_app.slotIndex);
-		if (!PtInRect(&bar, point))
-			return -1;
-		const RECT& cell = kPadCells[g_app.slotIndex];
-		Gdiplus::GraphicsPath padPath;
-		AddPadPath(padPath,
-			Gdiplus::RectF(static_cast<float>(cell.left), static_cast<float>(cell.top),
-				static_cast<float>(cell.right - cell.left), static_cast<float>(cell.bottom - cell.top)),
-			g_app.slotIndex == 1);
-		if (!padPath.IsVisible(static_cast<float>(point.x), static_cast<float>(point.y)))
-			return -1;
-
-		const int width = bar.right - bar.left;
-		return std::min<int>(kPadActionCount - 1,
-			(point.x - bar.left) * static_cast<int>(kPadActionCount) / width);
-	}
-
-	void DrawActionIcon(Gdiplus::Graphics& g, PadActionKind action, float centerX, float centerY,
-		const Gdiplus::Color& color)
-	{
-		Gdiplus::Pen pen(color, 1.8f);
-		pen.SetStartCap(Gdiplus::LineCapRound);
-		pen.SetEndCap(Gdiplus::LineCapRound);
-		pen.SetLineJoin(Gdiplus::LineJoinRound);
-
-		switch (action)
-		{
-		case PadActionKind::Load:
-			g.DrawLine(&pen, centerX, centerY + 5.5f, centerX, centerY - 5.0f);
-			g.DrawLine(&pen, centerX, centerY - 5.0f, centerX - 3.5f, centerY - 1.5f);
-			g.DrawLine(&pen, centerX, centerY - 5.0f, centerX + 3.5f, centerY - 1.5f);
-			g.DrawLine(&pen, centerX - 5.5f, centerY + 6.0f, centerX - 5.5f, centerY + 8.0f);
-			g.DrawLine(&pen, centerX - 5.5f, centerY + 8.0f, centerX + 5.5f, centerY + 8.0f);
-			g.DrawLine(&pen, centerX + 5.5f, centerY + 8.0f, centerX + 5.5f, centerY + 6.0f);
-			break;
-		case PadActionKind::Move:
-			g.DrawLine(&pen, centerX - 6.5f, centerY, centerX + 6.5f, centerY);
-			g.DrawLine(&pen, centerX + 6.5f, centerY, centerX + 3.0f, centerY - 3.5f);
-			g.DrawLine(&pen, centerX + 6.5f, centerY, centerX + 3.0f, centerY + 3.5f);
-			g.DrawLine(&pen, centerX, centerY - 6.5f, centerX, centerY + 6.5f);
-			g.DrawLine(&pen, centerX, centerY - 6.5f, centerX - 3.5f, centerY - 3.0f);
-			g.DrawLine(&pen, centerX, centerY - 6.5f, centerX + 3.5f, centerY - 3.0f);
-			break;
-		case PadActionKind::Clear:
-			g.DrawLine(&pen, centerX - 5.0f, centerY - 5.0f, centerX + 5.0f, centerY + 5.0f);
-			g.DrawLine(&pen, centerX + 5.0f, centerY - 5.0f, centerX - 5.0f, centerY + 5.0f);
-			break;
-		}
-	}
-
-	void DrawActionBar(Gdiplus::Graphics& g)
-	{
-		const RECT& cell = kPadCells[g_app.slotIndex];
-		const RECT bar = GetActionBarRect(g_app.slotIndex);
-		const Gdiplus::RectF barRect(static_cast<float>(bar.left), static_cast<float>(bar.top),
-			static_cast<float>(bar.right - bar.left), static_cast<float>(bar.bottom - bar.top));
-
-		Gdiplus::GraphicsPath padPath;
-		AddPadPath(padPath,
-			Gdiplus::RectF(static_cast<float>(cell.left), static_cast<float>(cell.top),
-				static_cast<float>(cell.right - cell.left), static_cast<float>(cell.bottom - cell.top)),
-			g_app.slotIndex == 1);
-		Gdiplus::Region padClip(&padPath);
-		const Gdiplus::GraphicsState state = g.Save();
-		g.SetClip(&padClip);
-
-		Gdiplus::LinearGradientBrush backdrop(barRect,
-			Gdiplus::Color(195, 3, 9, 18), Gdiplus::Color(180, 8, 18, 33),
-			Gdiplus::LinearGradientModeVertical);
-		g.FillRectangle(&backdrop, barRect);
-
-		Gdiplus::Pen divider(Gdiplus::Color(72, 220, 235, 255), 1.0f);
-		g.DrawLine(&divider, static_cast<float>(bar.left), static_cast<float>(bar.top) + 0.5f,
-			static_cast<float>(bar.right), static_cast<float>(bar.top) + 0.5f);
-
-		const std::array<std::wstring, kPadActionCount> labels = {L"Load", L"Move", L"Clear"};
-		static Gdiplus::Font labelFont(g_uiFontFamily, 12.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-		Gdiplus::StringFormat labelFormat;
-		labelFormat.SetAlignment(Gdiplus::StringAlignmentCenter);
-		labelFormat.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-
 		for (size_t index = 0; index < kPadActionCount; ++index)
 		{
-			const int segmentLeft = bar.left + static_cast<int>(index) * (bar.right - bar.left) / static_cast<int>(kPadActionCount);
-			const int segmentRight = bar.left + static_cast<int>(index + 1) * (bar.right - bar.left) / static_cast<int>(kPadActionCount);
+			const RECT rect = GetActionButtonRect(g_app.slotIndex, index);
+			if (!PtInRect(&rect, point))
+				continue;
+
+			const int cx = (rect.left + rect.right) / 2;
+			const int cy = (rect.top + rect.bottom) / 2;
+			const int dx = point.x - cx;
+			const int dy = point.y - cy;
+			const int radius = kActionButtonSize / 2;
+			if (dx * dx + dy * dy <= radius * radius)
+				return static_cast<int>(index);
+		}
+		return -1;
+	}
+
+	void DrawActionButtons(Gdiplus::Graphics& g)
+	{
+		for (size_t index = 0; index < kPadActionCount; ++index)
+		{
+			const PadActionKind action = static_cast<PadActionKind>(index);
 			const bool pressed = static_cast<int>(index) == g_app.pressedPadActionIndex;
 			const bool hovered = static_cast<int>(index) == g_app.hoveredPadActionIndex;
 			const bool focused = index == g_app.padActionIndex;
-			if (pressed || hovered || focused)
+			const int grow = focused || hovered || pressed ? kActionButtonFocusedGrow : 0;
+			const RECT rect = GetActionButtonRect(g_app.slotIndex, index);
+			const int x = rect.left - grow / 2;
+			const int y = rect.top - grow / 2;
+			const int size = kActionButtonSize + grow;
+
+			if (focused || hovered || pressed)
 			{
-				const BYTE alpha = pressed ? 82 : (hovered ? 54 : 34);
-				Gdiplus::SolidBrush highlight(Gdiplus::Color(alpha, 104, 174, 236));
-				g.FillRectangle(&highlight, segmentLeft, bar.top + 1, segmentRight - segmentLeft, bar.bottom - bar.top - 1);
+				const BYTE alpha = pressed ? 105 : (hovered ? 82 : 64);
+				Gdiplus::SolidBrush halo(Gdiplus::Color(alpha, 228, 238, 255));
+				g.FillEllipse(&halo, x - 2, y - 2, size + 4, size + 4);
 			}
 
-			if (index > 0)
-				g.DrawLine(&divider, static_cast<float>(segmentLeft) + 0.5f, static_cast<float>(bar.top),
-					static_cast<float>(segmentLeft) + 0.5f, static_cast<float>(bar.bottom));
-
-			const PadActionKind action = static_cast<PadActionKind>(index);
-			const bool destructive = action == PadActionKind::Clear;
-			const Gdiplus::Color actionColor = destructive
-				? Gdiplus::Color(235, 255, 164, 174)
-				: Gdiplus::Color(235, 191, 220, 249);
-			const float centerX = (segmentLeft + segmentRight) / 2.0f;
-			DrawActionIcon(g, action, centerX, static_cast<float>(bar.top) + 14.0f, actionColor);
-			Gdiplus::SolidBrush textBrush(actionColor);
-			g.DrawString(labels[index].c_str(), -1, &labelFont,
-				Gdiplus::RectF(static_cast<float>(segmentLeft), static_cast<float>(bar.top) + 26.0f,
-					static_cast<float>(segmentRight - segmentLeft), 18.0f),
-				&labelFormat, &textBrush);
+			if (Gdiplus::Bitmap* button = RenderScaledAsset(ResourceIdForAction(action), size, size, 0))
+				g.DrawImage(button, x, y);
 		}
-
-		g.Restore(state);
 	}
 
 	// Plus-picker: the vehicle's builds as a row of portrait circles (colored
@@ -2532,7 +2470,7 @@ namespace
 		case Screen::PadAction:
 			for (size_t index = 0; index < kPadCells.size(); ++index)
 				DrawPad(g, dc, index);
-			DrawActionBar(g);
+			DrawActionButtons(g);
 			break;
 		case Screen::FranchiseList:
 			DrawFranchiseGrid(g, dc);
@@ -2849,7 +2787,7 @@ case Screen::RosterList:
 			}
 			else if (stickLeft || stickRight)
 			{
-				// Horizontal: navigate action-bar buttons and similar horizontal lists.
+				// Horizontal: navigate action buttons and similar horizontal lists.
 				Navigate(stickLeft ? -1 : 1);
 			}
 			else if (stickUp || stickDown)
@@ -2866,15 +2804,7 @@ case Screen::RosterList:
 		if (!anyDirection)
 			lastNavigation = 0;
 
-		// Pad screens carry a pulsing selection ring, so they keep repainting
-		// at a throttled ~30fps to animate it without hogging the CPU; the
-		// other screens stay strictly paint-on-change.
-		static DWORD lastAnimRefresh = 0;
-		const bool padScreen = g_app.screen == Screen::PadViewer || g_app.screen == Screen::PadAction;
-		const bool animRefresh = g_app.overlayVisible && padScreen && (now - lastAnimRefresh >= 33);
-		if (animRefresh)
-			lastAnimRefresh = now;
-		if (changed || animRefresh)
+		if (changed)
 			InvalidateRect(window, nullptr, FALSE);
 	}
 
@@ -2943,7 +2873,7 @@ case Screen::RosterList:
 		case WM_MOUSEMOVE:
 		{
 			const POINT point{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))};
-			const int hoveredAction = ActionBarIndexAt(point);
+			const int hoveredAction = ActionButtonIndexAt(point);
 			if (hoveredAction != g_app.hoveredPadActionIndex)
 			{
 				g_app.hoveredPadActionIndex = hoveredAction;
@@ -2964,7 +2894,7 @@ case Screen::RosterList:
 		case WM_LBUTTONDOWN:
 		{
 			const POINT point{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))};
-			const int actionIndex = ActionBarIndexAt(point);
+			const int actionIndex = ActionButtonIndexAt(point);
 			if (actionIndex >= 0)
 			{
 				g_app.pressedPadActionIndex = actionIndex;
@@ -2977,7 +2907,7 @@ case Screen::RosterList:
 		case WM_LBUTTONUP:
 		{
 			const POINT point{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))};
-			const int actionIndex = ActionBarIndexAt(point);
+			const int actionIndex = ActionButtonIndexAt(point);
 			if (g_app.pressedPadActionIndex >= 0)
 			{
 				const bool activate = actionIndex == g_app.pressedPadActionIndex;

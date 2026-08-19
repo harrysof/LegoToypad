@@ -380,11 +380,11 @@ def generate(root: Path, out_dir: Path) -> int:
     if characters_tile:
         ascii_ok([str(characters_tile)], warnings)
 
-    # ---- action bar button assets -----------------------------------------
-    textfield_bar   = pick_named({"textfield_bar"},   "textfield bar background")
-    load_button     = pick_named({"load_button"},     "load button")
-    clear_button    = pick_named({"clear_button"},    "clear button")
-    move_button     = pick_named({"move_button"},     "move button")
+    # ---- action button assets ---------------------------------------------
+    textfield_bar   = None
+    load_button     = pick_named({"load_button", "load"},     "load button")
+    clear_button    = pick_named({"clear_button", "clear"},   "clear button")
+    move_button     = pick_named({"move_button", "move"},     "move button")
     scroll_bar      = pick_named({"scroll_bar"},      "scroll bar")
     by_harrysof     = pick_named({"by_harrysof"},      "by harrysof watermark")
     textfield_bar_sym  = symbols.allocate("ASSET_TEXTFIELD_BAR",  textfield_bar)  if textfield_bar  else None
@@ -393,9 +393,9 @@ def generate(root: Path, out_dir: Path) -> int:
     move_button_sym    = symbols.allocate("ASSET_MOVE_BUTTON",    move_button)    if move_button    else None
     scroll_bar_sym     = symbols.allocate("ASSET_SCROLL_BAR",     scroll_bar)     if scroll_bar     else None
     by_harrysof_sym    = symbols.allocate("ASSET_BY_HARRYSOF",    by_harrysof)    if by_harrysof    else None
-    for name, asset in [("textfield_bar", textfield_bar), ("load_button", load_button),
-                        ("clear_button", clear_button), ("move_button", move_button),
-                        ("scroll_bar", scroll_bar), ("by_harrysof", by_harrysof)]:
+    for name, asset in [("load_button", load_button), ("clear_button", clear_button),
+                        ("move_button", move_button), ("scroll_bar", scroll_bar),
+                        ("by_harrysof", by_harrysof)]:
         if asset:
             ascii_ok([str(asset)], warnings)
         else:
