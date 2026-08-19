@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -45,6 +46,7 @@ namespace
 	constexpr int kOverlayWidth = 900;
 	constexpr int kOverlayHeight = 610;
 	constexpr BYTE kOverlayAlpha = 235; // 0-255, uniform translucency for the whole panel.
+	constexpr int kWindowCornerRadius = 3;
 
 	// Tray icon / menu.
 	constexpr UINT kTrayCallbackMessage = WM_APP + 1;
@@ -381,8 +383,8 @@ namespace
 	constexpr unsigned int kGlowBlue = 0x005A96E0;    // move-source pads
 	constexpr unsigned int kPadBorderIdle = 0x00525A6A;
 	constexpr unsigned int kPadBorderOccupied = 0x0060B476;
-	constexpr unsigned int kPadFocusBloom = 0x00F3DDB8; // selected pad bloom (RGB 184,221,243)
-	constexpr unsigned int kPadFocusEdge = 0x0098D8F6; // selected pad edge (RGB 246,216,152)
+	constexpr unsigned int kPadFocusEdge = 0x003838E8; // selected pad edge (RGB 232,56,56)
+	constexpr unsigned int kFranchiseFocusEdge = 0x00FF9D42; // selected franchise edge (RGB 66,157,255)
 
 	void AddRoundedRectPath(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect, float radius)
 	{
@@ -468,20 +470,14 @@ namespace
 	void CompositeGlow(Gdiplus::Graphics& g, Gdiplus::Bitmap* mask, int radius, int width, int height);
 
 	void DrawGlow(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& path,
-		unsigned int color, int radius, int width, int height, BYTE alpha)
+		unsigned int color, int radius, int width, int height)
 	{
 		Gdiplus::Bitmap mask(width, height, PixelFormat32bppPARGB);
 		Gdiplus::Graphics mg(&mask);
 		mg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-		Gdiplus::SolidBrush solid(Gdiplus::Color(alpha, GetRValue(color), GetGValue(color), GetBValue(color)));
+		Gdiplus::SolidBrush solid(Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color)));
 		mg.FillPath(&solid, &path);
 		CompositeGlow(g, &mask, radius, width, height);
-	}
-
-	void DrawGlow(Gdiplus::Graphics& g, const Gdiplus::GraphicsPath& path,
-		unsigned int color, int radius, int width, int height)
-	{
-		DrawGlow(g, path, color, radius, width, height, 255);
 	}
 
 	// Blurs the alpha of `mask` (a PARGB bitmap holding the silhouette, RGB
@@ -545,16 +541,17 @@ namespace
 
 	// Glossy rounded-rect pad backed by the per-slot background PNG.
 	// `cell` is the real slot rect; the returned bitmap is padded by
-	// kPadGlowMargin so the champagne/blue halo has room. The cache key includes
+	// kPadGlowMargin gives the move-source halo room. Selected pads use only a
+	// crisp focus edge so they stay cheap to render.
 	// the slot's background resource id, since each of the 7 pads renders a
 	// different base image even at identical visuals/size.
-	constexpr int kPadGlowMargin = 20;
+	constexpr int kPadGlowMargin = 8;
 
-	Gdiplus::Bitmap* RenderPad(int slotIndex, const RECT& cell, PadVisual visual)
+	Gdiplus::Bitmap* RenderPad(int slotIndex, const RECT& cell, PadVisual visual, unsigned int occupantColor)
 	{
 		const int w = (cell.right - cell.left) + kPadGlowMargin * 2;
 		const int h = (cell.bottom - cell.top) + kPadGlowMargin * 2;
-		const GlossKey key{GlossKind::Pad, static_cast<int>(visual), kPadBackgroundResourceIds[slotIndex], 0, w, h};
+		const GlossKey key{GlossKind::Pad, static_cast<int>(visual), kPadBackgroundResourceIds[slotIndex], occupantColor, w, h};
 		const auto cached = g_glossCache.find(key);
 		if (cached != g_glossCache.end())
 			return cached->second;
@@ -573,9 +570,7 @@ namespace
 		const bool occupied = visual == PadVisual::Occupied || visual == PadVisual::OccupiedSelected;
 		const bool moveSource = visual == PadVisual::MoveSource;
 
-		if (selected)
-			DrawGlow(g, path, kPadFocusBloom, 18, w, h, 72);
-		else if (moveSource)
+		if (moveSource)
 			DrawGlow(g, path, kGlowBlue, 8, w, h);
 
 		// The real pad art (already includes the glass/gloss look) fills the
@@ -590,27 +585,22 @@ namespace
 			g.ResetClip();
 		}
 
-		// Occupied has no dedicated art, so it's a soft green tint over the
-		// same background clear enough to keep the pad's own texture visible.
+		const unsigned int occupiedColor = occupantColor != 0 ? occupantColor : kPadBorderOccupied;
+		// Occupied has no dedicated art, so the loaded figure's generated
+		// color becomes a soft per-pad tint over the same glass texture.
 		if (occupied)
 		{
-			Gdiplus::SolidBrush tint(Gdiplus::Color(40, 52, 168, 110));
+			Gdiplus::SolidBrush tint(Gdiplus::Color(
+				42, GetRValue(occupiedColor), GetGValue(occupiedColor), GetBValue(occupiedColor)));
 			g.FillPath(&tint, &path);
-		}
-		if (selected)
-		{
-			Gdiplus::LinearGradientBrush focusWash(rect,
-				Gdiplus::Color(34, 255, 255, 255), Gdiplus::Color(10, 142, 196, 238),
-				Gdiplus::LinearGradientModeForwardDiagonal);
-			g.FillPath(&focusWash, &path);
 		}
 
 		const unsigned int border = moveSource ? kGlowBlue
 			: (selected ? kPadFocusEdge
-				: (occupied ? kPadBorderOccupied : kPadBorderIdle));
+				: (occupied ? occupiedColor : kPadBorderIdle));
 		Gdiplus::Pen borderPen(
-			Gdiplus::Color(selected ? 175 : 255, GetRValue(border), GetGValue(border), GetBValue(border)),
-			selected ? 1.25f : 2.0f);
+			Gdiplus::Color(selected ? 230 : 255, GetRValue(border), GetGValue(border), GetBValue(border)),
+			selected ? 3.25f : 2.0f);
 		borderPen.SetLineJoin(Gdiplus::LineJoinRound);
 		g.DrawPath(&borderPen, &path);
 
@@ -659,7 +649,72 @@ namespace
 	}
 	// brighter ring plus a colored glow. `diameter` is the circle size; the
 	// bitmap is padded by kPortraitMargin for the glow.
-	constexpr int kPortraitMargin = 8;
+	constexpr int kPortraitMargin = 10;
+
+	Gdiplus::Rect GetOpaqueContentBounds(Gdiplus::Bitmap* image)
+	{
+		if (!image)
+			return Gdiplus::Rect(0, 0, 1, 1);
+
+		const int w = static_cast<int>(image->GetWidth());
+		const int h = static_cast<int>(image->GetHeight());
+		if (w <= 0 || h <= 0)
+			return Gdiplus::Rect(0, 0, 1, 1);
+
+		Gdiplus::Bitmap probe(w, h, PixelFormat32bppPARGB);
+		Gdiplus::Graphics pg(&probe);
+		pg.Clear(Gdiplus::Color(0, 0, 0, 0));
+		pg.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
+		pg.DrawImage(image, 0, 0, w, h);
+
+		Gdiplus::BitmapData data;
+		const Gdiplus::Rect lock(0, 0, w, h);
+		if (probe.LockBits(&lock, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &data) != Gdiplus::Ok)
+			return Gdiplus::Rect(0, 0, w, h);
+
+		int left = w;
+		int top = h;
+		int right = -1;
+		int bottom = -1;
+		const uint8_t* pixels = static_cast<const uint8_t*>(data.Scan0);
+		for (int y = 0; y < h; ++y)
+		{
+			const uint8_t* row = pixels + static_cast<size_t>(y) * data.Stride;
+			for (int x = 0; x < w; ++x)
+			{
+				if (row[x * 4 + 3] > 8)
+				{
+					left = std::min(left, x);
+					top = std::min(top, y);
+					right = std::max(right, x);
+					bottom = std::max(bottom, y);
+				}
+			}
+		}
+		probe.UnlockBits(&data);
+
+		if (right < left || bottom < top)
+			return Gdiplus::Rect(0, 0, w, h);
+
+		left = std::max(0, left - 2);
+		top = std::max(0, top - 2);
+		right = std::min(w - 1, right + 2);
+		bottom = std::min(h - 1, bottom + 2);
+		return Gdiplus::Rect(left, top, right - left + 1, bottom - top + 1);
+	}
+
+	void DrawCircularFocusHalo(Gdiplus::Graphics& g, const Gdiplus::RectF& circle, unsigned int color)
+	{
+		Gdiplus::RectF outer = circle;
+		outer.Inflate(3.5f, 3.5f);
+		Gdiplus::Pen soft(Gdiplus::Color(80, GetRValue(color), GetGValue(color), GetBValue(color)), 7.0f);
+		g.DrawEllipse(&soft, outer);
+
+		Gdiplus::RectF mid = circle;
+		mid.Inflate(1.5f, 1.5f);
+		Gdiplus::Pen crisp(Gdiplus::Color(130, GetRValue(color), GetGValue(color), GetBValue(color)), 3.0f);
+		g.DrawEllipse(&crisp, mid);
+	}
 
 	Gdiplus::Bitmap* RenderPortrait(int resId, unsigned int ringColor, bool focused, int diameter)
 	{
@@ -673,6 +728,7 @@ namespace
 
 		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
 		Gdiplus::Graphics g(bitmap);
+		g.Clear(Gdiplus::Color(0, 0, 0, 0));
 		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
 		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
 
@@ -682,20 +738,22 @@ namespace
 		circlePath.AddEllipse(circle);
 
 		if (focused)
-			DrawGlow(g, circlePath, ringColor, 7, w, h);
+			DrawCircularFocusHalo(g, circle, ringColor);
 
 		Gdiplus::Bitmap* photo = GetAssetBitmap(resId);
 		if (photo)
 		{
-			// Cover-fit the photo inside the circle, then clip.
-			const float scale = std::max(d / photo->GetWidth(), d / photo->GetHeight());
-			const float drawW = photo->GetWidth() * scale;
-			const float drawH = photo->GetHeight() * scale;
+			const Gdiplus::Rect source = GetOpaqueContentBounds(photo);
+			const float targetD = d * 0.92f;
+			const float scale = std::min(targetD / source.Width, targetD / source.Height);
+			const float drawW = source.Width * scale;
+			const float drawH = source.Height * scale;
 			const Gdiplus::RectF dest(kPortraitMargin + (d - drawW) / 2.0f,
 				kPortraitMargin + (d - drawH) / 2.0f, drawW, drawH);
 			Gdiplus::Region clip(&circlePath);
 			g.SetClip(&clip);
-			g.DrawImage(photo, dest);
+			g.DrawImage(photo, dest, static_cast<float>(source.X), static_cast<float>(source.Y),
+				static_cast<float>(source.Width), static_cast<float>(source.Height), Gdiplus::UnitPixel);
 			g.ResetClip();
 		}
 		else
@@ -736,6 +794,7 @@ namespace
 
 		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
 		Gdiplus::Graphics g(bitmap);
+		g.Clear(Gdiplus::Color(0, 0, 0, 0));
 		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
 
 		const float d = static_cast<float>(diameter);
@@ -744,7 +803,7 @@ namespace
 		circlePath.AddEllipse(circle);
 
 		if (focused)
-			DrawGlow(g, circlePath, ringColor, 7, w, h);
+			DrawCircularFocusHalo(g, circle, ringColor);
 
 		Gdiplus::LinearGradientBrush fill(circle,
 			Gdiplus::Color(255, 40, 46, 58), Gdiplus::Color(255, 18, 22, 30),
@@ -780,6 +839,7 @@ namespace
 
 		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
 		Gdiplus::Graphics g(bitmap);
+		g.Clear(Gdiplus::Color(0, 0, 0, 0));
 		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
 
 		const float d = static_cast<float>(diameter);
@@ -788,7 +848,7 @@ namespace
 		circlePath.AddEllipse(circle);
 
 		if (focused)
-			DrawGlow(g, circlePath, ringColor, 7, w, h);
+			DrawCircularFocusHalo(g, circle, ringColor);
 
 		Gdiplus::LinearGradientBrush fill(circle,
 			Gdiplus::Color(255, 46, 52, 64), Gdiplus::Color(255, 22, 26, 36),
@@ -814,8 +874,8 @@ namespace
 	}
 
 	// Franchise tile: the world_tile background image with the world logo
-	// drawn on top of it, plus a gold glow when focused. The logo alone
-	// identifies the world - no text label.
+	// drawn on top of it, plus a crisp focus outline when selected. The logo
+	// alone identifies the world - no text label.
 	Gdiplus::Bitmap* RenderFranchiseTile(int logoResourceId, bool focused)
 	{
 		constexpr int tileW = 190;
@@ -838,9 +898,6 @@ namespace
 			static_cast<float>(tileW), static_cast<float>(tileH));
 		Gdiplus::GraphicsPath path;
 		AddRoundedRectPath(path, rect, 12.0f);
-
-		if (focused)
-			DrawGlow(g, path, kGlowGold, 8, w, h);
 
 		// The real tile art (the translucent world-tile panel) fills the
 		// tile rect; the procedural gradient/gloss base is gone. The logo is
@@ -877,7 +934,10 @@ namespace
 			g.ResetClip();
 		}
 
-		Gdiplus::Pen borderPen(Gdiplus::Color(200, 88, 96, 112), 1.5f);
+		const unsigned int border = focused ? kFranchiseFocusEdge : kPadBorderIdle;
+		Gdiplus::Pen borderPen(
+			Gdiplus::Color(focused ? 230 : 200, GetRValue(border), GetGValue(border), GetBValue(border)),
+			focused ? 2.75f : 1.5f);
 		borderPen.SetLineJoin(Gdiplus::LineJoinRound);
 		g.DrawPath(&borderPen, &path);
 
@@ -1028,6 +1088,63 @@ namespace
 		SetTextColor(dc, color);
 		RECT rect{x, y, x + width, y + height};
 		DrawTextW(dc, text.c_str(), -1, &rect, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+	}
+
+	int MeasureLongestTokenWidth(HDC dc, const std::wstring& text)
+	{
+		int widest = 0;
+		size_t start = std::wstring::npos;
+		for (size_t i = 0; i <= text.size(); ++i)
+		{
+			const bool boundary = i == text.size() || iswspace(text[i]);
+			if (!boundary && start == std::wstring::npos)
+				start = i;
+			if (boundary && start != std::wstring::npos)
+			{
+				const std::wstring token = text.substr(start, i - start);
+				SIZE size{};
+				if (GetTextExtentPoint32W(dc, token.c_str(), static_cast<int>(token.size()), &size))
+					widest = std::max(widest, static_cast<int>(size.cx));
+				start = std::wstring::npos;
+			}
+		}
+		return widest;
+	}
+
+	bool WrappedTextFits(HDC dc, const std::wstring& text, int width, int height)
+	{
+		RECT measure{0, 0, width, height * 2};
+		DrawTextW(dc, text.c_str(), -1, &measure, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+		return measure.bottom - measure.top <= height && MeasureLongestTokenWidth(dc, text) <= width;
+	}
+
+	void DrawTextWrappedCenteredFit(HDC dc, const std::wstring& text, int x, int y, int width, int height, COLORREF color)
+	{
+		SetTextColor(dc, color);
+		HGDIOBJ oldFont = GetCurrentObject(dc, OBJ_FONT);
+
+		HFONT chosenFont = nullptr;
+		for (int px = 22; px >= 17; --px)
+		{
+			HFONT font = CreateFontW(-px, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+				OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, g_uiFontFamilyName.c_str());
+			if (!font)
+				continue;
+			SelectObject(dc, font);
+			if (WrappedTextFits(dc, text, width, height) || px == 17)
+			{
+				chosenFont = font;
+				break;
+			}
+			SelectObject(dc, oldFont);
+			DeleteObject(font);
+		}
+
+		RECT rect{x, y, x + width, y + height};
+		DrawTextW(dc, text.c_str(), -1, &rect, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+		SelectObject(dc, oldFont);
+		if (chosenFont)
+			DeleteObject(chosenFont);
 	}
 
 	std::filesystem::path GetExecutableDirectory()
@@ -1503,23 +1620,214 @@ namespace
 	// kRosterVisibleRows rows and follows the selection.
 	constexpr size_t kRosterCols = 5;
 	constexpr size_t kRosterVisibleRows = 3;
+	constexpr int kRosterOriginX = 60;
+	constexpr int kRosterOriginY = 120;
+	constexpr int kRosterPitchX = 156;
+	constexpr int kRosterLabelW = 132;
+	constexpr int kRosterSeparatorW = 180;
+	constexpr int kRosterSeparatorH = 6;
+	constexpr int kRosterGridBottomLimit = kOverlayHeight - 28;
+
+	struct RosterMetrics
+	{
+		int pitchY;
+		int portraitDiameter;
+		int labelH;
+		int separatorTopGap;
+		int vehicleGap;
+	};
+
+	constexpr RosterMetrics kRosterNormalMetrics{160, 94, 60, 16, 30};
+	constexpr RosterMetrics kRosterCompactMetrics{148, 84, 56, 12, 24};
+
+	size_t GetRosterCharacterCount()
+	{
+		size_t count = 0;
+		while (count < g_app.rosterSlots.size() &&
+			g_app.rosterSlots[count].kind == RosterSlot::Kind::Character)
+		{
+			++count;
+		}
+		return count;
+	}
+
+	size_t GetRosterCharacterRows()
+	{
+		const size_t characterCount = GetRosterCharacterCount();
+		return (characterCount + kRosterCols - 1) / kRosterCols;
+	}
+
+	size_t GetRosterVisualRowCount()
+	{
+		if (g_app.rosterSlots.empty())
+			return 0;
+		const size_t characterCount = GetRosterCharacterCount();
+		const size_t vehicleCount = g_app.rosterSlots.size() - characterCount;
+		return ((characterCount + kRosterCols - 1) / kRosterCols) +
+			((vehicleCount + kRosterCols - 1) / kRosterCols);
+	}
+
+	size_t GetRosterVisualRowItemCount(size_t row)
+	{
+		const size_t characterCount = GetRosterCharacterCount();
+		const size_t characterRows = GetRosterCharacterRows();
+		if (row < characterRows)
+			return std::min(kRosterCols, characterCount - row * kRosterCols);
+
+		const size_t vehicleCount = g_app.rosterSlots.size() - characterCount;
+		const size_t vehicleRow = row - characterRows;
+		return std::min(kRosterCols, vehicleCount - vehicleRow * kRosterCols);
+	}
+
+	struct RosterVisualPosition { size_t row, col; };
+
+	RosterVisualPosition GetRosterVisualPosition(size_t index)
+	{
+		const size_t characterCount = GetRosterCharacterCount();
+		if (index < characterCount)
+			return {index / kRosterCols, index % kRosterCols};
+
+		const size_t vehicleIndex = index - characterCount;
+		return {GetRosterCharacterRows() + vehicleIndex / kRosterCols, vehicleIndex % kRosterCols};
+	}
+
+	size_t GetRosterIndexAtVisualPosition(size_t row, size_t col)
+	{
+		const size_t characterCount = GetRosterCharacterCount();
+		const size_t characterRows = GetRosterCharacterRows();
+		if (row < characterRows)
+			return row * kRosterCols + col;
+
+		const size_t vehicleIndex = (row - characterRows) * kRosterCols + col;
+		return characterCount + vehicleIndex;
+	}
+
+	bool IsRosterSeparatorVisible()
+	{
+		const size_t characterCount = GetRosterCharacterCount();
+		if (characterCount == 0 || characterCount >= g_app.rosterSlots.size())
+			return false;
+
+		const size_t vehicleRow = GetRosterCharacterRows();
+		return vehicleRow > static_cast<size_t>(g_app.rosterTopRow) &&
+			vehicleRow < static_cast<size_t>(g_app.rosterTopRow) + kRosterVisibleRows;
+	}
+
+	int MeasureWrappedTextHeight(HDC dc, const std::wstring& text, int width, int maxHeight)
+	{
+		RECT rect{0, 0, width, maxHeight * 2};
+		DrawTextW(dc, text.c_str(), -1, &rect, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+		return std::clamp(static_cast<int>(rect.bottom - rect.top), 24, maxHeight);
+	}
+
+	int GetRosterSeparatorY(HDC dc, const RosterMetrics& metrics)
+	{
+		const size_t characterCount = GetRosterCharacterCount();
+		const size_t lastCharacterRow = GetRosterCharacterRows() - 1;
+		const size_t visibleRow = lastCharacterRow - static_cast<size_t>(g_app.rosterTopRow);
+		const int rowY = kRosterOriginY + static_cast<int>(visibleRow) * metrics.pitchY;
+		const int labelTop = rowY + metrics.portraitDiameter + 8;
+		int maxLabelH = 24;
+
+		const size_t rowStart = lastCharacterRow * kRosterCols;
+		const size_t rowEnd = std::min(characterCount, rowStart + kRosterCols);
+		for (size_t index = rowStart; index < rowEnd; ++index)
+		{
+			const RosterSlot& slot = g_app.rosterSlots[index];
+			if (slot.entry)
+				maxLabelH = std::max(maxLabelH, MeasureWrappedTextHeight(dc, slot.entry->name, kRosterLabelW, metrics.labelH));
+		}
+
+		return labelTop + maxLabelH + metrics.separatorTopGap;
+	}
+
+	int GetRosterVehicleSectionOffset(HDC dc, const RosterMetrics& metrics)
+	{
+		if (!IsRosterSeparatorVisible())
+			return 0;
+
+		const size_t vehicleRow = GetRosterCharacterRows();
+		const size_t visibleVehicleRow = vehicleRow - static_cast<size_t>(g_app.rosterTopRow);
+		const int vehicleBaseY = kRosterOriginY + static_cast<int>(visibleVehicleRow) * metrics.pitchY;
+		const int minVehicleY = GetRosterSeparatorY(dc, metrics) + kRosterSeparatorH + metrics.vehicleGap;
+		return std::max(0, minVehicleY - vehicleBaseY);
+	}
+
+	size_t GetRosterPaintRowCount()
+	{
+		const size_t totalRows = GetRosterVisualRowCount();
+		const size_t topRow = static_cast<size_t>(std::max(0, g_app.rosterTopRow));
+		if (topRow >= totalRows)
+			return 0;
+		return std::min(kRosterVisibleRows, totalRows - topRow);
+	}
+
+	int GetRosterContentBottom(HDC dc, const RosterMetrics& metrics)
+	{
+		const size_t paintRows = GetRosterPaintRowCount();
+		if (paintRows == 0)
+			return kRosterOriginY;
+
+		const size_t firstRow = static_cast<size_t>(std::max(0, g_app.rosterTopRow));
+		const size_t lastRow = firstRow + paintRows - 1;
+		const size_t characterRows = GetRosterCharacterRows();
+		const int vehicleSectionOffset = (lastRow >= characterRows && characterRows > firstRow)
+			? GetRosterVehicleSectionOffset(dc, metrics)
+			: 0;
+		return kRosterOriginY + static_cast<int>(paintRows - 1) * metrics.pitchY +
+			vehicleSectionOffset + metrics.portraitDiameter + metrics.labelH;
+	}
+
+	RosterMetrics GetRosterMetrics(HDC dc)
+	{
+		const size_t characterCount = GetRosterCharacterCount();
+		const bool onePage = GetRosterVisualRowCount() <= kRosterVisibleRows;
+		const bool hasSeparator = characterCount > 0 && characterCount < g_app.rosterSlots.size();
+		if (onePage && hasSeparator &&
+			GetRosterContentBottom(dc, kRosterNormalMetrics) > kRosterGridBottomLimit)
+		{
+			return kRosterCompactMetrics;
+		}
+		return kRosterNormalMetrics;
+	}
+
+	int GetRosterSeparatorY(HDC dc)
+	{
+		return GetRosterSeparatorY(dc, GetRosterMetrics(dc));
+	}
+
+	int GetRosterVehicleSectionOffset(HDC dc)
+	{
+		return GetRosterVehicleSectionOffset(dc, GetRosterMetrics(dc));
+	}
+
+	int GetRosterContentBottom(HDC dc)
+	{
+		return GetRosterContentBottom(dc, GetRosterMetrics(dc));
+	}
 
 	void MoveRosterSelection(int dx, int dy)
 	{
 		if (g_app.rosterSlots.empty())
 			return;
-		const size_t rows = (g_app.rosterSlots.size() + kRosterCols - 1) / kRosterCols;
-		size_t row = g_app.rosterIndex / kRosterCols;
-		size_t col = g_app.rosterIndex % kRosterCols;
+		const size_t rows = GetRosterVisualRowCount();
+		RosterVisualPosition pos = GetRosterVisualPosition(g_app.rosterIndex);
 
-		row = (row + static_cast<size_t>(dy) + rows) % rows;
-		const size_t lastCol = std::min(kRosterCols, g_app.rosterSlots.size() - row * kRosterCols) - 1;
-		col = (col + static_cast<size_t>(dx) + lastCol + 1) % (lastCol + 1);
+		if (dy != 0)
+		{
+			pos.row = (pos.row + static_cast<size_t>(dy) + rows) % rows;
+			pos.col = std::min(pos.col, GetRosterVisualRowItemCount(pos.row) - 1);
+		}
+		if (dx != 0)
+		{
+			const size_t count = GetRosterVisualRowItemCount(pos.row);
+			pos.col = (pos.col + static_cast<size_t>(dx) + count) % count;
+		}
 
-		g_app.rosterIndex = row * kRosterCols + col;
+		g_app.rosterIndex = GetRosterIndexAtVisualPosition(pos.row, pos.col);
 
 		// Keep the focused row inside the visible viewport.
-		const int focusedRow = static_cast<int>(row);
+		const int focusedRow = static_cast<int>(pos.row);
 		while (focusedRow < g_app.rosterTopRow)
 			--g_app.rosterTopRow;
 		while (focusedRow >= g_app.rosterTopRow + static_cast<int>(kRosterVisibleRows))
@@ -1989,13 +2297,8 @@ namespace
 	constexpr int kFranchiseTileH = 100;
 	constexpr int kTileGlowMargin = 6;
 
-	// Roster grid layout: 5 columns of larger portrait-circles with wrapped
-	// name labels, vertical scrolling. Origin leaves room for the world logo.
-	constexpr int kRosterOriginX = 60;
-	constexpr int kRosterOriginY = 120;
-	constexpr int kRosterPitchX = 156;
-	constexpr int kRosterPitchY = 160;
-	constexpr int kPortraitDiameter = 90;
+	// Roster grid layout lives with the roster navigation constants above,
+	// because navigation and painting both need the same visual row model.
 
 	// Right-edge vertical scroll bar (Scroll_Bar.png) shown on scrollable
 	// lists when their content overflows the visible rows. Kept inside the
@@ -2032,7 +2335,8 @@ namespace
 		else
 			visual = PadVisual::Idle;
 
-		Gdiplus::Bitmap* pad = RenderPad(static_cast<int>(index), cell, visual);
+		const unsigned int occupantColor = occupied ? g_app.padState[index].ringColor : 0;
+		Gdiplus::Bitmap* pad = RenderPad(static_cast<int>(index), cell, visual, occupantColor);
 		if (pad)
 			g.DrawImage(pad, static_cast<int>(cell.left) - kPadGlowMargin, static_cast<int>(cell.top) - kPadGlowMargin);
 
@@ -2145,6 +2449,7 @@ namespace
 	// sit in the gap before the lower pads; center/lower pads place the row
 	// just beneath the selected piece of glass.
 	constexpr int kActionButtonSize = 42;
+	constexpr int kUpperPadActionButtonSize = 38;
 	constexpr int kActionButtonGap = 4;
 	constexpr int kActionButtonFocusedGrow = 4;
 
@@ -2162,19 +2467,30 @@ namespace
 		return 0;
 	}
 
+	bool IsUpperSidePad(size_t slotIndex)
+	{
+		return slotIndex == 0 || slotIndex == 2;
+	}
+
+	int ActionButtonSizeForSlot(size_t slotIndex)
+	{
+		return IsUpperSidePad(slotIndex) ? kUpperPadActionButtonSize : kActionButtonSize;
+	}
+
 	RECT GetActionButtonRect(size_t slotIndex, size_t actionIndex)
 	{
 		const RECT& cell = kPadCells[slotIndex];
 		const int cellW = cell.right - cell.left;
-		const int rowW = static_cast<int>(kPadActionCount) * kActionButtonSize +
+		const int buttonSize = ActionButtonSizeForSlot(slotIndex);
+		const int rowW = static_cast<int>(kPadActionCount) * buttonSize +
 			static_cast<int>(kPadActionCount - 1) * kActionButtonGap;
 		const int rowX = cell.left + (cellW - rowW) / 2;
 		int rowY = cell.bottom + 4;
-		if (slotIndex == 0 || slotIndex == 2)
-			rowY = cell.bottom - kActionButtonSize + 4;
+		if (IsUpperSidePad(slotIndex))
+			rowY = cell.bottom - buttonSize - 8;
 
-		const int x = rowX + static_cast<int>(actionIndex) * (kActionButtonSize + kActionButtonGap);
-		return {x, rowY, x + kActionButtonSize, rowY + kActionButtonSize};
+		const int x = rowX + static_cast<int>(actionIndex) * (buttonSize + kActionButtonGap);
+		return {x, rowY, x + buttonSize, rowY + buttonSize};
 	}
 
 	int ActionButtonIndexAt(POINT point)
@@ -2192,7 +2508,7 @@ namespace
 			const int cy = (rect.top + rect.bottom) / 2;
 			const int dx = point.x - cx;
 			const int dy = point.y - cy;
-			const int radius = kActionButtonSize / 2;
+			const int radius = ActionButtonSizeForSlot(g_app.slotIndex) / 2;
 			if (dx * dx + dy * dy <= radius * radius)
 				return static_cast<int>(index);
 		}
@@ -2211,7 +2527,7 @@ namespace
 			const RECT rect = GetActionButtonRect(g_app.slotIndex, index);
 			const int x = rect.left - grow / 2;
 			const int y = rect.top - grow / 2;
-			const int size = kActionButtonSize + grow;
+			const int size = ActionButtonSizeForSlot(g_app.slotIndex) + grow;
 
 			if (focused || hovered || pressed)
 			{
@@ -2330,6 +2646,32 @@ namespace
 		DrawScrollBar(g, trackTop, trackBottom, totalRows, kFranchiseVisibleRows, g_app.franchiseTopRow);
 	}
 
+	void DrawRoundedSeparator(Gdiplus::Graphics& g, int x, int y, int width, int height)
+	{
+		Gdiplus::GraphicsPath path;
+		AddRoundedRectPath(path,
+			Gdiplus::RectF(static_cast<float>(x), static_cast<float>(y),
+				static_cast<float>(width), static_cast<float>(height)),
+			3.0f);
+		Gdiplus::LinearGradientBrush brush(
+			Gdiplus::RectF(static_cast<float>(x), static_cast<float>(y),
+				static_cast<float>(width), static_cast<float>(height)),
+			Gdiplus::Color(225, 255, 255, 255), Gdiplus::Color(135, 255, 255, 255),
+			Gdiplus::LinearGradientModeVertical);
+		g.FillPath(&brush, &path);
+	}
+
+	void DrawRosterCategorySeparator(Gdiplus::Graphics& g, HDC dc, const RosterMetrics& metrics)
+	{
+		if (!IsRosterSeparatorVisible())
+			return;
+
+		const int gridW = static_cast<int>(kRosterCols) * kRosterPitchX;
+		const int x = kRosterOriginX + (gridW - kRosterSeparatorW) / 2;
+		const int y = GetRosterSeparatorY(dc, metrics);
+		DrawRoundedSeparator(g, x, y, kRosterSeparatorW, kRosterSeparatorH);
+	}
+
 	void DrawRosterGrid(Gdiplus::Graphics& g, HDC dc)
 	{
 		if (g_app.rosterSlots.empty())
@@ -2338,18 +2680,25 @@ namespace
 			return;
 		}
 
-		const size_t visibleRows = kRosterVisibleRows;
-		const size_t totalRows = (g_app.rosterSlots.size() + kRosterCols - 1) / kRosterCols;
+		const size_t visibleRows = GetRosterPaintRowCount();
+		const size_t totalRows = GetRosterVisualRowCount();
+		const size_t characterRows = GetRosterCharacterRows();
+		const RosterMetrics metrics = GetRosterMetrics(dc);
+		const int vehicleSectionOffset = GetRosterVehicleSectionOffset(dc, metrics);
+		DrawRosterCategorySeparator(g, dc, metrics);
 		for (size_t row = 0; row < visibleRows; ++row)
 		{
 			for (size_t col = 0; col < kRosterCols; ++col)
 			{
-				const size_t slotIndex = (static_cast<size_t>(g_app.rosterTopRow) + row) * kRosterCols + col;
-				if (slotIndex >= g_app.rosterSlots.size())
+				const size_t visualRow = static_cast<size_t>(g_app.rosterTopRow) + row;
+				if (visualRow >= totalRows || col >= GetRosterVisualRowItemCount(visualRow))
 					break;
+				const size_t slotIndex = GetRosterIndexAtVisualPosition(visualRow, col);
 				const RosterSlot& slot = g_app.rosterSlots[slotIndex];
 				const int x = kRosterOriginX + static_cast<int>(col) * kRosterPitchX;
-				const int y = kRosterOriginY + static_cast<int>(row) * kRosterPitchY;
+				int y = kRosterOriginY + static_cast<int>(row) * metrics.pitchY;
+				if (visualRow >= characterRows && characterRows > static_cast<size_t>(g_app.rosterTopRow))
+					y += vehicleSectionOffset;
 				const bool focused = slotIndex == g_app.rosterIndex;
 
 				Gdiplus::Bitmap* visual = nullptr;
@@ -2360,7 +2709,7 @@ namespace
 				{
 					label = L"+";
 					color = slot.group && !slot.group->builds.empty() ? slot.group->builds[0].ringColor : kPadBorderIdle;
-					visual = RenderPlusTile(color, focused, kPortraitDiameter);
+					visual = RenderPlusTile(color, focused, metrics.portraitDiameter);
 				}
 				else if (slot.entry)
 				{
@@ -2368,23 +2717,23 @@ namespace
 					color = slot.entry->ringColor;
 					resId = slot.entry->portraitResourceId;
 					visual = resId != 0
-						? RenderPortrait(resId, color, focused, kPortraitDiameter)
-						: RenderPlaceholder(label.empty() ? L'?' : label[0], color, focused, kPortraitDiameter);
+						? RenderPortrait(resId, color, focused, metrics.portraitDiameter)
+						: RenderPlaceholder(label.empty() ? L'?' : label[0], color, focused, metrics.portraitDiameter);
 				}
 
-				const int circleX = x + (kRosterPitchX - kPortraitDiameter) / 2;
+				const int circleX = x + (kRosterPitchX - metrics.portraitDiameter) / 2;
 				const int circleY = y;
 				if (visual)
 					g.DrawImage(visual, circleX - kPortraitMargin, circleY - kPortraitMargin);
 
-				DrawTextWrappedCentered(dc, label, x, y + kPortraitDiameter + 8, kRosterPitchX, 58,
+				const int labelX = x + (kRosterPitchX - kRosterLabelW) / 2;
+				DrawTextWrappedCenteredFit(dc, label, labelX, y + metrics.portraitDiameter + 8, kRosterLabelW, metrics.labelH,
 					focused ? RGB(255, 236, 190) : RGB(214, 220, 230));
 			}
 		}
 
 		const int trackTop = kRosterOriginY - 14;
-		const int trackBottom = kRosterOriginY
-			+ static_cast<int>(kRosterVisibleRows - 1) * kRosterPitchY + kPortraitDiameter + 58;
+		const int trackBottom = GetRosterContentBottom(dc, metrics);
 		DrawScrollBar(g, trackTop, trackBottom, totalRows, kRosterVisibleRows, g_app.rosterTopRow);
 	}
 
@@ -2500,7 +2849,7 @@ case Screen::RosterList:
 			// plus a margin on each side. Drawn before the grid so the
 			// portraits sit on top of it.
 			const int gridRight = kRosterOriginX + static_cast<int>(kRosterCols) * kRosterPitchX;
-			const int gridBottom = kRosterOriginY + static_cast<int>(kRosterVisibleRows - 1) * kRosterPitchY + kPortraitDiameter + 58;
+			const int gridBottom = GetRosterContentBottom(dc);
 			const int panelX = kRosterOriginX - 16;
 			const int panelY = kRosterOriginY - 14;
 			const Gdiplus::RectF panelRect(static_cast<float>(panelX), static_cast<float>(panelY),
@@ -2808,6 +3157,23 @@ case Screen::RosterList:
 			InvalidateRect(window, nullptr, FALSE);
 	}
 
+	void ApplyWindowCornerRadius(HWND window)
+	{
+		RECT rect{};
+		GetClientRect(window, &rect);
+		const int width = rect.right - rect.left;
+		const int height = rect.bottom - rect.top;
+		if (width <= 0 || height <= 0)
+			return;
+
+		HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1,
+			kWindowCornerRadius * 2, kWindowCornerRadius * 2);
+		if (!region)
+			return;
+		if (SetWindowRgn(window, region, TRUE) == 0)
+			DeleteObject(region);
+	}
+
 	LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 		switch (message)
@@ -2974,7 +3340,10 @@ case Screen::RosterList:
 				PollController(window);
 			return 0;
 		case WM_ACTIVATE:
+			UpdateInputOwnership(window);
+			return 0;
 		case WM_SIZE:
+			ApplyWindowCornerRadius(window);
 			UpdateInputOwnership(window);
 			return 0;
 		case WM_DESTROY:
@@ -3066,6 +3435,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	}
 
 	SetLayeredWindowAttributes(window, 0, kOverlayAlpha, LWA_ALPHA);
+	ApplyWindowCornerRadius(window);
 	AddTrayIcon(window);
 	RegisterToggleHotkeyIfNeeded(window);
 	SetTimer(window, kControllerTimer, 8, nullptr);
