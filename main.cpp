@@ -14,6 +14,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
@@ -1215,6 +1216,41 @@ namespace
 		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
 		const UINT configuredPort = GetPrivateProfileIntW(L"Listener", L"Port", 9191, iniPath.c_str());
 		return configuredPort >= 1 && configuredPort <= 65535 ? static_cast<uint16_t>(configuredPort) : 9191;
+	}
+
+	void EnsureDefaultIniExists()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		std::error_code ec;
+		if (std::filesystem::exists(iniPath, ec))
+			return;
+
+		std::ofstream file(iniPath, std::ios::binary);
+		if (!file)
+			return;
+
+		file <<
+			"[Listener]\n"
+			"Port=9191\n"
+			"\n"
+			"; Optional. The app writes this section itself when you change the\n"
+			"; shortcut from the in-app Settings screen, so you normally never need to\n"
+			"; edit it by hand. Shown here for reference / manual tweaking.\n"
+			"[Shortcut]\n"
+			"; Type = Controller | Keyboard\n"
+			"Type=Controller\n"
+			"; Controller: raw XInput button bitmask (Back = 32). Combine buttons for a\n"
+			"; chord by adding their values, e.g. LB (256) + RB (512) = 768.\n"
+			"; Must include at least one button that isn't A/B/Y/D-pad Up/D-pad Down,\n"
+			"; since those are already used to navigate the picker's own menus.\n"
+			"ControllerMask=32\n"
+			"; Keyboard: modifier bitmask (Alt=1, Ctrl=2, Shift=4, Win=8) and a virtual-key\n"
+			"; code. Must include at least one modifier, or the key would be stolen from\n"
+			"; every other program while this app is running. Easiest to leave both at 0\n"
+			"; and set the keyboard shortcut from the Settings screen instead of\n"
+			"; computing VK codes by hand.\n"
+			"KeyModifiers=0\n"
+			"KeyCode=0\n";
 	}
 
 	// ---------------------------------------------------------------------
@@ -3392,6 +3428,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
 	LoadUIFont();
 
+	EnsureDefaultIniExists();
 	g_app.port = ReadPort();
 	LoadShortcutFromIni();
 

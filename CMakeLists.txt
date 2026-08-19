@@ -39,3 +39,11 @@ target_compile_features(LegoToypad PRIVATE cxx_std_20)
 target_compile_definitions(LegoToypad PRIVATE UNICODE _UNICODE NOMINMAX)
 target_include_directories(LegoToypad PRIVATE "${GENERATED_DIR}")
 target_link_libraries(LegoToypad PRIVATE ws2_32 xinput9_1_0 shell32 gdiplus winmm)
+
+add_custom_command(TARGET LegoToypad POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "${CMAKE_SOURCE_DIR}/README.txt"
+          "$<TARGET_FILE_DIR:LegoToypad>/README.txt"
+  COMMENT "Copying runtime README"
+  VERBATIM
+)
