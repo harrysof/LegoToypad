@@ -137,7 +137,7 @@ namespace
 	};
 	constexpr size_t kPadActionCount = 3;
 
-	constexpr size_t kSettingsItemCount = 2; // 0: change shortcut, 1: clear all pad slots
+	constexpr size_t kSettingsItemCount = 3; // 0: change shortcut, 1: A/B confirm style, 2: clear all pad slots
 
 	enum class ShortcutType
 	{
@@ -187,6 +187,7 @@ namespace
 		WORD shortcutControllerMask = XINPUT_GAMEPAD_BACK;
 		UINT shortcutKeyModifiers = 0;
 		UINT shortcutKeyCode = 0;
+		bool swapConfirmBackButtons = false;
 		bool capturingShortcut = false;
 		// Stays false until every controller button has been seen released
 		// at least once after entering capture mode, so whatever button was
@@ -1064,36 +1065,72 @@ namespace
 	}
 
 	// ---------------------------------------------------------------------
-	// Basic GDI text helpers
+	// Basic GDI+ text helpers
 	// ---------------------------------------------------------------------
 
-	void DrawTextLine(HDC dc, const std::wstring& text, int x, int y, int width, COLORREF color, int height = 30)
+	Gdiplus::Color ToGdiPlusColor(COLORREF color, BYTE alpha = 255)
 	{
-		SetTextColor(dc, color);
-		RECT rect{x, y, x + width, y + height};
-		DrawTextW(dc, text.c_str(), -1, &rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+		return Gdiplus::Color(alpha, GetRValue(color), GetGValue(color), GetBValue(color));
 	}
 
-	void DrawTextLineCentered(HDC dc, const std::wstring& text, int x, int y, int width, COLORREF color, int height = 30)
+	Gdiplus::Font MakeUIFont(float px)
 	{
-		SetTextColor(dc, color);
-		RECT rect{x, y, x + width, y + height};
-		DrawTextW(dc, text.c_str(), -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+		const Gdiplus::FontFamily* family = g_uiFontFamily ? g_uiFontFamily : Gdiplus::FontFamily::GenericSansSerif();
+		return Gdiplus::Font(family, px, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
 	}
 
-	// Centered word-wrap variant: shows the FULL string, wrapping onto extra
-	// lines if it doesn't fit the width - never truncates with "…". Used for
-	// names that must stay readable (roster labels, pad occupant names).
-	void DrawTextWrappedCentered(HDC dc, const std::wstring& text, int x, int y, int width, int height, COLORREF color)
+	void DrawTextLine(Gdiplus::Graphics& g, const std::wstring& text, int x, int y, int width, COLORREF color, int height = 30)
 	{
-		SetTextColor(dc, color);
-		RECT rect{x, y, x + width, y + height};
-		DrawTextW(dc, text.c_str(), -1, &rect, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+		Gdiplus::Font font = MakeUIFont(22.0f);
+		Gdiplus::SolidBrush brush(ToGdiPlusColor(color));
+		Gdiplus::StringFormat format(Gdiplus::StringFormatFlagsNoWrap);
+		format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+		format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+		const Gdiplus::RectF rect(static_cast<float>(x), static_cast<float>(y),
+			static_cast<float>(width), static_cast<float>(height));
+		g.DrawString(text.c_str(), -1, &font, rect, &format, &brush);
 	}
 
-	int MeasureLongestTokenWidth(HDC dc, const std::wstring& text)
+	void DrawTextLineCentered(Gdiplus::Graphics& g, const std::wstring& text, int x, int y, int width, COLORREF color, int height = 30)
 	{
-		int widest = 0;
+		Gdiplus::Font font = MakeUIFont(22.0f);
+		Gdiplus::SolidBrush brush(ToGdiPlusColor(color));
+		Gdiplus::StringFormat format(Gdiplus::StringFormatFlagsNoWrap);
+		format.SetAlignment(Gdiplus::StringAlignmentCenter);
+		format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+		format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+		const Gdiplus::RectF rect(static_cast<float>(x), static_cast<float>(y),
+			static_cast<float>(width), static_cast<float>(height));
+		g.DrawString(text.c_str(), -1, &font, rect, &format, &brush);
+	}
+
+	// Centered word-wrap variant: shows the full string, wrapping onto extra
+	// lines if it doesn't fit the width. Used for readable figure/build names.
+	void DrawTextWrappedCentered(Gdiplus::Graphics& g, const std::wstring& text, int x, int y, int width, int height, COLORREF color)
+	{
+		Gdiplus::Font font = MakeUIFont(22.0f);
+		Gdiplus::SolidBrush brush(ToGdiPlusColor(color));
+		Gdiplus::StringFormat format;
+		format.SetAlignment(Gdiplus::StringAlignmentCenter);
+		format.SetTrimming(Gdiplus::StringTrimmingWord);
+		const Gdiplus::RectF rect(static_cast<float>(x), static_cast<float>(y),
+			static_cast<float>(width), static_cast<float>(height));
+		g.DrawString(text.c_str(), -1, &font, rect, &format, &brush);
+	}
+
+	float MeasureTextWidth(Gdiplus::Graphics& g, const std::wstring& text, float px)
+	{
+		Gdiplus::Font font = MakeUIFont(px);
+		Gdiplus::StringFormat format(Gdiplus::StringFormatFlagsNoWrap | Gdiplus::StringFormatFlagsMeasureTrailingSpaces);
+		Gdiplus::RectF bounds;
+		const Gdiplus::RectF layout(0.0f, 0.0f, 10000.0f, 10000.0f);
+		g.MeasureString(text.c_str(), -1, &font, layout, &format, &bounds);
+		return bounds.Width;
+	}
+
+	float MeasureLongestTokenWidth(Gdiplus::Graphics& g, const std::wstring& text, float px)
+	{
+		float widest = 0.0f;
 		size_t start = std::wstring::npos;
 		for (size_t i = 0; i <= text.size(); ++i)
 		{
@@ -1103,49 +1140,51 @@ namespace
 			if (boundary && start != std::wstring::npos)
 			{
 				const std::wstring token = text.substr(start, i - start);
-				SIZE size{};
-				if (GetTextExtentPoint32W(dc, token.c_str(), static_cast<int>(token.size()), &size))
-					widest = std::max(widest, static_cast<int>(size.cx));
+				widest = std::max(widest, MeasureTextWidth(g, token, px));
 				start = std::wstring::npos;
 			}
 		}
 		return widest;
 	}
 
-	bool WrappedTextFits(HDC dc, const std::wstring& text, int width, int height)
+	float MeasureWrappedTextHeight(Gdiplus::Graphics& g, const std::wstring& text, int width, int maxHeight, float px)
 	{
-		RECT measure{0, 0, width, height * 2};
-		DrawTextW(dc, text.c_str(), -1, &measure, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
-		return measure.bottom - measure.top <= height && MeasureLongestTokenWidth(dc, text) <= width;
+		Gdiplus::Font font = MakeUIFont(px);
+		Gdiplus::StringFormat format;
+		format.SetAlignment(Gdiplus::StringAlignmentCenter);
+		format.SetTrimming(Gdiplus::StringTrimmingWord);
+		Gdiplus::RectF bounds;
+		const Gdiplus::RectF layout(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(maxHeight * 2));
+		g.MeasureString(text.c_str(), -1, &font, layout, &format, &bounds);
+		return bounds.Height;
 	}
 
-	void DrawTextWrappedCenteredFit(HDC dc, const std::wstring& text, int x, int y, int width, int height, COLORREF color)
+	bool WrappedTextFits(Gdiplus::Graphics& g, const std::wstring& text, int width, int height, float px)
 	{
-		SetTextColor(dc, color);
-		HGDIOBJ oldFont = GetCurrentObject(dc, OBJ_FONT);
+		return MeasureWrappedTextHeight(g, text, width, height, px) <= height + 0.5f &&
+			MeasureLongestTokenWidth(g, text, px) <= width + 0.5f;
+	}
 
-		HFONT chosenFont = nullptr;
+	void DrawTextWrappedCenteredFit(Gdiplus::Graphics& g, const std::wstring& text, int x, int y, int width, int height, COLORREF color)
+	{
+		float chosenPx = 17.0f;
 		for (int px = 22; px >= 17; --px)
 		{
-			HFONT font = CreateFontW(-px, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-				OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, g_uiFontFamilyName.c_str());
-			if (!font)
-				continue;
-			SelectObject(dc, font);
-			if (WrappedTextFits(dc, text, width, height) || px == 17)
+			if (WrappedTextFits(g, text, width, height, static_cast<float>(px)) || px == 17)
 			{
-				chosenFont = font;
+				chosenPx = static_cast<float>(px);
 				break;
 			}
-			SelectObject(dc, oldFont);
-			DeleteObject(font);
 		}
 
-		RECT rect{x, y, x + width, y + height};
-		DrawTextW(dc, text.c_str(), -1, &rect, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
-		SelectObject(dc, oldFont);
-		if (chosenFont)
-			DeleteObject(chosenFont);
+		Gdiplus::Font font = MakeUIFont(chosenPx);
+		Gdiplus::SolidBrush brush(ToGdiPlusColor(color));
+		Gdiplus::StringFormat format;
+		format.SetAlignment(Gdiplus::StringAlignmentCenter);
+		format.SetTrimming(Gdiplus::StringTrimmingWord);
+		const Gdiplus::RectF rect(static_cast<float>(x), static_cast<float>(y),
+			static_cast<float>(width), static_cast<float>(height));
+		g.DrawString(text.c_str(), -1, &font, rect, &format, &brush);
 	}
 
 	std::filesystem::path GetExecutableDirectory()
@@ -1250,7 +1289,12 @@ namespace
 			"; and set the keyboard shortcut from the Settings screen instead of\n"
 			"; computing VK codes by hand.\n"
 			"KeyModifiers=0\n"
-			"KeyCode=0\n";
+			"KeyCode=0\n"
+			"\n"
+			"[Input]\n"
+			"; SwapConfirmBackButtons = 0 uses A to enter and B to go back (RPCS3 style).\n"
+			"; SwapConfirmBackButtons = 1 uses B to enter and A to go back (Cemu style).\n"
+			"SwapConfirmBackButtons=0\n";
 	}
 
 	// ---------------------------------------------------------------------
@@ -1312,6 +1356,34 @@ namespace
 		return g_app.shortcutType == ShortcutType::Controller
 			? L"Controller: " + DescribeControllerMask(g_app.shortcutControllerMask)
 			: L"Keyboard: " + DescribeKeyboardKey(g_app.shortcutKeyModifiers, g_app.shortcutKeyCode);
+	}
+
+	std::wstring DescribeConfirmButtonMode()
+	{
+		return g_app.swapConfirmBackButtons
+			? L"B (Cemu)"
+			: L"A (RPCS3)";
+	}
+
+	void SaveInputSettingsToIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		WritePrivateProfileStringW(L"Input", L"SwapConfirmBackButtons",
+			g_app.swapConfirmBackButtons ? L"1" : L"0", iniPath.c_str());
+	}
+
+	void LoadInputSettingsFromIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		g_app.swapConfirmBackButtons =
+			GetPrivateProfileIntW(L"Input", L"SwapConfirmBackButtons", 0, iniPath.c_str()) != 0;
+	}
+
+	void ToggleConfirmButtonMode()
+	{
+		g_app.swapConfirmBackButtons = !g_app.swapConfirmBackButtons;
+		SaveInputSettingsToIni();
+		g_app.status = L"Confirm button: " + DescribeConfirmButtonMode();
 	}
 
 	void SaveShortcutToIni()
@@ -1749,14 +1821,12 @@ namespace
 			vehicleRow < static_cast<size_t>(g_app.rosterTopRow) + kRosterVisibleRows;
 	}
 
-	int MeasureWrappedTextHeight(HDC dc, const std::wstring& text, int width, int maxHeight)
+	int MeasureWrappedTextHeight(Gdiplus::Graphics& g, const std::wstring& text, int width, int maxHeight)
 	{
-		RECT rect{0, 0, width, maxHeight * 2};
-		DrawTextW(dc, text.c_str(), -1, &rect, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
-		return std::clamp(static_cast<int>(rect.bottom - rect.top), 24, maxHeight);
+		return std::clamp(static_cast<int>(MeasureWrappedTextHeight(g, text, width, maxHeight, 22.0f)), 24, maxHeight);
 	}
 
-	int GetRosterSeparatorY(HDC dc, const RosterMetrics& metrics)
+	int GetRosterSeparatorY(Gdiplus::Graphics& g, const RosterMetrics& metrics)
 	{
 		const size_t characterCount = GetRosterCharacterCount();
 		const size_t lastCharacterRow = GetRosterCharacterRows() - 1;
@@ -1771,13 +1841,13 @@ namespace
 		{
 			const RosterSlot& slot = g_app.rosterSlots[index];
 			if (slot.entry)
-				maxLabelH = std::max(maxLabelH, MeasureWrappedTextHeight(dc, slot.entry->name, kRosterLabelW, metrics.labelH));
+				maxLabelH = std::max(maxLabelH, MeasureWrappedTextHeight(g, slot.entry->name, kRosterLabelW, metrics.labelH));
 		}
 
 		return labelTop + maxLabelH + metrics.separatorTopGap;
 	}
 
-	int GetRosterVehicleSectionOffset(HDC dc, const RosterMetrics& metrics)
+	int GetRosterVehicleSectionOffset(Gdiplus::Graphics& g, const RosterMetrics& metrics)
 	{
 		if (!IsRosterSeparatorVisible())
 			return 0;
@@ -1785,7 +1855,7 @@ namespace
 		const size_t vehicleRow = GetRosterCharacterRows();
 		const size_t visibleVehicleRow = vehicleRow - static_cast<size_t>(g_app.rosterTopRow);
 		const int vehicleBaseY = kRosterOriginY + static_cast<int>(visibleVehicleRow) * metrics.pitchY;
-		const int minVehicleY = GetRosterSeparatorY(dc, metrics) + kRosterSeparatorH + metrics.vehicleGap;
+		const int minVehicleY = GetRosterSeparatorY(g, metrics) + kRosterSeparatorH + metrics.vehicleGap;
 		return std::max(0, minVehicleY - vehicleBaseY);
 	}
 
@@ -1798,7 +1868,7 @@ namespace
 		return std::min(kRosterVisibleRows, totalRows - topRow);
 	}
 
-	int GetRosterContentBottom(HDC dc, const RosterMetrics& metrics)
+	int GetRosterContentBottom(Gdiplus::Graphics& g, const RosterMetrics& metrics)
 	{
 		const size_t paintRows = GetRosterPaintRowCount();
 		if (paintRows == 0)
@@ -1808,38 +1878,38 @@ namespace
 		const size_t lastRow = firstRow + paintRows - 1;
 		const size_t characterRows = GetRosterCharacterRows();
 		const int vehicleSectionOffset = (lastRow >= characterRows && characterRows > firstRow)
-			? GetRosterVehicleSectionOffset(dc, metrics)
+			? GetRosterVehicleSectionOffset(g, metrics)
 			: 0;
 		return kRosterOriginY + static_cast<int>(paintRows - 1) * metrics.pitchY +
 			vehicleSectionOffset + metrics.portraitDiameter + metrics.labelH;
 	}
 
-	RosterMetrics GetRosterMetrics(HDC dc)
+	RosterMetrics GetRosterMetrics(Gdiplus::Graphics& g)
 	{
 		const size_t characterCount = GetRosterCharacterCount();
 		const bool onePage = GetRosterVisualRowCount() <= kRosterVisibleRows;
 		const bool hasSeparator = characterCount > 0 && characterCount < g_app.rosterSlots.size();
 		if (onePage && hasSeparator &&
-			GetRosterContentBottom(dc, kRosterNormalMetrics) > kRosterGridBottomLimit)
+			GetRosterContentBottom(g, kRosterNormalMetrics) > kRosterGridBottomLimit)
 		{
 			return kRosterCompactMetrics;
 		}
 		return kRosterNormalMetrics;
 	}
 
-	int GetRosterSeparatorY(HDC dc)
+	int GetRosterSeparatorY(Gdiplus::Graphics& g)
 	{
-		return GetRosterSeparatorY(dc, GetRosterMetrics(dc));
+		return GetRosterSeparatorY(g, GetRosterMetrics(g));
 	}
 
-	int GetRosterVehicleSectionOffset(HDC dc)
+	int GetRosterVehicleSectionOffset(Gdiplus::Graphics& g)
 	{
-		return GetRosterVehicleSectionOffset(dc, GetRosterMetrics(dc));
+		return GetRosterVehicleSectionOffset(g, GetRosterMetrics(g));
 	}
 
-	int GetRosterContentBottom(HDC dc)
+	int GetRosterContentBottom(Gdiplus::Graphics& g)
 	{
-		return GetRosterContentBottom(dc, GetRosterMetrics(dc));
+		return GetRosterContentBottom(g, GetRosterMetrics(g));
 	}
 
 	void MoveRosterSelection(int dx, int dy)
@@ -2025,6 +2095,8 @@ namespace
 			if (g_app.settingsIndex == 0)
 				BeginShortcutCapture();
 			else if (g_app.settingsIndex == 1)
+				ToggleConfirmButtonMode();
+			else if (g_app.settingsIndex == 2)
 				ClearAllPads();
 			break;
 		}
@@ -2475,7 +2547,7 @@ namespace
 				if (highlight)
 					g.DrawImage(highlight, x + 8, y + kPillPadV + static_cast<int>(row) * kPillRowH);
 			}
-			DrawTextLineCentered(dc, options[row], x + 8, y + kPillPadV + static_cast<int>(row) * kPillRowH,
+			DrawTextLineCentered(g, options[row], x + 8, y + kPillPadV + static_cast<int>(row) * kPillRowH,
 				kPillWidth - 16, row == focusedIndex ? RGB(255, 255, 255) : RGB(196, 204, 216), kPillRowH);
 		}
 	}
@@ -2486,7 +2558,9 @@ namespace
 	// just beneath the selected piece of glass.
 	constexpr int kActionButtonSize = 42;
 	constexpr int kUpperPadActionButtonSize = 38;
+	constexpr int kUpperLeftPadActionButtonSize = 36;
 	constexpr int kActionButtonGap = 4;
+	constexpr int kUpperLeftPadActionButtonGap = 3;
 	constexpr int kActionButtonFocusedGrow = 4;
 
 	int ResourceIdForAction(PadActionKind action)
@@ -2510,7 +2584,14 @@ namespace
 
 	int ActionButtonSizeForSlot(size_t slotIndex)
 	{
+		if (slotIndex == 0)
+			return kUpperLeftPadActionButtonSize;
 		return IsUpperSidePad(slotIndex) ? kUpperPadActionButtonSize : kActionButtonSize;
+	}
+
+	int ActionButtonGapForSlot(size_t slotIndex)
+	{
+		return slotIndex == 0 ? kUpperLeftPadActionButtonGap : kActionButtonGap;
 	}
 
 	RECT GetActionButtonRect(size_t slotIndex, size_t actionIndex)
@@ -2518,14 +2599,15 @@ namespace
 		const RECT& cell = kPadCells[slotIndex];
 		const int cellW = cell.right - cell.left;
 		const int buttonSize = ActionButtonSizeForSlot(slotIndex);
+		const int gap = ActionButtonGapForSlot(slotIndex);
 		const int rowW = static_cast<int>(kPadActionCount) * buttonSize +
-			static_cast<int>(kPadActionCount - 1) * kActionButtonGap;
+			static_cast<int>(kPadActionCount - 1) * gap;
 		const int rowX = cell.left + (cellW - rowW) / 2;
 		int rowY = cell.bottom + 4;
 		if (IsUpperSidePad(slotIndex))
 			rowY = cell.bottom - buttonSize - 8;
 
-		const int x = rowX + static_cast<int>(actionIndex) * (buttonSize + kActionButtonGap);
+		const int x = rowX + static_cast<int>(actionIndex) * (buttonSize + gap);
 		return {x, rowY, x + buttonSize, rowY + buttonSize};
 	}
 
@@ -2621,7 +2703,7 @@ namespace
 				: RenderPlaceholder(build.name.empty() ? L'?' : build.name[0], build.ringColor, focused, diam);
 			if (visual)
 				g.DrawImage(visual, x - kPortraitMargin, circleY - kPortraitMargin);
-			DrawTextWrappedCentered(dc, EntryDisplayName(build), x - 16, circleY + diam + 8, step, labelH,
+			DrawTextWrappedCentered(g, EntryDisplayName(build), x - 16, circleY + diam + 8, step, labelH,
 				focused ? RGB(255, 236, 190) : RGB(214, 220, 230));
 		}
 
@@ -2704,7 +2786,7 @@ namespace
 
 		const int gridW = static_cast<int>(kRosterCols) * kRosterPitchX;
 		const int x = kRosterOriginX + (gridW - kRosterSeparatorW) / 2;
-		const int y = GetRosterSeparatorY(dc, metrics);
+		const int y = GetRosterSeparatorY(g, metrics);
 		DrawRoundedSeparator(g, x, y, kRosterSeparatorW, kRosterSeparatorH);
 	}
 
@@ -2712,15 +2794,15 @@ namespace
 	{
 		if (g_app.rosterSlots.empty())
 		{
-			DrawTextLine(dc, L"No figures in this world.", 24, 200, 480, RGB(224, 230, 237));
+			DrawTextLine(g, L"No figures in this world.", 24, 200, 480, RGB(224, 230, 237));
 			return;
 		}
 
 		const size_t visibleRows = GetRosterPaintRowCount();
 		const size_t totalRows = GetRosterVisualRowCount();
 		const size_t characterRows = GetRosterCharacterRows();
-		const RosterMetrics metrics = GetRosterMetrics(dc);
-		const int vehicleSectionOffset = GetRosterVehicleSectionOffset(dc, metrics);
+		const RosterMetrics metrics = GetRosterMetrics(g);
+		const int vehicleSectionOffset = GetRosterVehicleSectionOffset(g, metrics);
 		DrawRosterCategorySeparator(g, dc, metrics);
 		for (size_t row = 0; row < visibleRows; ++row)
 		{
@@ -2763,13 +2845,13 @@ namespace
 					g.DrawImage(visual, circleX - kPortraitMargin, circleY - kPortraitMargin);
 
 				const int labelX = x + (kRosterPitchX - kRosterLabelW) / 2;
-				DrawTextWrappedCenteredFit(dc, label, labelX, y + metrics.portraitDiameter + 8, kRosterLabelW, metrics.labelH,
+				DrawTextWrappedCenteredFit(g, label, labelX, y + metrics.portraitDiameter + 8, kRosterLabelW, metrics.labelH,
 					focused ? RGB(255, 236, 190) : RGB(214, 220, 230));
 			}
 		}
 
 		const int trackTop = kRosterOriginY - 14;
-		const int trackBottom = GetRosterContentBottom(dc, metrics);
+		const int trackBottom = GetRosterContentBottom(g, metrics);
 		DrawScrollBar(g, trackTop, trackBottom, totalRows, kRosterVisibleRows, g_app.rosterTopRow);
 	}
 
@@ -2820,6 +2902,7 @@ namespace
 
 		Gdiplus::Graphics g(dc);
 		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+		g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
 
 		Gdiplus::Bitmap* background = RenderBackground(width, height);
 		if (background)
@@ -2885,7 +2968,7 @@ case Screen::RosterList:
 			// plus a margin on each side. Drawn before the grid so the
 			// portraits sit on top of it.
 			const int gridRight = kRosterOriginX + static_cast<int>(kRosterCols) * kRosterPitchX;
-			const int gridBottom = GetRosterContentBottom(dc);
+			const int gridBottom = GetRosterContentBottom(g);
 			const int panelX = kRosterOriginX - 16;
 			const int panelY = kRosterOriginY - 14;
 			const Gdiplus::RectF panelRect(static_cast<float>(panelX), static_cast<float>(panelY),
@@ -2925,6 +3008,7 @@ case Screen::RosterList:
 		{
 			const std::array<std::wstring, kSettingsItemCount> rows = {
 				L"Toggle shortcut: " + DescribeShortcut(),
+				L"Confirm button: " + DescribeConfirmButtonMode(),
 				L"Clear all pad",
 			};
 			for (size_t index = 0; index < rows.size(); ++index)
@@ -2938,17 +3022,17 @@ case Screen::RosterList:
 					FillRect(dc, &selection, brush);
 					DeleteObject(brush);
 				}
-				DrawTextLine(dc, rows[index], 30, y, width - 60, selected ? RGB(255, 255, 255) : RGB(228, 232, 238));
+				DrawTextLine(g, rows[index], 30, y, width - 60, selected ? RGB(255, 255, 255) : RGB(228, 232, 238));
 			}
 
 			if (g_app.capturingShortcut)
 			{
 				const int y = 108 + static_cast<int>(rows.size()) * 40 + 16;
 				if (!g_app.shortcutCaptureArmed)
-					DrawTextLine(dc, L"Release every controller button first...", 24, y, width - 48, RGB(255, 204, 51), 26);
+					DrawTextLine(g, L"Release every controller button first...", 24, y, width - 48, RGB(255, 204, 51), 26);
 				else
-					DrawTextLine(dc, L"Listening: press a controller combo, or a keyboard shortcut.", 24, y, width - 48, RGB(255, 204, 51), 26);
-				DrawTextLine(dc, L"Controller combo needs a non-nav button. Back+Start cancels. Keyboard needs a modifier. Esc cancels.", 24, y + 26, width - 48, RGB(255, 204, 51), 26);
+					DrawTextLine(g, L"Listening: press a controller combo, or a keyboard shortcut.", 24, y, width - 48, RGB(255, 204, 51), 26);
+				DrawTextLine(g, L"Controller combo needs a non-nav button. Back+Start cancels. Keyboard needs a modifier. Esc cancels.", 24, y + 26, width - 48, RGB(255, 204, 51), 26);
 			}
 			break;
 		}
@@ -3121,12 +3205,15 @@ case Screen::RosterList:
 		// ~60Hz repaint path exactly as cheap as the old bitmap draws.
 		bool changed = false;
 
-		if (combinedPressed & XINPUT_GAMEPAD_A)
+		const WORD confirmButton = g_app.swapConfirmBackButtons ? XINPUT_GAMEPAD_B : XINPUT_GAMEPAD_A;
+		const WORD backButton = g_app.swapConfirmBackButtons ? XINPUT_GAMEPAD_A : XINPUT_GAMEPAD_B;
+
+		if (combinedPressed & confirmButton)
 		{
 			Confirm();
 			changed = true;
 		}
-		if (combinedPressed & XINPUT_GAMEPAD_B)
+		if (combinedPressed & backButton)
 		{
 			Back(window);
 			changed = true;
@@ -3431,6 +3518,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	EnsureDefaultIniExists();
 	g_app.port = ReadPort();
 	LoadShortcutFromIni();
+	LoadInputSettingsFromIni();
 
 	size_t embeddedTags = 0;
 	for (size_t i = 0; i < kFranchiseCount; ++i)
@@ -3441,7 +3529,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	}
 	g_app.status = std::to_wstring(embeddedTags) +
 		L" tags embedded. Listener port: " + std::to_wstring(g_app.port) +
-		L" | Toggle: " + DescribeShortcut();
+		L" | Toggle: " + DescribeShortcut() +
+		L" | Confirm: " + DescribeConfirmButtonMode();
 
 	g_inputOwnershipEvent = CreateEventW(nullptr, TRUE, FALSE, kLegoToypadInputEvent);
 
