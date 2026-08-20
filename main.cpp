@@ -48,7 +48,7 @@ namespace
 	constexpr int kOverlayWidth = 900;
 	constexpr int kOverlayHeight = 610;
 	constexpr BYTE kOverlayAlpha = 235; // 0-255, uniform translucency for the whole panel.
-	constexpr int kWindowCornerRadius = 3;
+	constexpr int kWindowCornerRadius = 6;
 
 	// Tray icon / menu.
 	constexpr UINT kTrayCallbackMessage = WM_APP + 1;
@@ -3110,6 +3110,40 @@ case Screen::RosterList:
 					kByHarrysofResourceId, static_cast<int>(drawW), static_cast<int>(drawH), 0))
 				{
 					g.DrawImage(cached, width - drawW - kTopMargin, markY);
+				}
+			}
+		}
+
+		// Settings hint in the bottom-right corner: the Y button glyph next
+		// to the "settings" label, telling the user how to reach settings
+		// from the toypad view.
+		if (g_app.screen == Screen::PadViewer)
+		{
+			constexpr float kHintBottomInset = 18.0f;
+			constexpr float kHintGap = 8.0f;
+			constexpr float kHintYButtonH = 34.0f;
+			constexpr float kHintTextH = 40.0f;
+			const float hintCenterY = height - kHintBottomInset - kHintTextH / 2.0f;
+
+			Gdiplus::Bitmap* yButton = GetAssetBitmap(kYButtonResourceId);
+			Gdiplus::Bitmap* settingsText = GetAssetBitmap(kSettingsTextResourceId);
+			if (yButton && settingsText)
+			{
+				const float yButtonW = yButton->GetWidth() * (kHintYButtonH / yButton->GetHeight());
+				const float textW = settingsText->GetWidth() * (kHintTextH / settingsText->GetHeight());
+				const float totalW = yButtonW + kHintGap + textW;
+				const float originX = width - kTopMargin - totalW;
+				const float textX = originX + yButtonW + kHintGap;
+
+				if (Gdiplus::Bitmap* cachedY = RenderScaledAsset(
+					kYButtonResourceId, static_cast<int>(yButtonW), static_cast<int>(kHintYButtonH), 0))
+				{
+					g.DrawImage(cachedY, originX, hintCenterY - kHintYButtonH / 2.0f);
+				}
+				if (Gdiplus::Bitmap* cachedText = RenderScaledAsset(
+					kSettingsTextResourceId, static_cast<int>(textW), static_cast<int>(kHintTextH), 0))
+				{
+					g.DrawImage(cachedText, textX, hintCenterY - kHintTextH / 2.0f);
 				}
 			}
 		}

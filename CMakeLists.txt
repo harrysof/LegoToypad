@@ -61,8 +61,8 @@ target_link_libraries(LegoToypad PRIVATE ws2_32 shell32 gdiplus winmm SDL2::SDL2
 
 add_custom_command(TARGET LegoToypad POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-          "${CMAKE_SOURCE_DIR}/README.txt"
-          "$<TARGET_FILE_DIR:LegoToypad>/README.txt"
+          "${CMAKE_SOURCE_DIR}/README.md"
+          "$<TARGET_FILE_DIR:LegoToypad>/README.md"
   COMMENT "Copying runtime README"
   VERBATIM
 )

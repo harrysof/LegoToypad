@@ -421,15 +421,20 @@ def generate(root: Path, out_dir: Path) -> int:
     move_button     = pick_named({"move_button", "move"},     "move button")
     scroll_bar      = pick_named({"scroll_bar"},      "scroll bar")
     by_harrysof     = pick_named({"by_harrysof"},      "by harrysof watermark")
+    y_button        = pick_named({"y_button", "ybutton"}, "y button hint")
+    settings_text   = pick_named({"settings_text", "settings"}, "settings hint text")
     textfield_bar_sym  = symbols.allocate("ASSET_TEXTFIELD_BAR",  textfield_bar)  if textfield_bar  else None
     load_button_sym    = symbols.allocate("ASSET_LOAD_BUTTON",    load_button)    if load_button    else None
     clear_button_sym   = symbols.allocate("ASSET_CLEAR_BUTTON",   clear_button)   if clear_button   else None
     move_button_sym    = symbols.allocate("ASSET_MOVE_BUTTON",    move_button)    if move_button    else None
     scroll_bar_sym     = symbols.allocate("ASSET_SCROLL_BAR",     scroll_bar)     if scroll_bar     else None
     by_harrysof_sym    = symbols.allocate("ASSET_BY_HARRYSOF",    by_harrysof)    if by_harrysof    else None
+    y_button_sym       = symbols.allocate("ASSET_Y_BUTTON",       y_button)       if y_button       else None
+    settings_text_sym  = symbols.allocate("ASSET_SETTINGS_TEXT",  settings_text)  if settings_text  else None
     for name, asset in [("load_button", load_button), ("clear_button", clear_button),
                         ("move_button", move_button), ("scroll_bar", scroll_bar),
-                        ("by_harrysof", by_harrysof)]:
+                        ("by_harrysof", by_harrysof),
+                        ("y_button", y_button), ("settings_text", settings_text)]:
         if asset:
             ascii_ok([str(asset)], warnings)
         else:
@@ -620,6 +625,8 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kMoveButtonResourceId;")
     header.append("extern const int kScrollBarResourceId;")
     header.append("extern const int kByHarrysofResourceId;")
+    header.append("extern const int kYButtonResourceId;")
+    header.append("extern const int kSettingsTextResourceId;")
     header.append("")
     header.append("#endif  // RC_INVOKED")
     header.append("")
@@ -652,6 +659,8 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kMoveButtonResourceId = %s;" % (move_button_sym["name"] if move_button_sym else "0"))
     cpp.append("const int kScrollBarResourceId = %s;" % (scroll_bar_sym["name"] if scroll_bar_sym else "0"))
     cpp.append("const int kByHarrysofResourceId = %s;" % (by_harrysof_sym["name"] if by_harrysof_sym else "0"))
+    cpp.append("const int kYButtonResourceId = %s;" % (y_button_sym["name"] if y_button_sym else "0"))
+    cpp.append("const int kSettingsTextResourceId = %s;" % (settings_text_sym["name"] if settings_text_sym else "0"))
     cpp.append("")
     cpp.append("const BackgroundChoice kBackgroundChoices[] = {")
     for item in background_choice_syms:
@@ -694,6 +703,21 @@ def generate(root: Path, out_dir: Path) -> int:
 
         src = Image.open(io.BytesIO(png_bytes))
         src.load()
+
+        # Trim the transparent margins around the logo art before building the
+        # ICO frames. The raw logo PNG carries generous padding, and in the
+        # fixed-size tray slot that padding shrinks the visible art; cropping
+        # (with a small breathing margin) makes the icon render larger and
+        # crisper everywhere it gets downscaled.
+        if src.mode not in ("RGBA", "LA"):
+            src = src.convert("RGBA")
+        bbox = src.getbbox()
+        if bbox:
+            margin = max(2, int(min(src.width, src.height) * 0.02))
+            adjusted = (max(0, bbox[0] - margin), max(0, bbox[1] - margin),
+                        min(src.width, bbox[2] + margin), min(src.height, bbox[3] + margin))
+            src = src.crop(adjusted)
+
         buf = io.BytesIO()
         src.save(buf, format="ICO", sizes=[(s, s) for s in (16, 24, 32, 48, 256)])
         ico = buf.getvalue()
