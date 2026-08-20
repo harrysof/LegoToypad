@@ -1,0 +1,569 @@
+/* LegoToypad Remote - mobile-first phone UI.
+   The stage is a fixed 9:16 portrait stage (405x720) that is scaled to fit
+   the viewport, so the layout always keeps the 9:16 ratio on any phone. */
+
+:root {
+  --focus-edge: #e83838;
+  --glow-blue: #e0965a;
+  --text-soft: #d6dce6;
+  --text-hot: #ffe0be;
+  --panel: rgba(12, 16, 22, 0.62);
+  --panel-line: rgba(130, 150, 180, 0.35);
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  overflow: hidden;
+  font-family: "UI Compacta", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+  color: var(--text-soft);
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#stage {
+  position: relative;
+  width: 405px;
+  height: 720px;
+  transform-origin: center center;
+  overflow: hidden;
+  flex: none;
+}
+
+#bgimg {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 0;
+}
+
+/* top bar ----------------------------------------------------------- */
+#topbar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 58px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.55), transparent);
+}
+
+#wordmark {
+  height: 36px;
+  max-width: 240px;
+  object-fit: contain;
+}
+
+#connDot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #8a93a0;
+  box-shadow: 0 0 8px rgba(0, 0, 0, 0.6);
+}
+
+#connDot.ok {
+  background: #57d35c;
+  box-shadow: 0 0 10px rgba(87, 211, 92, 0.8);
+}
+
+#connDot.bad {
+  background: #e04848;
+  box-shadow: 0 0 10px rgba(224, 72, 72, 0.8);
+}
+
+/* screens --------------------------------------------------------------- */
+.screen {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 405px;
+  height: 720px;
+  z-index: 2;
+  display: none;
+}
+
+.screen.active {
+  display: block;
+}
+
+/* pads ------------------------------------------------------------------ */
+#pads {
+  position: absolute;
+  left: 0;
+  top: 58px;
+  width: 405px;
+  height: 444px;
+}
+
+.pad {
+  position: absolute;
+  cursor: pointer;
+  z-index: 3;
+  transition: filter 0.08s ease;
+}
+
+.pad .padart {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  pointer-events: none;
+}
+
+.pad .padcdot {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.pad .padportrait {
+  position: absolute;
+  border-radius: 50%;
+  object-fit: cover;
+  background: rgba(10, 12, 16, 0.55);
+  box-shadow: 0 0 18px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+}
+
+.pad .padname {
+  position: absolute;
+  left: 50%;
+  bottom: 8px;
+  transform: translateX(-50%);
+  width: 94%;
+  text-align: center;
+  font-size: 13px;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: rgba(235, 240, 245, 0.85);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+}
+
+.pad.selected {
+  z-index: 6;
+  animation: padsel 1.6s ease-in-out infinite;
+}
+
+@keyframes padsel {
+  0%, 100% { box-shadow: 0 0 10px rgba(232, 56, 56, 0.55); }
+  50%      { box-shadow: 0 0 22px rgba(232, 56, 56, 0.95); }
+}
+
+.pad.moveSource {
+  z-index: 6;
+  box-shadow: 0 0 24px var(--glow-blue), inset 0 0 12px rgba(224, 150, 90, 0.35);
+}
+
+/* selected-pad chip + action bar ----------------------------------------- */
+.chip {
+  position: absolute;
+  left: 50%;
+  top: 508px;
+  transform: translateX(-50%);
+  width: 360px;
+  height: 40px;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 20px;
+  background: var(--panel);
+  border: 1px solid var(--panel-line);
+  font-size: 16px;
+  letter-spacing: 0.4px;
+  color: var(--text-soft);
+  z-index: 7;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+#actionBar {
+  position: absolute;
+  left: 50%;
+  top: 556px;
+  transform: translateX(-50%);
+  width: 368px;
+  height: 82px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  z-index: 8;
+}
+
+.actbtn {
+  flex: 1;
+  height: 72px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  border-radius: 16px;
+  background: var(--panel);
+  border: 1px solid var(--panel-line);
+  cursor: pointer;
+  transition: transform 0.06s ease, box-shadow 0.06s ease, filter 0.06s ease;
+}
+
+.actbtn img {
+  width: 34px;
+  height: 34px;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.actbtn .alabel {
+  font-size: 15px;
+  letter-spacing: 1px;
+  color: var(--text-soft);
+  pointer-events: none;
+}
+
+.actbtn.tapped {
+  transform: scale(1.08);
+  box-shadow: 0 0 14px rgba(228, 238, 255, 0.5);
+}
+
+/* status + toast ---------------------------------------------------------- */
+#statusbar {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 8px;
+  height: 22px;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  z-index: 6;
+  color: rgba(235, 240, 245, 0.8);
+  pointer-events: none;
+}
+
+#toast {
+  position: absolute;
+  left: 50%;
+  top: 84px;
+  transform: translateX(-50%);
+  max-width: 360px;
+  padding: 10px 20px;
+  border-radius: 18px;
+  background: rgba(16, 22, 30, 0.94);
+  border: 1px solid var(--panel-line);
+  font-size: 16px;
+  text-align: center;
+  color: #fff;
+  z-index: 40;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+  pointer-events: none;
+}
+
+#toast.show {
+  opacity: 1;
+}
+
+/* back button ------------------------------------------------------------ */
+#backBtn {
+  position: absolute;
+  left: 16px;
+  top: 12px;
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(20, 26, 34, 0.9);
+  color: #d6dce6;
+  font-size: 26px;
+  line-height: 1;
+  z-index: 20;
+  cursor: pointer;
+  box-shadow: 0 0 10px rgba(0, 0, 0, 0.45);
+  display: none;
+  align-items: center;
+  justify-content: center;
+}
+
+#backBtn.visible {
+  display: flex;
+}
+
+/* franchise screen -------------------------------------------------------- */
+#franchiseTitle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 18px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  letter-spacing: 2px;
+  color: var(--text-hot);
+  z-index: 4;
+  pointer-events: none;
+}
+
+#franchiseGrid {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  top: 62px;
+  bottom: 14px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  z-index: 3;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  align-content: start;
+  padding: 2px 14px 20px 0;
+}
+
+.fworld {
+  position: relative;
+  aspect-ratio: 2 / 1;
+  cursor: pointer;
+  background-size: 100% 100%;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: box-shadow 0.08s ease, transform 0.08s ease;
+}
+
+.fworld img.logo {
+  width: 82%;
+  height: 74%;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.fworld.touched {
+  box-shadow: 0 0 0 3px var(--focus-edge), 0 0 18px rgba(232, 56, 56, 0.6);
+}
+
+/* roster screen ---------------------------------------------------------- */
+#worldLogo {
+  position: absolute;
+  left: 50%;
+  top: 14px;
+  transform: translateX(-50%);
+  height: 40px;
+  max-width: 230px;
+  object-fit: contain;
+  z-index: 4;
+  pointer-events: none;
+}
+
+#rosterGrid {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  top: 66px;
+  bottom: 12px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  z-index: 3;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px 6px;
+  align-content: start;
+  padding: 4px 12px 22px 0;
+}
+
+#rosterGrid .rowsep {
+  grid-column: 1 / -1;
+  height: 5px;
+  margin: 2px 0;
+  border-radius: 3px;
+  background: linear-gradient(to bottom, rgba(255, 255, 255, 0.85), rgba(255, 255, 255, 0.45));
+}
+
+.fig {
+  text-align: center;
+  cursor: pointer;
+  vertical-align: top;
+  padding: 4px 2px 2px;
+}
+
+.fig .ring {
+  position: relative;
+  width: 84px;
+  height: 84px;
+  margin: 0 auto;
+}
+
+.fig .ring img {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  background: rgba(12, 14, 18, 0.6);
+}
+
+.fig .ring.bordered img {
+  border: 3px solid var(--fig-color, #77aaff);
+}
+
+.fig .ring.bordered .letter {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  border: 3px solid var(--fig-color, #77aaff);
+  background: rgba(12, 14, 18, 0.6);
+  font-size: 40px;
+  font-weight: 700;
+  color: var(--fig-color, #77aaff);
+}
+
+.fig .ring.touched img {
+  border-color: var(--focus-edge);
+  box-shadow: 0 0 18px rgba(232, 56, 56, 0.75);
+}
+
+.fig .lbl {
+  margin-top: 6px;
+  padding: 0 4px;
+  font-size: 14px;
+  line-height: 1.12;
+  height: 34px;
+  overflow: hidden;
+  color: var(--text-soft);
+}
+
+.fig.touched .lbl {
+  color: var(--text-hot);
+}
+
+.fig.plus .ring {
+  border: 3px dashed var(--fig-color, #9fb2cc);
+  border-radius: 50%;
+}
+
+.fig.plus .ring span {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 46px;
+  font-weight: 700;
+  color: #cfdae8;
+}
+
+/* plus picker screen ------------------------------------------------------ */
+#plusWorldLogo {
+  position: absolute;
+  left: 50%;
+  top: 14px;
+  transform: translateX(-50%);
+  height: 40px;
+  max-width: 230px;
+  object-fit: contain;
+  z-index: 4;
+  pointer-events: none;
+}
+
+#plusPanel {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  top: 84px;
+  height: 340px;
+  background-size: 100% 100%;
+  background-position: center;
+  z-index: 2;
+  border-radius: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+#plusGrid {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  z-index: 3;
+}
+
+#plusGrid .fig {
+  flex: none;
+}
+
+#plusGrid .fig .ring {
+  width: 78px;
+  height: 78px;
+}
+
+/* scrollbar --------------------------------------------------------------- */
+.scrollbar {
+  position: absolute;
+  right: 8px;
+  top: 68px;
+  bottom: 22px;
+  width: 12px;
+  z-index: 6;
+  display: none;
+  pointer-events: none;
+}
+
+.scrollbar img {
+  position: absolute;
+  left: 0;
+  width: 12px;
+  border-radius: 6px;
+}
+
+.scrollbar.visible {
+  display: block;
+}

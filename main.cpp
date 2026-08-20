@@ -1,6 +1,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <Xinput.h>
 #include <shellapi.h>
 #include <mmsystem.h>
@@ -9,15 +10,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -26,6 +33,7 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 namespace
 {
@@ -45,10 +53,11 @@ namespace
 	// Overlay window sizing. All assets (portraits, logos, background,
 	// wordmark, tag .bins) are compiled into the exe as resources at build
 	// time by generate_assets.py - nothing is read from disk at runtime.
-	constexpr int kOverlayWidth = 900;
+constexpr int kOverlayWidth = 900;
 	constexpr int kOverlayHeight = 610;
 	constexpr BYTE kOverlayAlpha = 235; // 0-255, uniform translucency for the whole panel.
 	constexpr int kWindowCornerRadius = 6;
+	constexpr wchar_t kAppVersion[] = L"1.3.0";
 
 	// Tray icon / menu.
 	constexpr UINT kTrayCallbackMessage = WM_APP + 1;
@@ -56,6 +65,7 @@ namespace
 	constexpr UINT kMenuIdToggle = 1001;
 	constexpr UINT kMenuIdSettings = 1002;
 	constexpr UINT kMenuIdExit = 1003;
+	constexpr UINT kMenuIdWebAddress = 1004;
 
 	// Global toggle hotkey id (used only when the shortcut type is Keyboard).
 	constexpr UINT kToggleHotkeyId = 1;
@@ -138,7 +148,7 @@ namespace
 	};
 	constexpr size_t kPadActionCount = 3;
 
-	constexpr size_t kSettingsItemCount = 4; // shortcut, A/B confirm style, background, clear all pad slots
+	constexpr size_t kSettingsItemCount = 5; // shortcut, A/B confirm style, background, clear all pads, web remote
 
 	enum class ShortcutType
 	{
@@ -188,9 +198,16 @@ namespace
 		WORD shortcutControllerMask = XINPUT_GAMEPAD_BACK;
 		UINT shortcutKeyModifiers = 0;
 		UINT shortcutKeyCode = 0;
-		bool swapConfirmBackButtons = false;
+bool swapConfirmBackButtons = false;
 		size_t backgroundIndex = 0;
 		bool capturingShortcut = false;
+		// Web remote: the built-in HTTP server that lets the same tag library
+		// be driven from a phone browser on the local network. Runs on its own
+		// thread; requests that touch app state are marshaled back to the
+		// window's UI thread, so this is fully off by default.
+		bool webEnabled = true;
+		uint16_t webPort = 8765;
+		std::wstring webUrl;
 		// Stays false until every controller button has been seen released
 		// at least once after entering capture mode, so whatever button was
 		// still held down from opening the Settings screen can't be
@@ -217,13 +234,52 @@ namespace
 	AppState g_app;
 	HANDLE g_inputOwnershipEvent = nullptr;
 
+	// ---------------------------------------------------------------------
+	// Web remote (phone browser control)
+	// ---------------------------------------------------------------------
+	// A tiny HTTP server embedded in the exe. The sockets library is already
+	// linked for the toypad listener, and every image/tag is already compiled
+	// in as resources, so the server needs nothing on disk. Requests that read
+	// or mutate app state are posted to the window message loop on the UI
+	// thread (kWebMessage) so they can never race the controller polling.
+	constexpr UINT kWebMessage = WM_APP + 2;
+	constexpr UINT kWebDefaultPort = 8765;
+
+	struct WebJob
+	{
+		enum class Op { State, Catalog, Load, Move, Clear, ClearAll } op = Op::State;
+		int a = 0; // slot index for Load/Clear; source slot for Move
+		int b = 0; // bin resource id for Load; destination slot for Move
+		std::string result; // JSON response body, written on the UI thread
+		bool ok = false;
+		HANDLE done = nullptr;
+	};
+
+	std::atomic<bool> g_webRunning{false};
+	SOCKET g_webListenSocket = INVALID_SOCKET;
+	HWND g_webWindow = nullptr;
+	std::thread g_webThread;
+	HWND g_mainWindow = nullptr;
+
+	// The library catalog is static once the app is running, so it is built a
+	// single time on the UI thread (it reads live background settings) and
+	// then served from cache to every browser tab.
+	bool g_catalogBuilt = false;
+	std::string g_catalogCache;
+
 	// Forward-declared here; defined later in the file. Confirm()/Back() run
 	// before those definitions appear.
-	void UpdateInputOwnership(HWND window);
+void UpdateInputOwnership(HWND window);
 	void HideOverlay(HWND window);
 	void BeginShortcutCapture();
 	void CancelShortcutCapture();
 	int CurrentBackgroundResourceId();
+	bool StartWebServer(HWND window);
+	void StopWebServer();
+	void ToggleWebRemote();
+	std::wstring DescribeWebRemote();
+	std::wstring GetLanAddress();
+	void HandleWebJob(WebJob& job);
 
 	// ---------------------------------------------------------------------
 	// GDI+ plumbing
@@ -1299,8 +1355,18 @@ namespace
 			"; SwapConfirmBackButtons = 0 uses A to enter and B to go back (RPCS3 style).\n"
 			"; SwapConfirmBackButtons = 1 uses B to enter and A to go back (Cemu style).\n"
 			"SwapConfirmBackButtons=0\n"
-			"; BackgroundIndex selects the app background from bundled Assets/background*. images.\n"
-			"BackgroundIndex=0\n";
+"; BackgroundIndex selects the app background from bundled Assets/Wallpapers images.\n"
+			"BackgroundIndex=0\n"
+			"\n"
+			"[Web]\n"
+			"; Web remote serves the same Toypad UI to a phone browser on your local\n"
+			"; network so you never need the desktop overlay. Point the phone at the\n"
+			"; address shown in Settings (or the tray's copy menu). Set Enabled=0 to\n"
+			"; run fully offline - no sockets are opened then.\n"
+			"Enabled=1\n"
+			"; Port the phone connects to. Must be allowed inbound by Windows Firewall\n"
+			"; (it is NOT the emulator listener port, that one lives under [Listener]).\n"
+			"Port=8765\n";
 	}
 
 	// ---------------------------------------------------------------------
@@ -1425,7 +1491,7 @@ namespace
 	{
 		if (kBackgroundChoiceCount <= 1)
 		{
-			g_app.status = L"No extra backgrounds are bundled in Assets.";
+			g_app.status = L"No extra backgrounds are bundled in Assets/Wallpapers.";
 			return;
 		}
 		g_app.backgroundIndex = (g_app.backgroundIndex + 1) % kBackgroundChoiceCount;
@@ -1459,6 +1525,66 @@ namespace
 			GetPrivateProfileIntW(L"Shortcut", L"KeyModifiers", 0, iniPath.c_str()));
 		g_app.shortcutKeyCode = static_cast<UINT>(
 			GetPrivateProfileIntW(L"Shortcut", L"KeyCode", 0, iniPath.c_str()));
+	}
+
+	// ---------------------------------------------------------------------
+	// Web remote settings
+	// ---------------------------------------------------------------------
+
+	void SaveWebSettingsToIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		WritePrivateProfileStringW(L"Web", L"Enabled", g_app.webEnabled ? L"1" : L"0", iniPath.c_str());
+		WritePrivateProfileStringW(L"Web", L"Port",
+			std::to_wstring(g_app.webPort).c_str(), iniPath.c_str());
+	}
+
+	void LoadWebSettingsFromIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		g_app.webEnabled =
+			GetPrivateProfileIntW(L"Web", L"Enabled", 1, iniPath.c_str()) != 0;
+		const UINT configuredPort = GetPrivateProfileIntW(L"Web", L"Port", kWebDefaultPort, iniPath.c_str());
+		g_app.webPort = configuredPort >= 1 && configuredPort <= 65535
+			? static_cast<uint16_t>(configuredPort) : static_cast<uint16_t>(kWebDefaultPort);
+	}
+
+	std::wstring DescribeWebRemote()
+	{
+		if (!g_app.webEnabled)
+			return L"Off";
+		if (!g_app.webUrl.empty())
+			return g_app.webUrl;
+		return L"On (port " + std::to_wstring(g_app.webPort) + L")";
+	}
+
+	void ToggleWebRemote()
+	{
+		g_app.webEnabled = !g_app.webEnabled;
+		if (g_app.webEnabled)
+		{
+			if (StartWebServer(g_mainWindow))
+			{
+				g_app.webUrl = GetLanAddress();
+				if (g_app.webUrl.empty())
+					g_app.webUrl = L"http://<this-pc-lan-ip>:" + std::to_wstring(g_app.webPort) + L"/";
+				g_app.status = L"Web remote ON: " + g_app.webUrl;
+			}
+			else
+			{
+				g_app.webUrl.clear();
+				g_app.status = L"Web remote could not start (port " +
+					std::to_wstring(g_app.webPort) + L" busy or unavailable).";
+			}
+		}
+		else
+		{
+			StopWebServer();
+			g_app.webUrl.clear();
+			g_app.status = L"Web remote OFF.";
+		}
+		SaveWebSettingsToIni();
+		InvalidateRect(g_mainWindow, nullptr, FALSE);
 	}
 
 	// ---------------------------------------------------------------------
@@ -1578,12 +1704,13 @@ namespace
 		return SendToypadMessage(message.data(), message.size(), errorOut);
 	}
 
-	// Sources the tag bytes from the embedded resource and sends the same
-	// LOAD message as before, to whatever pad slot the user picked.
-	void LoadRosterEntryToPad(const RosterEntry& entry)
+	// Loads an entry onto a specific pad slot. With updateUi true the desktop
+	// overlay also returns to the pad viewer front screen (controller flow);
+	// the web remote passes false so it never yanks the desktop UI around.
+	void LoadEntryToSlot(const RosterEntry& entry, size_t slotIndex, bool updateUi)
 	{
 		std::wstring error;
-		if (!SendLoadResourceToSlot(entry.binResourceId, g_app.slotIndex, error))
+		if (!SendLoadResourceToSlot(entry.binResourceId, slotIndex, error))
 		{
 			g_app.status = error;
 			return;
@@ -1592,32 +1719,54 @@ namespace
 		// The listener always clears the destination before loading, so a
 		// direct Load action still intentionally overwrites that pad.
 		const std::wstring name = EntryDisplayName(entry);
-		auto& slot = g_app.padState[g_app.slotIndex];
+		auto& slot = g_app.padState[slotIndex];
 		slot.occupied = true;
 		slot.figureName = name;
 		slot.binResourceId = entry.binResourceId;
 		slot.portraitResourceId = entry.portraitResourceId;
 		slot.ringColor = entry.ringColor;
 
-		g_app.status = L"LOAD sent: " + name + L" -> " + kSlots[g_app.slotIndex].label;
-		g_app.screen = Screen::PadViewer;
+		g_app.status = L"LOAD sent: " + name + L" -> " + kSlots[slotIndex].label;
+		if (updateUi)
+		{
+			g_app.screen = Screen::PadViewer;
+			InvalidateRect(g_mainWindow, nullptr, FALSE);
+		}
 	}
 
-	void ClearSelectedPad()
+	// Sources the tag bytes from the embedded resource and sends the same
+	// LOAD message as before, to whatever pad slot the user picked.
+	void LoadRosterEntryToPad(const RosterEntry& entry)
+	{
+		LoadEntryToSlot(entry, g_app.slotIndex, true);
+	}
+
+	// Clears one pad slot in the emulator and the local bookkeeping. Does not
+	// touch the desktop screen when called from the web remote.
+	void ClearSlot(size_t slotIndex, bool updateUi)
 	{
 		std::wstring error;
-		if (!SendClearSlot(g_app.slotIndex, error))
+		if (!SendClearSlot(slotIndex, error))
 		{
 			g_app.status = error;
 			return;
 		}
 
-		g_app.padState[g_app.slotIndex] = PadSlot{};
-		g_app.status = std::wstring(L"CLEAR sent: ") + kSlots[g_app.slotIndex].label;
-		g_app.screen = Screen::PadViewer;
+		g_app.padState[slotIndex] = PadSlot{};
+		g_app.status = std::wstring(L"CLEAR sent: ") + kSlots[slotIndex].label;
+		if (updateUi)
+		{
+			g_app.screen = Screen::PadViewer;
+			InvalidateRect(g_mainWindow, nullptr, FALSE);
+		}
 	}
 
-	void ClearAllPads()
+	void ClearSelectedPad()
+	{
+		ClearSlot(g_app.slotIndex, true);
+	}
+
+	void ClearAllPads(bool updateUi)
 	{
 		std::wstring error;
 		size_t clearedCount = 0;
@@ -1626,7 +1775,8 @@ namespace
 			if (!SendClearSlot(index, error))
 			{
 				g_app.status = L"Clear all stopped after " + std::to_wstring(clearedCount) + L" pads: " + error;
-				g_app.screen = Screen::Settings;
+				if (updateUi)
+					g_app.screen = Screen::Settings;
 				return;
 			}
 
@@ -1635,65 +1785,83 @@ namespace
 		}
 
 		g_app.status = L"Clear all pad sent: all 7 slots cleared.";
-		g_app.screen = Screen::PadViewer;
+		if (updateUi)
+			g_app.screen = Screen::PadViewer;
 	}
 
 	// Moves whatever is tracked at moveSourceSlotIndex to destIndex. Called
 	// once the user has picked a destination pad in the PadViewer's
 	// move-destination mode.
-	void MoveToDestination(size_t destIndex)
+	void MoveSlotToSlot(size_t sourceIndex, size_t destIndex, bool updateUi)
 	{
-		if (!g_app.padState[g_app.moveSourceSlotIndex].occupied)
+		if (!g_app.padState[sourceIndex].occupied)
 		{
 			g_app.status = L"There is nothing tracked on that pad to move.";
-			g_app.selectingMoveDestination = false;
-			g_app.screen = Screen::PadViewer;
+			if (updateUi)
+			{
+				g_app.selectingMoveDestination = false;
+				g_app.screen = Screen::PadViewer;
+			}
 			return;
 		}
 
 		std::wstring error;
-		if (!SendMoveSlotToSlot(g_app.moveSourceSlotIndex, destIndex, error))
+		if (!SendMoveSlotToSlot(sourceIndex, destIndex, error))
 		{
 			g_app.status = error;
 			return;
 		}
 
-		const PadSlot sourceSlot = g_app.padState[g_app.moveSourceSlotIndex];
+		const PadSlot sourceSlot = g_app.padState[sourceIndex];
 		const PadSlot destSlot = g_app.padState[destIndex];
 		const std::wstring movedName = sourceSlot.figureName;
-		if (destIndex != g_app.moveSourceSlotIndex)
+		if (destIndex != sourceIndex)
 		{
 			if (destSlot.occupied)
 			{
-				if (!SendLoadResourceToSlot(destSlot.binResourceId, g_app.moveSourceSlotIndex, error))
+				if (!SendLoadResourceToSlot(destSlot.binResourceId, sourceIndex, error))
 				{
 					g_app.padState[destIndex] = sourceSlot;
-					g_app.padState[g_app.moveSourceSlotIndex] = PadSlot{};
+					g_app.padState[sourceIndex] = PadSlot{};
 					g_app.status = L"MOVE sent, but swap reload failed: " + error;
-					g_app.selectingMoveDestination = false;
-					g_app.screen = Screen::PadViewer;
+					if (updateUi)
+					{
+						g_app.selectingMoveDestination = false;
+						g_app.screen = Screen::PadViewer;
+					}
 					return;
 				}
 
 				g_app.padState[destIndex] = sourceSlot;
-				g_app.padState[g_app.moveSourceSlotIndex] = destSlot;
+				g_app.padState[sourceIndex] = destSlot;
 				g_app.status = L"SWAP sent: " + sourceSlot.figureName + L" <-> " + destSlot.figureName;
-				g_app.selectingMoveDestination = false;
-				g_app.screen = Screen::PadViewer;
+				if (updateUi)
+				{
+					g_app.selectingMoveDestination = false;
+					g_app.screen = Screen::PadViewer;
+				}
 				return;
 			}
 
 			g_app.padState[destIndex] = sourceSlot;
-			g_app.padState[g_app.moveSourceSlotIndex] = PadSlot{};
+			g_app.padState[sourceIndex] = PadSlot{};
 		}
 
-		if (destIndex == g_app.moveSourceSlotIndex)
+		if (destIndex == sourceIndex)
 			g_app.status = L"REFRESH sent: " + movedName + L" on " + kSlots[destIndex].label;
 		else
-			g_app.status = L"MOVE sent: " + movedName + L" (" + kSlots[g_app.moveSourceSlotIndex].label +
+			g_app.status = L"MOVE sent: " + movedName + L" (" + kSlots[sourceIndex].label +
 				L" -> " + kSlots[destIndex].label + L")";
-		g_app.selectingMoveDestination = false;
-		g_app.screen = Screen::PadViewer;
+		if (updateUi)
+		{
+			g_app.selectingMoveDestination = false;
+			g_app.screen = Screen::PadViewer;
+		}
+	}
+
+	void MoveToDestination(size_t destIndex)
+	{
+		MoveSlotToSlot(g_app.moveSourceSlotIndex, destIndex, true);
 	}
 
 	// ---------------------------------------------------------------------
@@ -2138,7 +2306,7 @@ namespace
 			if (g_app.plusGroup && g_app.plusBuildIndex < g_app.plusGroup->builds.size())
 				LoadRosterEntryToPad(g_app.plusGroup->builds[g_app.plusBuildIndex]);
 			break;
-		case Screen::Settings:
+case Screen::Settings:
 			if (g_app.settingsIndex == 0)
 				BeginShortcutCapture();
 			else if (g_app.settingsIndex == 1)
@@ -2146,7 +2314,9 @@ namespace
 			else if (g_app.settingsIndex == 2)
 				CycleBackgroundChoice();
 			else if (g_app.settingsIndex == 3)
-				ClearAllPads();
+				ClearAllPads(true);
+			else if (g_app.settingsIndex == 4)
+				ToggleWebRemote();
 			break;
 		}
 	}
@@ -2406,6 +2576,24 @@ namespace
 		Shell_NotifyIconW(NIM_DELETE, &icon);
 	}
 
+	void CopyTextToClipboard(const std::wstring& text)
+	{
+		if (!OpenClipboard(nullptr))
+			return;
+		EmptyClipboard();
+		const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+		if (HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, bytes))
+		{
+			if (void* dest = GlobalLock(handle))
+			{
+				std::memcpy(dest, text.c_str(), bytes);
+				GlobalUnlock(handle);
+				SetClipboardData(CF_UNICODETEXT, handle);
+			}
+		}
+		CloseClipboard();
+	}
+
 	void ShowTrayMenu(HWND window)
 	{
 		POINT cursor{};
@@ -2413,6 +2601,8 @@ namespace
 		HMENU menu = CreatePopupMenu();
 		AppendMenuW(menu, MF_STRING, kMenuIdToggle, g_app.overlayVisible ? L"Hide overlay" : L"Show overlay");
 		AppendMenuW(menu, MF_STRING, kMenuIdSettings, L"Shortcut settings");
+		AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+		AppendMenuW(menu, MF_STRING, kMenuIdWebAddress, g_app.webEnabled ? L"Copy web remote address" : L"Web remote address (disabled)");
 		AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 		AppendMenuW(menu, MF_STRING, kMenuIdExit, L"Exit");
 		// Required so the popup menu dismisses correctly when clicking away.
@@ -3055,11 +3245,12 @@ case Screen::RosterList:
 		}
 		case Screen::Settings:
 		{
-			const std::array<std::wstring, kSettingsItemCount> rows = {
+const std::array<std::wstring, kSettingsItemCount> rows = {
 				L"Toggle shortcut: " + DescribeShortcut(),
 				L"Confirm button: " + DescribeConfirmButtonMode(),
 				L"Background: " + DescribeBackgroundChoice(),
 				L"Clear all pad",
+				L"Web remote: " + DescribeWebRemote(),
 			};
 			for (size_t index = 0; index < rows.size(); ++index)
 			{
@@ -3418,8 +3609,727 @@ void PollController(HWND window)
 		if (!anyDirection)
 			lastNavigation = 0;
 
-		if (changed)
+if (changed)
 			InvalidateRect(window, nullptr, FALSE);
+	}
+
+	// ---------------------------------------------------------------------
+	// Web remote: embedded HTTP server
+	//
+	// Serves the phone UI (index.html/style.css/app.js from embedded
+	// resources), every embedded image/tag binary as /img/<resourceId>, a
+	// JSON catalog describing the whole tag library, and Load/Move/Clear
+	// endpoints that reuse the exact same send paths as the desktop UI.
+	// Commands mutate app state on the UI thread via kWebMessage so they can
+	// never race the controller poll timer. Socket helper functions (SendAll
+	// etc.) are defined earlier in this file.
+	// ---------------------------------------------------------------------
+
+	std::string Utf8FromWide(const std::wstring& wide)
+	{
+		if (wide.empty())
+			return {};
+		const int length = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+		if (length <= 1)
+			return {};
+		std::string out(static_cast<size_t>(length - 1), '\0');
+		WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, out.data(), length, nullptr, nullptr);
+		return out;
+	}
+
+	std::wstring WideFromUtf8(const std::string& utf8)
+	{
+		if (utf8.empty())
+			return {};
+		const int length = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+		if (length <= 1)
+			return {};
+		std::wstring out(static_cast<size_t>(length - 1), L'\0');
+		MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, out.data(), length);
+		return out;
+	}
+
+	std::string JsonEscape(const std::string& in)
+	{
+		std::string out;
+		out.reserve(in.size() + 8);
+		for (unsigned char c : in)
+		{
+			switch (c)
+			{
+			case '"': out += "\\\""; break;
+			case '\\': out += "\\\\"; break;
+			case '\n': out += "\\n"; break;
+			case '\r': out += "\\r"; break;
+			case '\t': out += "\\t"; break;
+			default:
+				if (c < 0x20)
+				{
+					char tmp[8];
+					::snprintf(tmp, sizeof tmp, "\\u%04x", c);
+					out += tmp;
+				}
+				else
+				{
+					out += static_cast<char>(c);
+				}
+			}
+		}
+		return out;
+	}
+
+	std::string WJson(const std::wstring& wide)
+	{
+		return "\"" + JsonEscape(Utf8FromWide(wide)) + "\"";
+	}
+
+	std::string OkJson(const std::wstring& message)
+	{
+		return "{\"ok\":true,\"status\":" + WJson(message) + "}";
+	}
+
+	std::string ErrJson(const std::wstring& message)
+	{
+		return "{\"ok\":false,\"status\":" + WJson(message) + "}";
+	}
+
+	// Sniffs a payload's type from its magic bytes so every embedded resource
+	// (png/jpg/ttf/woff2) can be served without a name->mime table.
+	const char* MimeForBytes(const uint8_t* data, size_t size)
+	{
+		if (size >= 8 && std::memcmp(data, "\x89PNG\r\n\x1a\n", 8) == 0)
+			return "image/png";
+		if (size >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF)
+			return "image/jpeg";
+		if (size >= 4 && std::memcmp(data, "wOF2", 4) == 0)
+			return "font/woff2";
+		if (size >= 4 && std::memcmp(data, "wOFF", 4) == 0)
+			return "font/woff";
+		if (size >= 4 && data[0] == 0x00 && data[1] == 0x01 && data[2] == 0x00 && data[3] == 0x00)
+			return "font/ttf";
+		if (size >= 1 && data[0] == '<')
+			return "text/html; charset=utf-8";
+		return "application/octet-stream";
+	}
+
+	const char* MimeForWebFile(const char* name)
+	{
+		const std::string path(name);
+		if (path.size() >= 5 && path.compare(path.size() - 5, 5, ".html") == 0)
+			return "text/html; charset=utf-8";
+		if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".css") == 0)
+			return "text/css; charset=utf-8";
+		if (path.size() >= 3 && path.compare(path.size() - 3, 3, ".js") == 0)
+			return "application/javascript; charset=utf-8";
+		if (path.size() >= 5 && path.compare(path.size() - 5, 5, ".json") == 0)
+			return "application/json; charset=utf-8";
+		if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".svg") == 0)
+			return "image/svg+xml";
+		return "application/octet-stream";
+	}
+
+	std::string IdUrl(int resourceId)
+	{
+		return "/img/" + std::to_string(resourceId);
+	}
+
+	std::wstring GetLanAddress()
+	{
+		ULONG size = 0;
+		::GetAdaptersAddresses(AF_INET,
+			GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+			nullptr, nullptr, &size);
+		if (size == 0)
+			return {};
+		std::vector<BYTE> buffer(size);
+		PIP_ADAPTER_ADDRESSES adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+		if (::GetAdaptersAddresses(AF_INET,
+				GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+				nullptr, adapters, &size) != NO_ERROR)
+			return {};
+
+		for (PIP_ADAPTER_ADDRESSES adapter = adapters; adapter; adapter = adapter->Next)
+		{
+			if (adapter->OperStatus != IfOperStatusUp)
+				continue;
+			if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+				continue;
+			for (PIP_ADAPTER_UNICAST_ADDRESS unicast = adapter->FirstUnicastAddress;
+				unicast; unicast = unicast->Next)
+			{
+				const sockaddr_in* address = reinterpret_cast<const sockaddr_in*>(unicast->Address.lpSockaddr);
+				if (address->sin_family != AF_INET)
+					continue;
+				const ULONG addr = ntohl(address->sin_addr.s_addr);
+				if ((addr >> 24) == 127) continue;      // loopback
+				if ((addr >> 16) == 0xA9FE) continue;   // 169.254.x.x APIPA / link-local
+				char text[INET_ADDRSTRLEN] = {};
+				if (InetNtopA(AF_INET, &address->sin_addr, text, sizeof text))
+				{
+					return L"http://" + WideFromUtf8(text) + L":" + std::to_wstring(g_app.webPort) + L"/";
+				}
+			}
+		}
+		return {};
+	}
+
+	void SendHttpResponse(SOCKET socket, int status, const char* statusText,
+		const std::string& body, const char* contentType, bool cacheable)
+	{
+		std::ostringstream head;
+		head << "HTTP/1.1 " << status << " " << statusText << "\r\n"
+			<< "Content-Type: " << contentType << "\r\n"
+			<< "Content-Length: " << body.size() << "\r\n"
+			<< "Connection: close\r\n"
+			<< "Cache-Control: " << (cacheable ? "public, max-age=3600" : "no-store") << "\r\n"
+			<< "Access-Control-Allow-Origin: *\r\n"
+			<< "\r\n";
+		const std::string header = head.str();
+		SendAll(socket, reinterpret_cast<const uint8_t*>(header.data()), header.size());
+		SendAll(socket, reinterpret_cast<const uint8_t*>(body.data()), body.size());
+	}
+
+	// Minimal HTTP request parser: request line + headers + optional body.
+	struct HttpRequest
+	{
+		std::string method;
+		std::string path;
+		std::string query;
+		std::string version;
+		std::map<std::string, std::string> headers;
+		std::string body;
+	};
+
+	bool ReadHttpRequest(SOCKET socket, HttpRequest& request)
+	{
+		std::string raw;
+		char buffer[4096];
+		size_t headerEnd = std::string::npos;
+		while (raw.size() < 64 * 1024)
+		{
+			const int received = recv(socket, buffer, sizeof buffer, 0);
+			if (received == SOCKET_ERROR || received == 0)
+				return false;
+			raw.append(buffer, static_cast<size_t>(received));
+			headerEnd = raw.find("\r\n\r\n");
+			if (headerEnd != std::string::npos)
+				break;
+		}
+		if (headerEnd == std::string::npos)
+			return false;
+
+		const std::string head = raw.substr(0, headerEnd);
+		const size_t lineEnd = head.find("\r\n");
+		const std::string requestLine = lineEnd == std::string::npos ? head : head.substr(0, lineEnd);
+
+		size_t firstSpace = requestLine.find(' ');
+		if (firstSpace == std::string::npos)
+			return false;
+		const size_t secondSpace = requestLine.find(' ', firstSpace + 1);
+		if (secondSpace == std::string::npos)
+			return false;
+		request.method = requestLine.substr(0, firstSpace);
+		std::string target = requestLine.substr(firstSpace + 1, secondSpace - firstSpace - 1);
+		request.version = requestLine.substr(secondSpace + 1);
+
+		const size_t queryPos = target.find('?');
+		if (queryPos != std::string::npos)
+		{
+			request.query = target.substr(queryPos + 1);
+			target.resize(queryPos);
+		}
+		request.path = target;
+
+		const size_t headerStart = lineEnd == std::string::npos ? 0 : lineEnd + 2;
+		size_t cursor = headerStart;
+		while (cursor < head.size())
+		{
+			const size_t end = head.find("\r\n", cursor);
+			if (end == std::string::npos)
+				break;
+			const std::string line = head.substr(cursor, end - cursor);
+			const size_t colon = line.find(':');
+			if (colon != std::string::npos)
+			{
+				std::string key = line.substr(0, colon);
+				std::string value = line.substr(colon + 1);
+				key.erase(std::remove_if(key.begin(), key.end(),
+					[](unsigned char c) { return c == ' ' || c == '\t'; }), key.end());
+				std::transform(key.begin(), key.end(), key.begin(),
+					[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+				while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+					value.erase(value.begin());
+				request.headers[key] = value;
+			}
+			cursor = end + 2;
+		}
+
+		const auto contentLength = request.headers.find("content-length");
+		if (contentLength != request.headers.end() && !contentLength->second.empty())
+		{
+			const size_t bodyLength = static_cast<size_t>(std::strtoull(contentLength->second.c_str(), nullptr, 10));
+			if (bodyLength > 16 * 1024 * 1024)
+				return false;
+			const size_t bodyStart = headerEnd + 4;
+			while (raw.size() < bodyStart + bodyLength)
+			{
+				const int received = recv(socket, buffer, sizeof buffer, 0);
+				if (received == SOCKET_ERROR || received == 0)
+					return false;
+				raw.append(buffer, static_cast<size_t>(received));
+			}
+			request.body = raw.substr(bodyStart, bodyLength);
+		}
+		return true;
+	}
+
+	// Pulls an integer out of {"key": N} JSON minima. Returns -1 when absent.
+	int JsonInt(const std::string& json, const char* key)
+	{
+		const std::string needle = std::string("\"") + key + "\"";
+		const size_t keyPos = json.find(needle);
+		if (keyPos == std::string::npos)
+			return -1;
+		const size_t colon = json.find(':', keyPos);
+		if (colon == std::string::npos)
+			return -1;
+		size_t cursor = colon + 1;
+		while (cursor < json.size() && (json[cursor] == ' ' || json[cursor] == '\t'))
+			++cursor;
+		if (cursor >= json.size() || (json[cursor] != '-' && (json[cursor] < '0' || json[cursor] > '9')))
+			return -1;
+		bool negative = json[cursor] == '-';
+		if (negative)
+			++cursor;
+		long long value = 0;
+		bool anyDigit = false;
+		while (cursor < json.size() && json[cursor] >= '0' && json[cursor] <= '9')
+		{
+			value = value * 10 + (json[cursor] - '0');
+			anyDigit = true;
+			++cursor;
+		}
+		return anyDigit ? static_cast<int>(negative ? -value : value) : -1;
+	}
+
+	std::string EntryJson(const RosterEntry& entry)
+	{
+		const unsigned int color = entry.ringColor;
+		char hex[16];
+		::snprintf(hex, sizeof hex, "#%02X%02X%02X", color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
+		std::string out = "{";
+		out += "\"name\":" + WJson(entry.name) + ",";
+		out += "\"build\":" + std::to_string(entry.buildNumber) + ",";
+		out += "\"color\":\"" + std::string(hex) + "\",";
+		out += "\"portrait\":\"" + IdUrl(entry.portraitResourceId) + "\",";
+		out += "\"bin\":" + std::to_string(entry.binResourceId);
+		out += "}";
+		return out;
+	}
+
+	// The full static library description: every franchise, character and
+	// vehicle with the asset URLs and bin ids the phone UI needs to render
+	// and to request loads. Only reads const data, safe on any thread.
+	std::string BuildCatalogJson()
+	{
+		std::string out = "{";
+		out += "\"appName\":" + WJson(L"LEGO Dimensions Toypad") + ",";
+		out += "\"version\":" + WJson(kAppVersion) + ",";
+		out += "\"listenerPort\":" + std::to_string(g_app.port) + ",";
+		out += "\"wordmark\":\"" + IdUrl(kWordmarkResourceId) + "\",";
+		out += "\"byMark\":\"" + IdUrl(kByHarrysofResourceId) + "\",";
+		out += "\"background\":\"" + IdUrl(CurrentBackgroundResourceId()) + "\",";
+		const int fontResource = kUIFontWebResourceId != 0 ? kUIFontWebResourceId : kUIFontResourceId;
+		out += "\"fontUrl\":\"" + IdUrl(fontResource) + "\",";
+		out += "\"yButton\":\"" + IdUrl(kYButtonResourceId) + "\",";
+		out += "\"settingsText\":\"" + IdUrl(kSettingsTextResourceId) + "\",";
+		out += "\"worldTile\":\"" + IdUrl(kWorldTileResourceId) + "\",";
+		out += "\"charactersTile\":\"" + IdUrl(kCharactersTileResourceId) + "\",";
+		out += "\"loadBtn\":\"" + IdUrl(kLoadButtonResourceId) + "\",";
+		out += "\"clearBtn\":\"" + IdUrl(kClearButtonResourceId) + "\",";
+		out += "\"moveBtn\":\"" + IdUrl(kMoveButtonResourceId) + "\",";
+		out += "\"scrollBar\":\"" + IdUrl(kScrollBarResourceId) + "\",";
+		out += "\"pads\":[";
+		for (size_t i = 0; i < 7; ++i)
+		{
+			if (i != 0)
+				out += ",";
+			out += "\"" + IdUrl(kPadBackgroundResourceIds[i]) + "\"";
+		}
+		out += "],\"franchises\":[";
+		for (size_t franchiseIndex = 0; franchiseIndex < kFranchiseCount; ++franchiseIndex)
+		{
+			if (franchiseIndex != 0)
+				out += ",";
+			const Franchise& franchise = kFranchises[franchiseIndex];
+			out += "{\"name\":" + WJson(franchise.name) + ",";
+			out += "\"logo\":\"" + IdUrl(franchise.logoResourceId) + "\",";
+			out += "\"characters\":[";
+			for (size_t i = 0; i < franchise.characters.size(); ++i)
+			{
+				if (i != 0)
+					out += ",";
+				out += EntryJson(franchise.characters[i]);
+			}
+			out += "],\"vehicles\":[";
+			for (size_t v = 0; v < franchise.vehicles.size(); ++v)
+			{
+				if (v != 0)
+					out += ",";
+				const VehicleGroup& group = franchise.vehicles[v];
+				out += "{\"base\":" + WJson(group.baseName) + ",\"builds\":[";
+				for (size_t b = 0; b < group.builds.size(); ++b)
+				{
+					if (b != 0)
+						out += ",";
+					out += EntryJson(group.builds[b]);
+				}
+				out += "]}";
+			}
+			out += "]}";
+		}
+		out += "]}";
+		return out;
+	}
+
+	// The live pad-state snapshot, read on the UI thread through a WebJob.
+	void BuildStateJson(WebJob& job)
+	{
+		std::string out = "{\"pads\":[";
+		for (size_t i = 0; i < 7; ++i)
+		{
+			if (i != 0)
+				out += ",";
+			const PadSlot& slot = g_app.padState[i];
+			const unsigned int color = slot.occupied ? slot.ringColor : 0;
+			char hex[16];
+			::snprintf(hex, sizeof hex, "#%02X%02X%02X", color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
+			out += "{\"index\":" + std::to_string(i) + ",";
+			out += "\"pad\":" + std::to_string(kSlots[i].pad) + ",";
+			out += "\"label\":" + WJson(kSlots[i].label) + ",";
+			out += std::string("\"occupied\":") + (slot.occupied ? "true" : "false") + ",";
+			out += std::string("\"name\":") + (slot.occupied ? WJson(slot.figureName) : std::string("\"\"")) + ",";
+			out += "\"color\":\"" + std::string(hex) + "\",";
+			out += "\"portrait\":\"" + IdUrl(slot.portraitResourceId) + "\"}";
+		}
+		out += "],\"status\":" + WJson(g_app.status) + "}";
+		job.result = out;
+		job.ok = true;
+	}
+
+	const RosterEntry* FindEntryByBinResource(int binResourceId)
+	{
+		for (size_t franchiseIndex = 0; franchiseIndex < kFranchiseCount; ++franchiseIndex)
+		{
+			for (const auto& character : kFranchises[franchiseIndex].characters)
+			{
+				if (character.binResourceId == binResourceId)
+					return &character;
+			}
+			for (const auto& vehicle : kFranchises[franchiseIndex].vehicles)
+			{
+				for (const auto& build : vehicle.builds)
+				{
+					if (build.binResourceId == binResourceId)
+						return &build;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	// Runs on the UI thread (dispatched via kWebMessage). Everything it
+	// touches belongs to the message-loop thread, so there is no locking.
+	void HandleWebJob(WebJob& job)
+	{
+		switch (job.op)
+		{
+		case WebJob::Op::State:
+			BuildStateJson(job);
+			break;
+		case WebJob::Op::Catalog:
+			if (!g_catalogBuilt)
+			{
+				g_catalogCache = BuildCatalogJson();
+				g_catalogBuilt = true;
+			}
+			job.result = g_catalogCache;
+			job.ok = true;
+			break;
+		case WebJob::Op::Load:
+			if (job.a < 0 || job.a >= static_cast<int>(kSlots.size()))
+			{
+				job.result = ErrJson(L"Invalid pad slot.");
+				break;
+			}
+			{
+				const RosterEntry* entry = FindEntryByBinResource(job.b);
+				if (!entry)
+				{
+					job.result = ErrJson(L"Unknown tag id.");
+					break;
+				}
+				LoadEntryToSlot(*entry, static_cast<size_t>(job.a), false);
+				job.ok = g_app.status.rfind(L"LOAD sent", 0) == 0;
+				job.result = job.ok ? OkJson(g_app.status) : ErrJson(g_app.status);
+			}
+			break;
+		case WebJob::Op::Move:
+			if (job.a < 0 || job.a >= static_cast<int>(kSlots.size()) ||
+				job.b < 0 || job.b >= static_cast<int>(kSlots.size()))
+			{
+				job.result = ErrJson(L"Invalid pad slot.");
+				break;
+			}
+			if (!g_app.padState[job.a].occupied)
+			{
+				job.result = ErrJson(L"There is nothing tracked on that pad to move.");
+				break;
+			}
+			MoveSlotToSlot(static_cast<size_t>(job.a), static_cast<size_t>(job.b), false);
+			job.ok = g_app.status.rfind(L"MOVE sent", 0) == 0 || g_app.status.rfind(L"SWAP sent", 0) == 0 ||
+				g_app.status.rfind(L"REFRESH sent", 0) == 0;
+			job.result = job.ok ? OkJson(g_app.status) : ErrJson(g_app.status);
+			break;
+		case WebJob::Op::Clear:
+			if (job.a < 0 || job.a >= static_cast<int>(kSlots.size()))
+			{
+				job.result = ErrJson(L"Invalid pad slot.");
+				break;
+			}
+			ClearSlot(static_cast<size_t>(job.a), false);
+			job.ok = g_app.status.rfind(L"CLEAR sent", 0) == 0;
+			job.result = job.ok ? OkJson(g_app.status) : ErrJson(g_app.status);
+			break;
+		case WebJob::Op::ClearAll:
+			ClearAllPads(false);
+			job.ok = g_app.status.rfind(L"Clear all pad sent", 0) == 0;
+			job.result = job.ok ? OkJson(g_app.status) : ErrJson(g_app.status);
+			break;
+		}
+		SetEvent(job.done);
+	}
+
+	// Sends an operation to the UI thread and waits (bounded) for its JSON
+	// result. Ownership of the job stays in this thread.
+	std::string DispatchWebJob(HWND window, WebJob::Op operation, int a, int b)
+	{
+		WebJob job;
+		job.op = operation;
+		job.a = a;
+		job.b = b;
+		job.done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		if (!job.done)
+			return ErrJson(L"Could not create a job event.");
+		const BOOL posted = PostMessageW(window, kWebMessage, reinterpret_cast<WPARAM>(&job), 0);
+		if (!posted)
+		{
+			CloseHandle(job.done);
+			return ErrJson(L"The desktop app is shutting down.");
+		}
+		const DWORD waited = WaitForSingleObject(job.done, 8000);
+		CloseHandle(job.done);
+		if (waited != WAIT_OBJECT_0 || job.result.empty())
+			return ErrJson(L"Timed out talking to the desktop app.");
+		return job.result;
+	}
+
+	void HandleHttpConnection(SOCKET socket, HWND window)
+	{
+		const DWORD receiveTimeout = 8000;
+		setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
+			reinterpret_cast<const char*>(&receiveTimeout), sizeof receiveTimeout);
+
+		HttpRequest request;
+		if (!ReadHttpRequest(socket, request))
+		{
+			SendHttpResponse(socket, 400, "Bad Request", "Bad Request", "text/plain; charset=utf-8", false);
+			closesocket(socket);
+			return;
+		}
+
+		// Serves one of the embedded UI files (index.html / style.css / app.js).
+		auto serveWebFile = [&](const std::string& filename) -> void
+		{
+			for (size_t i = 0; i < kWebFileCount; ++i)
+			{
+				if (filename != kWebFiles[i].name)
+					continue;
+				std::vector<uint8_t> data = LoadResourceBytes(kWebFiles[i].resourceId);
+				if (data.empty())
+				{
+					SendHttpResponse(socket, 404, "Not Found", "Not Found", "text/plain; charset=utf-8", false);
+					return;
+				}
+				const std::string body(reinterpret_cast<const char*>(data.data()), data.size());
+				SendHttpResponse(socket, 200, "OK", body, MimeForWebFile(kWebFiles[i].name), true);
+				return;
+			}
+			SendHttpResponse(socket, 404, "Not Found", "Not Found", "text/plain; charset=utf-8", false);
+		};
+
+		// Serves any embedded resource binary by its numeric id (png/jpg/font/tag).
+		auto serveResource = [&](int resourceId) -> void
+		{
+			std::vector<uint8_t> data = LoadResourceBytes(resourceId);
+			if (data.empty())
+			{
+				SendHttpResponse(socket, 404, "Not Found", "Not Found", "text/plain; charset=utf-8", false);
+				return;
+			}
+			const std::string body(reinterpret_cast<const char*>(data.data()), data.size());
+			SendHttpResponse(socket, 200, "OK", body, MimeForBytes(data.data(), data.size()), true);
+		};
+
+		if (request.method == "GET")
+		{
+			if (request.path == "/" || request.path == "/index.html")
+			{
+				serveWebFile("index.html");
+			}
+			else if (request.path == "/style.css")
+			{
+				serveWebFile("style.css");
+			}
+			else if (request.path == "/app.js")
+			{
+				serveWebFile("app.js");
+			}
+			else if (request.path == "/api/catalog")
+			{
+				const std::string body = DispatchWebJob(window, WebJob::Op::Catalog, 0, 0);
+				SendHttpResponse(socket, 200, "OK", body, "application/json; charset=utf-8", false);
+			}
+			else if (request.path == "/api/state")
+			{
+				const std::string body = DispatchWebJob(window, WebJob::Op::State, 0, 0);
+				SendHttpResponse(socket, 200, "OK", body, "application/json; charset=utf-8", false);
+			}
+			else if (request.path.rfind("/img/", 0) == 0 && request.path.size() > 5)
+			{
+				int resourceId = ::atoi(request.path.c_str() + 5);
+				if (resourceId == 0)
+					SendHttpResponse(socket, 400, "Bad Request", "Bad Request", "text/plain; charset=utf-8", false);
+				else
+					serveResource(resourceId);
+			}
+			else if (request.path == "/favicon.ico")
+			{
+				serveResource(kAppIconResourceId);
+			}
+			else
+			{
+				SendHttpResponse(socket, 404, "Not Found", "Not Found", "text/plain; charset=utf-8", false);
+			}
+		}
+		else if (request.method == "POST")
+		{
+			std::string body;
+			if (request.path == "/api/load")
+			{
+				const int slot = JsonInt(request.body, "slot");
+				const int bin = JsonInt(request.body, "bin");
+				body = DispatchWebJob(window, WebJob::Op::Load, slot, bin);
+			}
+			else if (request.path == "/api/move")
+			{
+				const int source = JsonInt(request.body, "src");
+				const int dest = JsonInt(request.body, "dest");
+				body = DispatchWebJob(window, WebJob::Op::Move, source, dest);
+			}
+			else if (request.path == "/api/clear")
+			{
+				const int slot = JsonInt(request.body, "slot");
+				body = DispatchWebJob(window, WebJob::Op::Clear, slot, 0);
+			}
+			else if (request.path == "/api/clearall")
+			{
+				body = DispatchWebJob(window, WebJob::Op::ClearAll, 0, 0);
+			}
+			else
+			{
+				SendHttpResponse(socket, 404, "Not Found", "Not Found", "text/plain; charset=utf-8", false);
+				closesocket(socket);
+				return;
+			}
+			SendHttpResponse(socket, 200, "OK", body, "application/json; charset=utf-8", false);
+		}
+		else
+		{
+			SendHttpResponse(socket, 405, "Method Not Allowed", "Method Not Allowed", "text/plain; charset=utf-8", false);
+		}
+
+		closesocket(socket);
+	}
+
+	void WebServerLoop(SOCKET listenSocket, HWND window)
+	{
+		while (g_webRunning.load())
+		{
+			fd_set readSet;
+			FD_ZERO(&readSet);
+			FD_SET(listenSocket, &readSet);
+			timeval timeout{0, 200000}; // 200ms wake-up so shutdown is snappy
+			const int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+			if (ready == SOCKET_ERROR || ready == 0)
+				continue;
+
+			SOCKET client = accept(listenSocket, nullptr, nullptr);
+			if (client == INVALID_SOCKET)
+				continue;
+
+			// One throwaway thread per connection. The LAN scale is tiny and
+			// the phone is the only client, so no pool is warranted; detached
+			// workers that are mid-request simply die with the process.
+			std::thread worker(HandleHttpConnection, client, window);
+			worker.detach();
+		}
+		closesocket(listenSocket);
+	}
+
+	bool StartWebServer(HWND window)
+	{
+		if (g_webRunning.load())
+			return true;
+
+		SOCKET listenSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (listenSocket == INVALID_SOCKET)
+			return false;
+
+		BOOL reuseAddress = TRUE;
+		setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR,
+			reinterpret_cast<const char*>(&reuseAddress), sizeof reuseAddress);
+
+		sockaddr_in address{};
+		address.sin_family = AF_INET;
+		address.sin_port = htons(g_app.webPort);
+		address.sin_addr.s_addr = htonl(INADDR_ANY); // listen on all LAN interfaces
+		if (bind(listenSocket, reinterpret_cast<const sockaddr*>(&address), sizeof address) == SOCKET_ERROR ||
+			listen(listenSocket, 8) == SOCKET_ERROR)
+		{
+			closesocket(listenSocket);
+			return false;
+		}
+
+		g_webWindow = window;
+		g_webListenSocket = listenSocket;
+		g_webRunning.store(true);
+		g_webThread = std::thread(WebServerLoop, listenSocket, window);
+		return true;
+	}
+
+	void StopWebServer()
+	{
+		if (!g_webRunning.load())
+			return;
+		g_webRunning.store(false);
+		if (g_webListenSocket != INVALID_SOCKET)
+		{
+			closesocket(g_webListenSocket);
+			g_webListenSocket = INVALID_SOCKET;
+		}
+		if (g_webThread.joinable())
+			g_webThread.join();
 	}
 
 	void ApplyWindowCornerRadius(HWND window)
@@ -3583,6 +4493,10 @@ void PollController(HWND window)
 			else if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU)
 				ShowTrayMenu(window);
 			return 0;
+		case kWebMessage:
+			if (wParam)
+				HandleWebJob(*reinterpret_cast<WebJob*>(wParam));
+			return 0;
 		case WM_COMMAND:
 			switch (LOWORD(wParam))
 			{
@@ -3593,6 +4507,27 @@ void PollController(HWND window)
 				if (!g_app.overlayVisible)
 					ShowOverlay(window);
 				g_app.screen = Screen::Settings;
+				InvalidateRect(window, nullptr, FALSE);
+				break;
+			case kMenuIdWebAddress:
+				if (g_app.webEnabled)
+				{
+					if (g_app.webUrl.empty()) // server running in case URL lookup lost the network
+						g_app.webUrl = GetLanAddress();
+					if (!g_app.webUrl.empty())
+					{
+						CopyTextToClipboard(g_app.webUrl);
+						g_app.status = L"Web remote address copied: " + g_app.webUrl;
+					}
+					else
+					{
+						g_app.status = L"Web remote is on, but no LAN address was found.";
+					}
+				}
+				else
+				{
+					g_app.status = L"Web remote is disabled. Enable it from Settings.";
+				}
 				InvalidateRect(window, nullptr, FALSE);
 				break;
 			case kMenuIdExit:
@@ -3615,6 +4550,7 @@ void PollController(HWND window)
 			KillTimer(window, kControllerTimer);
 			UnregisterHotKey(window, kToggleHotkeyId);
 			RemoveTrayIcon(window);
+			StopWebServer();
 			if (g_inputOwnershipEvent)
 			{
 				ResetEvent(g_inputOwnershipEvent);
@@ -3691,10 +4627,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
 	LoadUIFont();
 
-	EnsureDefaultIniExists();
+EnsureDefaultIniExists();
 	g_app.port = ReadPort();
 	LoadShortcutFromIni();
 	LoadInputSettingsFromIni();
+	LoadWebSettingsFromIni();
 
 	size_t embeddedTags = 0;
 	for (size_t i = 0; i < kFranchiseCount; ++i)
@@ -3703,11 +4640,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 		for (const auto& vehicle : kFranchises[i].vehicles)
 			embeddedTags += vehicle.builds.size();
 	}
-	g_app.status = std::to_wstring(embeddedTags) +
+g_app.status = std::to_wstring(embeddedTags) +
 		L" tags embedded. Listener port: " + std::to_wstring(g_app.port) +
 		L" | Toggle: " + DescribeShortcut() +
 		L" | Confirm: " + DescribeConfirmButtonMode() +
-		L" | Background: " + DescribeBackgroundChoice();
+		L" | Background: " + DescribeBackgroundChoice() +
+		L" | Web remote: " + (g_app.webEnabled ? L"on" : L"off");
 
 	g_inputOwnershipEvent = CreateEventW(nullptr, TRUE, FALSE, kLegoToypadInputEvent);
 
@@ -3727,7 +4665,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	HWND window = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
 		className, L"LEGO Dimensions Toypad Picker", WS_POPUP,
 		CW_USEDEFAULT, CW_USEDEFAULT, kOverlayWidth, kOverlayHeight, nullptr, nullptr, instance, nullptr);
-	if (!window)
+if (!window)
 	{
 		ReleaseGlossCache();
 		ReleaseAssetImages();
@@ -3736,12 +4674,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 		WSACleanup();
 		return 1;
 	}
-
+	g_mainWindow = window;
 	SetLayeredWindowAttributes(window, 0, kOverlayAlpha, LWA_ALPHA);
 	ApplyWindowCornerRadius(window);
 	AddTrayIcon(window);
 	RegisterToggleHotkeyIfNeeded(window);
 	SetTimer(window, kControllerTimer, 8, nullptr);
+
+	// Start the web remote if enabled in settings; surface the phone address
+	// in the status line and the tray copy menu.
+	if (g_app.webEnabled)
+	{
+		if (StartWebServer(window))
+		{
+			g_app.webUrl = GetLanAddress();
+			if (g_app.webUrl.empty())
+				g_app.webUrl = L"http://<this-pc-lan-ip>:" + std::to_wstring(g_app.webPort) + L"/";
+			g_app.status = std::wstring(L"Web remote on: ") + g_app.webUrl + L" (Enable from Settings anytime)";
+		}
+		else
+		{
+			g_app.status = L"Web remote could not start (port " + std::to_wstring(g_app.webPort) +
+				L" busy or unavailable). Checking the firewall may be needed.";
+		}
+	}
 	// The default Windows timer granularity (~15.6ms) would round an 8ms
 	// poll back up to ~16ms, keeping the fast-tap miss window untouched, so
 	// tighten the system timer resolution to 1ms for the app's lifetime.

@@ -2,7 +2,9 @@
 """Build-time asset generator for LegoToypad.
 
 Walks the prepared source layout ("All Bin Files/<World>/{Characters,Vehicules,Logo}"
-plus the "Assets" folder) and emits, into the output directory:
+plus the "Assets" tree, which is organized into category folders:
+Wallpapers, Pads, Tiles, Buttons, Branding and Fonts) and emits, into the
+output directory:
 
   - resources.rc              : one RCDATA entry per .bin/.png, plus the app ICON
   - GeneratedAssetTable.h     : resource id defines (also consumed by rc.exe) and
@@ -147,6 +149,32 @@ def image_files(directory: Path):
                 if child.stat().st_size > 0:
                     out.append(child)
     return sorted(out, key=lambda p: p.name.casefold())
+
+
+# Subfolders that only hold superseded layouts and must never be scanned for
+# active assets (e.g. the legacy "Old" collection of pad/button art).
+SKIPPED_ASSET_DIRS = {"old", "legacy", ".old", "unused", "archive"}
+
+
+def asset_files(assets_root: Path, suffixes):
+    """Recursive scan of the Assets tree. The tree is organized into category
+    folders (Wallpapers, Pads, Tiles, Buttons, Branding, Fonts), so the active
+    assets are gathered from every subfolder while legacy/archive folders are
+    skipped. Catches images dropped straight into a category folder and keeps
+    the .rc/.cpp output identical regardless of which folder holds a file."""
+    out = []
+    if not assets_root or not assets_root.is_dir():
+        return out
+    for child in assets_root.rglob("*"):
+        if not child.is_file() or child.stat().st_size == 0:
+            continue
+        if child.suffix.lower() not in suffixes:
+            continue
+        parents = [p.casefold() for p in child.relative_to(assets_root).parts[:-1]]
+        if any(p in SKIPPED_ASSET_DIRS for p in parents):
+            continue
+        out.append(child)
+    return sorted(out, key=lambda p: str(p).casefold())
 
 
 def pair_bins_and_images(bin_files, png_files, warnings):
@@ -319,7 +347,10 @@ def generate(root: Path, out_dir: Path) -> int:
     # is sorted.
 
     # ---- app-level assets -------------------------------------------------
-    assets_files = image_files(assets_root)
+    # The Assets tree is organized into category folders (Wallpapers, Pads,
+    # Tiles, Buttons, Branding, Fonts); asset_files() walks it recursively so
+    # the lookup helpers below find each asset wherever it lives.
+    assets_files = asset_files(assets_root, (".png", ".jpg", ".jpeg"))
 
     def pick_asset(expected_names, keyword, what):
         for candidate in sorted(assets_files, key=lambda p: p.stem.casefold()):
@@ -447,14 +478,11 @@ def generate(root: Path, out_dir: Path) -> int:
     # into the output dir; the runtime app path is unchanged.
     ui_font = None
     font_rc_path = None
-    if assets_root:
-        font_candidates = [p for p in assets_root.iterdir()
-                           if p.is_file() and p.suffix.lower() in (".ttf", ".otf", ".woff", ".woff2")]
-        if font_candidates:
-            font_candidates.sort(key=lambda p: p.stem.casefold())
-            ui_font = font_candidates[0]
-            if len(font_candidates) > 1:
-                warnings.append("multiple fonts in Assets, using %s" % font_candidates[0].name)
+    font_candidates = asset_files(assets_root, (".ttf", ".otf", ".woff", ".woff2"))
+    if font_candidates:
+        ui_font = font_candidates[0]
+        if len(font_candidates) > 1:
+            warnings.append("multiple fonts in Assets, using %s" % font_candidates[0].name)
 
     if ui_font and ui_font.suffix.lower() in (".woff", ".woff2"):
         try:
@@ -485,6 +513,33 @@ def generate(root: Path, out_dir: Path) -> int:
     font_sym = symbols.allocate("ASSET_UI_FONT", font_rc_path) if font_rc_path else None
     if font_rc_path:
         ascii_ok([str(font_rc_path)], warnings)
+
+    # The same face in original web format (woff/woff2) is embedded separately
+    # so the phone UI can load the compact typeface without a multi-megabyte
+    # raw ttf download. Served straight from the resource bytes; the HTTP
+    # layer sniffs the magic to pick the right content type.
+    ui_font_web_sym = None
+    if ui_font and ui_font.suffix.lower() in (".woff", ".woff2"):
+        ui_font_web_sym = symbols.allocate("ASSET_UI_FONT_WEB", ui_font)
+        ascii_ok([str(ui_font)], warnings)
+
+    # ---- web remote UI -----------------------------------------------------
+    # Files in the "Web" folder (index.html / style.css / app.js) are embedded
+    # verbatim as RCDATA resources and handed to the built-in HTTP server via
+    # the kWebFiles table below. Missing folder just means no remote UI is
+    # bundled; the server still answers the API endpoints.
+    web_files = []
+    web_root = discover_case_insensitive(root, "Web")
+    if web_root and web_root.is_dir():
+        for web_file in sorted(web_root.iterdir(), key=lambda p: p.name.casefold()):
+            if not web_file.is_file() or web_file.stat().st_size == 0:
+                continue
+            resource_name = "WEB_%s" % sanitize(web_file.name)
+            sym = symbols.allocate(resource_name, web_file)
+            ascii_ok([str(web_file)], warnings)
+            web_files.append({"name": web_file.name, "symbol": sym})
+    else:
+        warnings.append("no Web folder found (web remote UI will not be bundled)")
 
     if not wordmark:
         print("ERROR: could not find the wordmark image in %s" % assets_root)
@@ -608,14 +663,23 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("    int resourceId;")
     header.append("};")
     header.append("")
+    header.append("struct WebFile")
+    header.append("{")
+    header.append("    const char* name;")
+    header.append("    int resourceId;")
+    header.append("};")
+    header.append("")
     header.append("extern const Franchise kFranchises[];")
     header.append("extern const size_t kFranchiseCount;")
     header.append("extern const BackgroundChoice kBackgroundChoices[];")
     header.append("extern const size_t kBackgroundChoiceCount;")
+    header.append("extern const WebFile kWebFiles[];")
+    header.append("extern const size_t kWebFileCount;")
     header.append("extern const int kWordmarkResourceId;")
     header.append("extern const int kBackgroundResourceId;")
     header.append("extern const int kAppIconResourceId;")
     header.append("extern const int kUIFontResourceId;")
+    header.append("extern const int kUIFontWebResourceId;")
     header.append("extern const int kWorldTileResourceId;")
     header.append("extern const int kCharactersTileResourceId;")
     header.append("extern const int kPadBackgroundResourceIds[7];")
@@ -649,6 +713,7 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kBackgroundResourceId = %s;" % (background_sym["name"] if background_sym else "0"))
     cpp.append("const int kAppIconResourceId = %s;" % icon_sym["name"])
     cpp.append("const int kUIFontResourceId = %s;" % (font_sym["name"] if font_sym else "0"))
+    cpp.append("const int kUIFontWebResourceId = %s;" % (ui_font_web_sym["name"] if ui_font_web_sym else "0"))
     cpp.append("const int kWorldTileResourceId = %s;" % (world_tile_sym["name"] if world_tile_sym else "0"))
     cpp.append("const int kCharactersTileResourceId = %s;" % (characters_tile_sym["name"] if characters_tile_sym else "0"))
     cpp.append("const int kPadBackgroundResourceIds[7] = { %s };"
@@ -689,6 +754,13 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("};")
     cpp.append("")
     cpp.append("const size_t kFranchiseCount = %d;" % len(franchises))
+    cpp.append("")
+    cpp.append("const WebFile kWebFiles[] = {")
+    for entry in sorted(web_files, key=lambda w: w["name"].casefold()):
+        cpp.append('    { "%s", %s },' % (entry["name"].replace("\\", "\\\\").replace('"', '\\"'),
+                                          entry["symbol"]["name"]))
+    cpp.append("};")
+    cpp.append("const size_t kWebFileCount = sizeof(kWebFiles) / sizeof(kWebFiles[0]);")
     cpp.append("")
 
     # -----------------------------------------------------------------------

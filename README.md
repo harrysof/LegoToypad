@@ -1,7 +1,7 @@
 # LegoToypad
 
 <p align="center">
-  <img src="Assets/Legotoypad_Logo.png" alt="LegoToypad logo" width="220">
+  <img src="Assets/Branding/Legotoypad_Logo.png" alt="LegoToypad logo" width="220">
 </p>
 
 A controller-driven companion app for LEGO Dimensions emulation. It emulates the
@@ -26,6 +26,9 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
   and rendered to an off-screen buffer for a flicker-free frame.
 - **Sits in the system tray**: stays hidden until the toggle shortcut shows it,
   launching with a one-time toast notification.
+- **Web remote**: a phone-friendly HTML UI is embedded in the exe and served
+  over your LAN, mirroring the desktop overlay so you can Load/Move/Clear tags
+  from any device on your network.
 - **Configurable everything**: toggle shortcut, confirm-button style, and
   bundled background selection all live in the in-app Settings screen.
 
@@ -77,7 +80,8 @@ Press **Y / S** on the pad grid to open Settings:
    or keyboard shortcut, see below).
 2. **Confirm button** — swap A/B confirm style: **A (RPCS3)** or **B (Cemu)**.
 3. **Background** — cycle through the bundled background images (drop more
-   `background*.png` files into `Assets` and rebuild to add your own).
+   `background*.png` files into `Assets/Wallpapers` and rebuild to add your
+   own).
 4. **Clear all pad** — empty every slot at once (useful if the emulator reset
    its Toypad state out from under the app, e.g. after an emulator restart).
 
@@ -94,7 +98,27 @@ Right-click the tray icon for the menu:
 
 - **Show/Hide overlay** — same as the toggle shortcut.
 - **Shortcut settings** — opens the Settings screen's shortcut row directly.
+- **Copy web remote address** — copies the URL to open on your phone/tablet.
 - **Exit** — quits the app and removes the tray icon.
+
+## Web remote (phone UI)
+
+A complete phone remote is compiled into the exe. When enabled, the app shows
+`Web remote on: http://<your-ip>:8765/` in the status bar and copies that URL to
+the clipboard so you can just open it on your phone. The page is a mobile-first
+9:16 portrait layout (it stays at 9:16 on any sized screen): the 7 Toypad slots
+keep the iconic 3/1/3 arrangement on top of a thumb-friendly action bar, and a
+picked world shows a scrollable roster with the vehicle build picker — Load,
+Move and Clear work from the selected slot.
+
+- The desktop app must keep running — it is the bridge that relays your taps to
+  the emulator's Toypad listener on loopback.
+- Turn it off entirely from **Settings → Web remote** (default: **On**). When
+  off, no server thread is created and no port is opened.
+- On Windows, the first browser connection from another device may trigger a
+  firewall prompt for `LegoToypad.exe` — allow it on **private** networks.
+- Use it on your LAN only; nothing is encrypted and there is no authentication.
+  Don't expose port `8765` to the internet.
 
 ## Build
 
@@ -110,6 +134,10 @@ Output: `build\Release\LegoToypad.exe`
 Regenerating the embedded assets happens automatically on every build
 (`generate_assets.py` walks the `All Bin Files` + `Assets` folders and emits
 `resources.rc`, `GeneratedAssetTable.{h,cpp}` and `app.ico` into `build\generated`).
+The `Assets` tree is organized into category folders — `Wallpapers` (backgrounds),
+`Pads` (the 7 Toypad slot art), `Tiles`, `Buttons`, `Branding` and `Fonts` — and
+the generator gathers them recursively, so drop a file in the right folder and
+rebuild. Legacy art in `Assets/Old` is skipped.
 The script only rewrites a file when its content changes, so incremental builds
 don't recompile the resources unnecessarily. Add or change a `.bin`/`.png` in
 the source folders and just rebuild - no manual step.
@@ -182,7 +210,9 @@ you can tweak by hand or pre-configure a deployment.
 | `[Shortcut]` | `KeyModifiers` | Keyboard modifier bitmask (Alt=1, Ctrl=2, Shift=4, Win=8) |
 | `[Shortcut]` | `KeyCode` | Keyboard virtual-key code (must have a modifier) |
 | `[Input]` | `SwapConfirmBackButtons` | `0` = A confirm / B back (RPCS3 style), `1` = B confirm / A back (Cemu style) |
-| `[Input]` | `BackgroundIndex` | Index into the bundled `Assets/background*.png` choices |
+| `[Input]` | `BackgroundIndex` | Index into the bundled `Assets/Wallpapers/background*.png` choices |
+| `[Web]` | `Enabled` | `1` = serve the phone UI / `0` = no web server at all (default `1`) |
+| `[Web]` | `Port` | Port the HTTP server binds (default `8765`) |
 
 ## Listener protocol
 

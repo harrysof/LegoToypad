@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>LegoToypad Remote</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="stage">
+  <img id="bgimg" alt="">
+  <div id="topbar">
+    <img id="wordmark" alt="">
+    <div id="connDot" title="Connection to desktop app"></div>
+  </div>
+
+  <div id="padScreen" class="screen active">
+    <div id="pads"></div>
+    <div id="chip" class="chip"><span id="chipText">Tap a pad to select it</span></div>
+    <div id="actionBar"></div>
+  </div>
+
+  <div id="franchiseScreen" class="screen">
+    <div id="franchiseTitle">PICK A WORLD</div>
+    <div id="franchiseGrid"></div>
+    <div class="scrollbar" id="franchiseScroll"><img src="" alt=""></div>
+  </div>
+
+  <div id="rosterScreen" class="screen">
+    <img id="worldLogo" alt="">
+    <div id="rosterGrid"></div>
+    <div class="scrollbar" id="rosterScroll"><img src="" alt=""></div>
+  </div>
+
+  <div id="plusScreen" class="screen">
+    <img id="plusWorldLogo" alt="">
+    <div id="plusPanel"><div id="plusGrid"></div></div>
+  </div>
+
+  <button id="backBtn">&#8249;</button>
+  <div id="statusbar"></div>
+  <div id="toast"></div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
