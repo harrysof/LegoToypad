@@ -36,6 +36,14 @@ from pathlib import Path
 RCDATA_BASE_ID = 1000  # numeric ids start here, one per resource name
 APP_ICON_ID = 100
 
+# Version metadata stamped into the exe's VERSIONINFO resource. Bump these
+# together with the release tag; the comma form is what rc.exe's
+# FILEVERSION/PRODUCTVERSION statements require.
+APP_VERSION = "1.3.0"
+APP_VERSION_COMMA = "1,3,0,0"
+APP_COMPANY = "HarrysofXD"
+APP_DESCRIPTION = "Controller-driven LEGO Dimensions Toypad companion for Cemu and Rpcs3"
+
 # ---------------------------------------------------------------------------
 # Deterministic hash -> color
 # ---------------------------------------------------------------------------
@@ -503,9 +511,41 @@ def generate(root: Path, out_dir: Path) -> int:
     # -----------------------------------------------------------------------
     # Emit resources.rc
     # -----------------------------------------------------------------------
-    rc_lines = ['#include "GeneratedAssetTable.h"', ""]
+    rc_lines = ['#include "GeneratedAssetTable.h"', '#include <winver.h>', ""]
     rc_lines.append("// Numeric ids are defined in GeneratedAssetTable.h; the")
     rc_lines.append("// RCDATA payloads below are the embedded asset payloads.")
+    rc_lines.append("")
+    # A real VERSIONINFO block keeps the signed metadata rich instead of
+    # anonymous; unsigned binaries with zero version info and huge opaque
+    # resource payloads are exactly the profile Windows Defender's ML
+    # heuristics (Wacatac.C!ml) score as suspicious.
+    rc_lines.append("VS_VERSION_INFO VERSIONINFO")
+    rc_lines.append(" FILEVERSION %s" % APP_VERSION_COMMA)
+    rc_lines.append(" PRODUCTVERSION %s" % APP_VERSION_COMMA)
+    rc_lines.append(" FILEFLAGSMASK 0x3fL")
+    rc_lines.append(" FILEFLAGS 0x0L")
+    rc_lines.append(" FILEOS 0x40004L")  # VOS_NT_WINDOWS32
+    rc_lines.append(" FILETYPE 0x1L")    # VFT_APP
+    rc_lines.append(" FILESUBTYPE 0x0L")
+    rc_lines.append("BEGIN")
+    rc_lines.append("    BLOCK \"StringFileInfo\"")
+    rc_lines.append("    BEGIN")
+    rc_lines.append("        BLOCK \"040904b0\"")
+    rc_lines.append("        BEGIN")
+    rc_lines.append('            VALUE "CompanyName", "%s"' % APP_COMPANY)
+    rc_lines.append('            VALUE "FileDescription", "%s"' % APP_DESCRIPTION)
+    rc_lines.append('            VALUE "FileVersion", "%s"' % APP_VERSION)
+    rc_lines.append('            VALUE "InternalName", "LegoToypad"')
+    rc_lines.append('            VALUE "OriginalFilename", "LegoToypad.exe"')
+    rc_lines.append('            VALUE "ProductName", "LegoToypad"')
+    rc_lines.append('            VALUE "ProductVersion", "%s"' % APP_VERSION)
+    rc_lines.append("        END")
+    rc_lines.append("    END")
+    rc_lines.append("    BLOCK \"VarFileInfo\"")
+    rc_lines.append("    BEGIN")
+    rc_lines.append('        VALUE "Translation", 0x409, 1200')
+    rc_lines.append("    END")
+    rc_lines.append("END")
     rc_lines.append("")
     icon_path = out_dir / "app.ico"
     rc_lines.append("IDI_APP_ICON ICON \"app.ico\"")

@@ -27,10 +27,11 @@ add_custom_target(gen_assets ALL
 
 # SDL2 backs the game-controller input (Xbox / DualShock 4 / DualSense /
 # Switch Pro) via its GameController API. Fetched from the official release
-# tarball so the version and integrity are pinned; only the shared runtime
-# (SDL2.dll) is built and shipped next to the exe.
-set(SDL_SHARED ON CACHE BOOL "" FORCE)
-set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+# tarball so the version and integrity are pinned, and linked STATICALLY:
+# shipping SDL2 as a separate DLL was tripping antivirus heuristics, and the
+# static build embeds everything in the exe with no companion DLL to lose.
+set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST OFF CACHE BOOL "" FORCE)
 set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
 include(FetchContent)
@@ -53,24 +54,15 @@ target_compile_features(LegoToypad PRIVATE cxx_std_20)
 # NOMINMAX keeps windows.h's min/max macros from clobbering std::min/std::max.
 target_compile_definitions(LegoToypad PRIVATE UNICODE _UNICODE NOMINMAX)
 target_include_directories(LegoToypad PRIVATE "${GENERATED_DIR}")
-# SDL2::SDL2 is linked without SDL2main: wWinMain stays the entry point and
-# SDL2 is used purely as a controller-input library, not taking over main.
-target_link_libraries(LegoToypad PRIVATE ws2_32 shell32 gdiplus winmm SDL2::SDL2)
+# SDL2 is linked statically and WITHOUT SDL2main: wWinMain stays the entry
+# point and SDL2 is used purely as a controller-input library, not taking
+# over main.
+target_link_libraries(LegoToypad PRIVATE ws2_32 shell32 gdiplus winmm SDL2::SDL2-static)
 
 add_custom_command(TARGET LegoToypad POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
           "${CMAKE_SOURCE_DIR}/README.txt"
           "$<TARGET_FILE_DIR:LegoToypad>/README.txt"
   COMMENT "Copying runtime README"
-  VERBATIM
-)
-
-# SDL2.dll must sit next to the exe (Windows resolves DLLs from the app's own
-# folder first). TARGET_FILE of the shared SDL2 target IS the .dll.
-add_custom_command(TARGET LegoToypad POST_BUILD
-  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-          "$<TARGET_FILE:SDL2>"
-          "$<TARGET_FILE_DIR:LegoToypad>/SDL2.dll"
-  COMMENT "Copying SDL2.dll"
   VERBATIM
 )
