@@ -3725,6 +3725,10 @@ if (changed)
 			return "application/json; charset=utf-8";
 		if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".svg") == 0)
 			return "image/svg+xml";
+		if (path.size() >= 6 && path.compare(path.size() - 6, 6, ".woff2") == 0)
+			return "font/woff2";
+		if (path.size() >= 5 && path.compare(path.size() - 5, 5, ".woff") == 0)
+			return "font/woff";
 		return "application/octet-stream";
 	}
 
@@ -4162,7 +4166,11 @@ if (changed)
 					return;
 				}
 				const std::string body(reinterpret_cast<const char*>(data.data()), data.size());
-				SendHttpResponse(socket, 200, "OK", body, MimeForWebFile(kWebFiles[i].name), true);
+				// The UI payloads change on every rebuild (they are compiled in),
+				// so never let a browser heuristically serve a 1-hour-old
+				// style.css/app.js. no-store plus a versioned URL (see index.html)
+				// guarantees the phone always gets the embedded bytes.
+				SendHttpResponse(socket, 200, "OK", body, MimeForWebFile(kWebFiles[i].name), false);
 				return;
 			}
 			SendHttpResponse(socket, 404, "Not Found", "Not Found", "text/plain; charset=utf-8", false);
@@ -4194,6 +4202,10 @@ if (changed)
 			else if (request.path == "/app.js")
 			{
 				serveWebFile("app.js");
+			}
+			else if (request.path == "/InterVariable.woff2")
+			{
+				serveWebFile("InterVariable.woff2");
 			}
 			else if (request.path == "/api/catalog")
 			{

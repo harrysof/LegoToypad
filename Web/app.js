@@ -7,16 +7,17 @@
 // --- layout constants (9:16 portrait stage, mirrored by style.css) --------
 const STAGE_W = 405, STAGE_H = 720;
 
-// pad cells in stage coordinates. Top row keeps the iconic 3/1/3 Toypad
-// layout with the center pad dominant; the lower row carries 4 smaller pads.
+// Pad cells in stage coordinates, mirroring the real 3/1/3 Toypad shape:
+// the inner lower pads (4 and 5) sit half a pad lower than the outer lower
+// pads (3 and 6), so each side reads as a diagonal, like the physical pad.
 const PAD_CELLS = [
-  { x: 29,  y: 0,   w: 106, h: 244 }, // 0 Left - upper
-  { x: 143, y: 0,   w: 120, h: 244 }, // 1 Center (large)
-  { x: 271, y: 0,   w: 106, h: 244 }, // 2 Right - upper
-  { x: 15,  y: 256, w: 86,  h: 188 }, // 3 Left - lower left
-  { x: 111, y: 256, w: 86,  h: 188 }, // 4 Left - lower right
-  { x: 207, y: 256, w: 86,  h: 188 }, // 5 Right - lower left
-  { x: 303, y: 256, w: 86,  h: 188 }, // 6 Right - lower right
+  { x: 32,  y: 76,  w: 104, h: 104 }, // 0 Left - upper
+  { x: 136, y: 34,  w: 134, h: 134 }, // 1 Center (large)
+  { x: 269, y: 76,  w: 104, h: 104 }, // 2 Right - upper
+  { x: 24,  y: 254, w: 84,  h: 84  }, // 3 Left - lower left (outer)
+  { x: 116, y: 296, w: 84,  h: 84  }, // 4 Left - lower right (inner, lowered)
+  { x: 208, y: 296, w: 84,  h: 84  }, // 5 Right - lower left (inner, lowered)
+  { x: 300, y: 254, w: 84,  h: 84  }, // 6 Right - lower right (outer)
 ];
 
 const FR_COLS = 2, RO_COLS = 3;
@@ -25,7 +26,10 @@ const FR_COLS = 2, RO_COLS = 3;
 let CAT = null;            // catalog from /api/catalog
 let screen = 'pad';        // pad | franchise | roster | plus
 let curSlot = null;        // selected pad slot (null = nothing selected)
-let moveSource = -1;       // -1 = not picking a move destination
+let lastTapSlot = -1;      // double-tap detection
+let lastTapTime = 0;
+let dragState = null;      // active pad drag (null = none)
+let suppressClick = false; // ignore a click right after a drag
 let curWorld = null;       // franchise object for roster/plus
 let curGroup = null;       // vehicle group object for the plus picker
 let lastState = null;      // last /api/state payload
@@ -56,6 +60,94 @@ async function api(url, opts) {
   return res.json();
 }
 
+// --- drag & drop ----------------------------------------------------------
+// Pointer-capture drag between pads. The finger never loses the gesture
+// because the source pad grabs the pointer, and both the ghost and the
+// possible drop target give live feedback so a move always "registers".
+function toStage(e) {
+  const rect = $('stage').getBoundingClientRect();
+  const scale = rect.width / STAGE_W;
+  return { x: (e.clientX - rect.left) / scale, y: (e.clientY - rect.top) / scale };
+}
+
+function hitTestPad(clientX, clientY) {
+  for (let i = 0; i < pads.length; i++) {
+    const r = pads[i].getBoundingClientRect();
+    if (clientX >= r.left - 12 && clientX <= r.right + 12 && clientY >= r.top - 12 && clientY <= r.bottom + 12) return i;
+  }
+  return -1;
+}
+
+function startDrag(slot, e) {
+  const pad = pads[slot];
+  clearDropHighlight();
+  dragState = { slot, startX: e.clientX, startY: e.clientY, active: false, warned: false };
+  if (pad.classList.contains('occupied')) {
+    try { pad.setPointerCapture(e.pointerId); } catch (err) {}
+    const portrait = pad.querySelector('.padportrait');
+    if (portrait && portrait.src) $('dragGhost').src = portrait.src;
+    const st = toStage(e);
+    const ghost = $('dragGhost');
+    ghost.style.left = (st.x - 32) + 'px';
+    ghost.style.top = (st.y - 32) + 'px';
+    ghost.classList.add('active');
+    pad.classList.add('dragging');
+  }
+}
+
+function clearDropHighlight() {
+  pads.forEach(p => p.classList.remove('dropTarget'));
+}
+
+function moveDrag(e) {
+  if (!dragState) return;
+  const dx = e.clientX - dragState.startX;
+  const dy = e.clientY - dragState.startY;
+  const ghost = $('dragGhost');
+  if (!dragState.active && Math.hypot(dx, dy) > 6) {
+    dragState.active = true;
+    if (!pads[dragState.slot].classList.contains('occupied')) {
+      dragState.warned = true;
+      showToast('Nothing on this pad to move.');
+    }
+  }
+  if (!dragState.active) return;
+  const st = toStage(e);
+  ghost.style.left = (st.x - 32) + 'px';
+  ghost.style.top = (st.y - 32) + 'px';
+  const over = hitTestPad(e.clientX, e.clientY);
+  clearDropHighlight();
+  if (over >= 0 && over !== dragState.slot) pads[over].classList.add('dropTarget');
+}
+
+function endDrag(e) {
+  if (!dragState) return;
+  const source = dragState.slot;
+  const didDrag = dragState.active && pads[source].classList.contains('occupied');
+  clearDropHighlight();
+  pads[source].classList.remove('dragging');
+  $('dragGhost').classList.remove('active');
+  if (didDrag) {
+    suppressClick = true;
+    setTimeout(() => { suppressClick = false; }, 500);
+    const drop = hitTestPad(e.clientX, e.clientY);
+    if (drop >= 0 && drop !== source) apiMove(source, drop);
+  }
+  dragState = null;
+}
+
+function cancelDrag() {
+  if (!dragState) return;
+  clearDropHighlight();
+  pads[dragState.slot].classList.remove('dragging');
+  $('dragGhost').classList.remove('active');
+  dragState = null;
+}
+
+window.addEventListener('pointermove', moveDrag);
+window.addEventListener('pointerup', endDrag);
+window.addEventListener('pointercancel', cancelDrag);
+
 // --- boot -----------------------------------------------------------------
 function scaleStage() {
   const vw = document.documentElement.clientWidth;
@@ -76,13 +168,8 @@ function buildPads() {
     pad.style.top = c.y + 'px';
     pad.style.width = c.w + 'px';
     pad.style.height = c.h + 'px';
-    pad.style.borderRadius = i === 1 ? '28px' : (i < 3 ? '20px' : '16px');
+    pad.style.borderRadius = '10px';
     pad.dataset.slot = i;
-
-    const art = document.createElement('img');
-    art.className = 'padart';
-    art.src = CAT.pads[i];
-    pad.appendChild(art);
 
     const dot = document.createElement('div');
     dot.className = 'padcdot';
@@ -93,11 +180,8 @@ function buildPads() {
     portrait.alt = '';
     pad.appendChild(portrait);
 
-    const name = document.createElement('div');
-    name.className = 'padname';
-    pad.appendChild(name);
-
     pad.addEventListener('click', () => onPadTap(i));
+    pad.addEventListener('pointerdown', (e) => startDrag(i, e));
     container.appendChild(pad);
     pads.push(pad);
   }
@@ -112,12 +196,11 @@ function refreshPads(es) {
     const occupied = p.occupied;
 
     const portrait = pad.querySelector('.padportrait');
-    const name = pad.querySelector('.padname');
     const dot = pad.querySelector('.padcdot');
 
     portrait.style.display = occupied ? 'block' : 'none';
     portrait.src = occupied ? p.portrait : '';
-    const size = Math.round(Math.min(PAD_CELLS[i].w, PAD_CELLS[i].h) * 0.58);
+    const size = Math.round(Math.min(PAD_CELLS[i].w, PAD_CELLS[i].h) * (i === 1 ? 0.56 : 0.62));
     portrait.style.width = size + 'px';
     portrait.style.height = size + 'px';
     portrait.style.left = '50%';
@@ -126,11 +209,8 @@ function refreshPads(es) {
     portrait.style.border = occupied ? `3px solid ${p.color}` : 'none';
     portrait.style.boxShadow = occupied ? `0 0 16px ${rgba(p.color, 0.7)}` : 'none';
 
-    name.textContent = occupied ? p.name : '';
-    name.style.display = occupied ? 'block' : 'none';
-
+    pad.classList.toggle('occupied', occupied);
     pad.classList.toggle('selected', i === curSlot);
-    pad.classList.toggle('moveSource', i === moveSource);
     pad.style.border = (i === curSlot && curSlot !== null)
       ? '3px solid #E83838' : '2px solid transparent';
 
@@ -139,50 +219,52 @@ function refreshPads(es) {
       ? `radial-gradient(circle at 50% 45%, ${rgba(p.color, 0.30)} 0%, ${rgba(p.color, 0.10)} 70%, transparent 100%)`
       : 'none';
   }
-  updateChip();
+  updateFloatName();
 }
 
-function updateChip() {
-  const chip = $('chipText');
-  if (moveSource >= 0) {
-    chip.textContent = 'Pick the destination pad for PAD ' + (moveSource + 1);
-    return;
-  }
-  if (curSlot === null) {
-    chip.textContent = 'Tap a pad to select it';
+// Small faded caption floating 1px below the very top of the selected pad,
+// just clearing the selection highlight, fading in and out on select.
+function updateFloatName() {
+  const el = $('floatName');
+  if (screen !== 'pad' || curSlot === null) {
+    el.classList.remove('show');
     return;
   }
   const p = lastState && lastState.pads ? lastState.pads[curSlot] : null;
-  if (p && p.occupied) {
-    chip.textContent = `PAD ${curSlot + 1} — ${p.name}`;
-  } else {
-    chip.textContent = `PAD ${curSlot + 1} (empty)`;
+  if (!p || !p.occupied || !p.name) {
+    el.classList.remove('show');
+    return;
   }
+  el.textContent = p.name;
+  const sr = $('stage').getBoundingClientRect();
+  const scale = sr.width / STAGE_W;
+  const r = pads[curSlot].getBoundingClientRect();
+  const px = (r.left - sr.left) / scale;
+  const py = (r.top - sr.top) / scale;
+  const pw = r.width / scale;
+  const w = el.offsetWidth || 120;
+  const left = px + (pw - w) / 2;
+  el.style.left = Math.max(4, left) + 'px';
+  el.style.top = (py + 1) + 'px';
+  el.classList.add('show');
 }
 
 // --- action bar -----------------------------------------------------------
 function buildActionBar() {
   const bar = $('actionBar');
   bar.textContent = '';
-  const specs = [
-    { img: CAT.loadBtn, label: 'LOAD' },
-    { img: CAT.moveBtn, label: 'MOVE' },
-    { img: CAT.clearBtn, label: 'CLEAR' },
-  ];
-  specs.forEach((s, i) => {
-    const btn = document.createElement('div');
-    btn.className = 'actbtn';
-    const img = document.createElement('img');
-    img.src = s.img;
-    img.alt = s.label;
-    const lbl = document.createElement('span');
-    lbl.className = 'alabel';
-    lbl.textContent = s.label;
-    btn.appendChild(img);
-    btn.appendChild(lbl);
-    btn.addEventListener('click', () => onActionTap(i));
-    bar.appendChild(btn);
-  });
+  const btn = document.createElement('div');
+  btn.className = 'actbtn';
+  const img = document.createElement('img');
+  img.src = CAT.clearBtn;
+  img.alt = 'CLEAR';
+  const lbl = document.createElement('span');
+  lbl.className = 'alabel';
+  lbl.textContent = 'CLEAR';
+  btn.appendChild(img);
+  btn.appendChild(lbl);
+  btn.addEventListener('click', () => onActionTap(0));
+  bar.appendChild(btn);
 }
 
 // --- franchise grid -------------------------------------------------------
@@ -192,7 +274,6 @@ function buildFranchiseGrid() {
   CAT.franchises.forEach((world, idx) => {
     const tile = document.createElement('div');
     tile.className = 'fworld';
-    tile.style.backgroundImage = `url(${CAT.worldTile})`;
     const logo = document.createElement('img');
     logo.className = 'logo';
     logo.src = world.logo;
@@ -337,20 +418,18 @@ function setScreen(s) {
   $('rosterScreen').classList.toggle('active', s === 'roster');
   $('plusScreen').classList.toggle('active', s === 'plus');
   $('backBtn').classList.toggle('visible', s !== 'pad');
+  $('floatName').classList.remove('show');
+  if (s === 'pad') updateFloatName();
 }
 
 function onPadTap(slot) {
-  if (moveSource >= 0) {
-    if (slot === moveSource) {
-      moveSource = -1;
-      refreshPadsFromState();
-      showToast('Move cancelled.');
-    } else {
-      apiMove(moveSource, slot);
-    }
-    return;
-  }
-  if (curSlot === slot && lastState && lastState.pads && lastState.pads[slot].occupied) {
+  if (suppressClick) { suppressClick = false; return; }
+  const now = Date.now();
+  const isDouble = slot === lastTapSlot && now - lastTapTime < 350;
+  lastTapSlot = slot;
+  lastTapTime = now;
+  if (isDouble) {
+    curSlot = slot;
     setScreen('franchise');
     return;
   }
@@ -359,32 +438,16 @@ function onPadTap(slot) {
 }
 
 async function onActionTap(action) {
-  if (action === 0) {           // Load
-    if (curSlot === null) {
-      showToast('Tap a pad first.');
-      return;
-    }
-    setScreen('franchise');
-  } else if (action === 1) {    // Move
-    if (curSlot === null) {
-      showToast('Tap a pad first.');
-      return;
-    }
-    const st = await getState();
-    if (!st || !st.pads[curSlot].occupied) {
-      showToast('There is nothing tracked on that pad to move.');
-      return;
-    }
-    moveSource = curSlot;
-    refreshPadsFromState();
-    showToast('Pick a destination pad.');
-  } else {                      // Clear
-    if (curSlot === null) {
-      showToast('Tap a pad first.');
-      return;
-    }
-    apiClear(curSlot);
+  const btn = document.querySelector('#actionBar .actbtn');
+  if (btn) {
+    btn.classList.add('tapped');
+    setTimeout(() => btn.classList.remove('tapped'), 220);
   }
+  if (curSlot === null) {
+    showToast('Tap a pad first.');
+    return;
+  }
+  apiClear(curSlot);
 }
 
 function onWorldTap(idx, tile) {
@@ -448,7 +511,6 @@ function apiLoad(slot, bin) {
 }
 
 function apiMove(src, dest) {
-  moveSource = -1;
   post('/api/move', { src: Number(src), dest: Number(dest) }, 'MOVE');
   setScreen('pad');
 }
@@ -469,6 +531,7 @@ function goBack() {
   if (screen === 'pad') return;
   if (screen === 'franchise') {
     setScreen('pad');
+    refreshPadsFromState();
   } else if (screen === 'roster') {
     setScreen('franchise');
   } else if (screen === 'plus') {
@@ -477,28 +540,32 @@ function goBack() {
 }
 
 // --- boot -----------------------------------------------------------------
+function setLoading(visible, text) {
+  const l = $('loading');
+  if (visible) {
+    l.classList.remove('hidden');
+    if (text) $('loadingText').textContent = text;
+  } else {
+    l.classList.add('hidden');
+  }
+}
+
 async function boot() {
   scaleStage();
   window.addEventListener('resize', scaleStage);
   $('backBtn').addEventListener('click', goBack);
 
+  setLoading(true, 'Connecting to LegoToypad…');
   try {
     CAT = await api('/api/catalog');
   } catch (e) {
-    $('statusbar').textContent = 'Cannot reach LegoToypad. Is the app running with the Web remote enabled?';
     $('connDot').classList.add('bad');
+    setLoading(true, 'Cannot reach LegoToypad.\nIs the app running with the Web remote enabled?');
     return;
   }
 
+  $('loadingLogo').src = CAT.wordmark;
   document.title = CAT.appName || 'LegoToypad Remote';
-
-  // inject the bundled Compacta typeface; never block first paint on it
-  if (CAT.fontUrl) {
-    try {
-      const f = new FontFace('UI Compacta', `url(${CAT.fontUrl})`);
-      f.load().then(() => document.fonts.add(f)).catch(() => {});
-    } catch (e) { /* fall back to system condensed fonts */ }
-  }
 
   $('bgimg').src = CAT.background;
   $('wordmark').src = CAT.wordmark;
@@ -509,6 +576,7 @@ async function boot() {
 
   setScreen('pad');
   await getState();
+  setTimeout(() => setLoading(false), 350);
   setInterval(getState, 3000);
 }
 

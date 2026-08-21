@@ -6,10 +6,15 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>LegoToypad Remote</title>
-<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/style.css?v=8">
 </head>
 <body>
 <div id="stage">
+  <div id="loading">
+    <img id="loadingLogo" alt="">
+    <div id="loadBar"></div>
+    <div id="loadingText"></div>
+  </div>
   <img id="bgimg" alt="">
   <div id="topbar">
     <img id="wordmark" alt="">
@@ -18,7 +23,6 @@
 
   <div id="padScreen" class="screen active">
     <div id="pads"></div>
-    <div id="chip" class="chip"><span id="chipText">Tap a pad to select it</span></div>
     <div id="actionBar"></div>
   </div>
 
@@ -40,9 +44,11 @@
   </div>
 
   <button id="backBtn">&#8249;</button>
+  <div id="floatName"></div>
+  <img id="dragGhost" class="dragGhost" alt="">
   <div id="statusbar"></div>
   <div id="toast"></div>
 </div>
-<script src="/app.js"></script>
+<script src="/app.js?v=8"></script>
 </body>
 </html>
