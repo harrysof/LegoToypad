@@ -1,26 +1,40 @@
-/* LegoToypad Remote - mobile-first phone controller.
+/* LegoToypad Remote - mobile-first and fully responsive controller UI.
    The desktop app stays the bridge: it embeds this UI, serves it over your
    LAN, and relays Load/Move/Clear to the emulator's Toypad listener. */
 
 'use strict';
 
-// --- layout constants (9:16 portrait stage, mirrored by style.css) --------
-const STAGE_W = 405, STAGE_H = 720;
-
-// Pad cells in stage coordinates, mirroring the real 3/1/3 Toypad shape:
-// the inner lower pads (4 and 5) sit half a pad lower than the outer lower
-// pads (3 and 6), so each side reads as a diagonal, like the physical pad.
-const PAD_CELLS = [
-  { x: 32,  y: 76,  w: 104, h: 104 }, // 0 Left - upper
-  { x: 136, y: 34,  w: 134, h: 134 }, // 1 Center (large)
-  { x: 269, y: 76,  w: 104, h: 104 }, // 2 Right - upper
-  { x: 24,  y: 254, w: 84,  h: 84  }, // 3 Left - lower left (outer)
-  { x: 116, y: 296, w: 84,  h: 84  }, // 4 Left - lower right (inner, lowered)
-  { x: 208, y: 296, w: 84,  h: 84  }, // 5 Right - lower left (inner, lowered)
-  { x: 300, y: 254, w: 84,  h: 84  }, // 6 Right - lower right (outer)
+// Landscape layout: L-shape left, inverted-L right, large circle center
+// Percentages are of the deck container (aspect-ratio: 405/310)
+const PAD_CELLS_LANDSCAPE = [
+  { x: 6.67,  y: 16.25,  w: 20.25, h: 25.625 }, // 0 Left - upper
+  { x: 34.32, y: 8.125,  w: 31.11, h: 39.375 }, // 1 Center (circle)
+  { x: 73.08, y: 16.25,  w: 20.25, h: 25.625 }, // 2 Right - upper
+  { x: 6.67,  y: 55.625, w: 20.25, h: 25.625 }, // 3 Left - lower outer
+  { x: 29.14, y: 55.625, w: 20.25, h: 25.625 }, // 4 Left - lower inner
+  { x: 50.62, y: 55.625, w: 20.25, h: 25.625 }, // 5 Right - lower inner
+  { x: 73.08, y: 55.625, w: 20.25, h: 25.625 }, // 6 Right - lower outer
 ];
 
-const FR_COLS = 2, RO_COLS = 3;
+// Portrait layout: circle top → 2 upper pads → 4 lower pads (1 + 2 + 4 rows)
+// Percentages are of the deck container (aspect-ratio: 350 / 400, R = 0.875)
+// Spans edge-to-edge (2% to 98%) to eliminate side gaps and maximize pad touch targets!
+const PAD_CELLS_PORTRAIT = [
+  { x: 2.5,   y: 39.5, w: 45.5,  h: 28.0 }, // 0 Left upper  (row 2)
+  { x: 30.0,  y: 2.5,  w: 40.0,  h: 35.0 }, // 1 Center circle (row 1, top)
+  { x: 52.0,  y: 39.5, w: 45.5,  h: 28.0 }, // 2 Right upper (row 2)
+  { x: 2.0,   y: 69.5, w: 22.65, h: 27.5 }, // 3 Left lower outer  (row 3)
+  { x: 26.45, y: 69.5, w: 22.65, h: 27.5 }, // 4 Left lower inner  (row 3)
+  { x: 50.9,  y: 69.5, w: 22.65, h: 27.5 }, // 5 Right lower inner (row 3)
+  { x: 75.35, y: 69.5, w: 22.65, h: 27.5 }, // 6 Right lower outer (row 3)
+];
+
+// Media query that matches portrait orientation (width <= height)
+const portraitMQ = window.matchMedia('(max-aspect-ratio: 1/1)');
+
+function getPadCells() {
+  return portraitMQ.matches ? PAD_CELLS_PORTRAIT : PAD_CELLS_LANDSCAPE;
+}
 
 // --- app state -----------------------------------------------------------
 let CAT = null;            // catalog from /api/catalog
@@ -33,10 +47,10 @@ let suppressClick = false; // ignore a click right after a drag
 let curWorld = null;       // franchise object for roster/plus
 let curGroup = null;       // vehicle group object for the plus picker
 let lastState = null;      // last /api/state payload
+let currentBg = null;      // current wallpaper background URL
 
 const $ = (id) => document.getElementById(id);
 const pads = [];            // pad DOM elements, indexed by slot
-let toastTimer = null;
 
 // --- helpers -------------------------------------------------------------
 function rgba(hex, a) {
@@ -46,12 +60,27 @@ function rgba(hex, a) {
   return `rgba(${r},${g},${b},${a})`;
 }
 
-function showToast(text) {
-  const el = $('toast');
+function getPadName(slot) {
+  const names = [
+    'left upper pad',
+    'center pad',
+    'right upper pad',
+    'left lower outer pad',
+    'left lower inner pad',
+    'right lower inner pad',
+    'right lower outer pad'
+  ];
+  return names[slot] || `pad ${slot}`;
+}
+
+function setStatusMessage(text, type = 'info') {
+  const el = $('statusMessage');
+  if (!el) return;
   el.textContent = text;
-  el.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+  el.className = 'status-message active ' + type;
+  el.classList.remove('pulse');
+  void el.offsetWidth; // trigger reflow for animation restart
+  el.classList.add('pulse');
 }
 
 async function api(url, opts) {
@@ -61,19 +90,10 @@ async function api(url, opts) {
 }
 
 // --- drag & drop ----------------------------------------------------------
-// Pointer-capture drag between pads. The finger never loses the gesture
-// because the source pad grabs the pointer, and both the ghost and the
-// possible drop target give live feedback so a move always "registers".
-function toStage(e) {
-  const rect = $('stage').getBoundingClientRect();
-  const scale = rect.width / STAGE_W;
-  return { x: (e.clientX - rect.left) / scale, y: (e.clientY - rect.top) / scale };
-}
-
 function hitTestPad(clientX, clientY) {
   for (let i = 0; i < pads.length; i++) {
     const r = pads[i].getBoundingClientRect();
-    if (clientX >= r.left - 12 && clientX <= r.right + 12 && clientY >= r.top - 12 && clientY <= r.bottom + 12) return i;
+    if (clientX >= r.left - 8 && clientX <= r.right + 8 && clientY >= r.top - 8 && clientY <= r.bottom + 8) return i;
   }
   return -1;
 }
@@ -86,10 +106,9 @@ function startDrag(slot, e) {
     try { pad.setPointerCapture(e.pointerId); } catch (err) {}
     const portrait = pad.querySelector('.padportrait');
     if (portrait && portrait.src) $('dragGhost').src = portrait.src;
-    const st = toStage(e);
     const ghost = $('dragGhost');
-    ghost.style.left = (st.x - 32) + 'px';
-    ghost.style.top = (st.y - 32) + 'px';
+    ghost.style.left = (e.clientX - 32) + 'px';
+    ghost.style.top = (e.clientY - 32) + 'px';
     ghost.classList.add('active');
     pad.classList.add('dragging');
   }
@@ -108,13 +127,12 @@ function moveDrag(e) {
     dragState.active = true;
     if (!pads[dragState.slot].classList.contains('occupied')) {
       dragState.warned = true;
-      showToast('Nothing on this pad to move.');
+      setStatusMessage('Nothing on this pad to move.', 'warn');
     }
   }
   if (!dragState.active) return;
-  const st = toStage(e);
-  ghost.style.left = (st.x - 32) + 'px';
-  ghost.style.top = (st.y - 32) + 'px';
+  ghost.style.left = (e.clientX - 32) + 'px';
+  ghost.style.top = (e.clientY - 32) + 'px';
   const over = hitTestPad(e.clientX, e.clientY);
   clearDropHighlight();
   if (over >= 0 && over !== dragState.slot) pads[over].classList.add('dropTarget');
@@ -148,27 +166,20 @@ window.addEventListener('pointermove', moveDrag);
 window.addEventListener('pointerup', endDrag);
 window.addEventListener('pointercancel', cancelDrag);
 
-// --- boot -----------------------------------------------------------------
-function scaleStage() {
-  const vw = document.documentElement.clientWidth;
-  const vh = window.innerHeight;
-  const s = Math.min(vw / STAGE_W, vh / STAGE_H);
-  $('stage').style.transform = `scale(${s})`;
-}
-
 // --- pad grid -------------------------------------------------------------
 function buildPads() {
   const container = $('pads');
   container.textContent = '';
+  pads.length = 0;
+  const cells = getPadCells();
   for (let i = 0; i < 7; i++) {
-    const c = PAD_CELLS[i];
+    const c = cells[i];
     const pad = document.createElement('div');
-    pad.className = 'pad';
-    pad.style.left = c.x + 'px';
-    pad.style.top = c.y + 'px';
-    pad.style.width = c.w + 'px';
-    pad.style.height = c.h + 'px';
-    pad.style.borderRadius = '10px';
+    pad.className = 'pad' + (i === 1 ? ' center-pad' : '');
+    pad.style.left = c.x + '%';
+    pad.style.top = c.y + '%';
+    pad.style.width = c.w + '%';
+    pad.style.height = c.h + '%';
     pad.dataset.slot = i;
 
     const dot = document.createElement('div');
@@ -187,6 +198,19 @@ function buildPads() {
   }
 }
 
+// Update pad positions when orientation changes without rebuilding DOM
+function repositionPads() {
+  const cells = getPadCells();
+  for (let i = 0; i < 7; i++) {
+    const c = cells[i];
+    pads[i].style.left    = c.x + '%';
+    pads[i].style.top     = c.y + '%';
+    pads[i].style.width   = c.w + '%';
+    pads[i].style.height  = c.h + '%';
+  }
+  updateFloatName();
+}
+
 function refreshPads(es) {
   lastState = es;
   const padsData = es.pads;
@@ -200,21 +224,13 @@ function refreshPads(es) {
 
     portrait.style.display = occupied ? 'block' : 'none';
     portrait.src = occupied ? p.portrait : '';
-    const size = Math.round(Math.min(PAD_CELLS[i].w, PAD_CELLS[i].h) * (i === 1 ? 0.56 : 0.62));
-    portrait.style.width = size + 'px';
-    portrait.style.height = size + 'px';
-    portrait.style.left = '50%';
-    portrait.style.top = '50%';
-    portrait.style.transform = 'translate(-50%, -50%)';
     portrait.style.border = occupied ? `3px solid ${p.color}` : 'none';
     portrait.style.boxShadow = occupied ? `0 0 16px ${rgba(p.color, 0.7)}` : 'none';
 
     pad.classList.toggle('occupied', occupied);
     pad.classList.toggle('selected', i === curSlot);
-    pad.style.border = (i === curSlot && curSlot !== null)
-      ? '3px solid #E83838' : '2px solid transparent';
+    pad.style.borderColor = (i === curSlot && curSlot !== null) ? '#E83838' : 'rgba(255, 255, 255, 0.22)';
 
-    const tint = occupied ? rgba(p.color, 0.18) : 'transparent';
     dot.style.background = occupied
       ? `radial-gradient(circle at 50% 45%, ${rgba(p.color, 0.30)} 0%, ${rgba(p.color, 0.10)} 70%, transparent 100%)`
       : 'none';
@@ -222,8 +238,6 @@ function refreshPads(es) {
   updateFloatName();
 }
 
-// Small faded caption floating 1px below the very top of the selected pad,
-// just clearing the selection highlight, fading in and out on select.
 function updateFloatName() {
   const el = $('floatName');
   if (screen !== 'pad' || curSlot === null) {
@@ -236,16 +250,11 @@ function updateFloatName() {
     return;
   }
   el.textContent = p.name;
-  const sr = $('stage').getBoundingClientRect();
-  const scale = sr.width / STAGE_W;
   const r = pads[curSlot].getBoundingClientRect();
-  const px = (r.left - sr.left) / scale;
-  const py = (r.top - sr.top) / scale;
-  const pw = r.width / scale;
-  const w = el.offsetWidth || 120;
-  const left = px + (pw - w) / 2;
-  el.style.left = Math.max(4, left) + 'px';
-  el.style.top = (py + 1) + 'px';
+  const w = el.offsetWidth || 110;
+  const left = r.left + (r.width - w) / 2;
+  el.style.left = Math.max(8, left) + 'px';
+  el.style.top = Math.max(8, r.top - 28) + 'px';
   el.classList.add('show');
 }
 
@@ -338,7 +347,7 @@ function makeFig(entry) {
 
   fig.addEventListener('click', () => {
     highlightTouched(fig);
-    apiLoad(curSlot, entry.bin);
+    apiLoad(curSlot, entry.bin, entry.name);
   });
   return fig;
 }
@@ -396,6 +405,7 @@ function wireScroller(scroller, sb) {
   };
   scroller.addEventListener('scroll', () => drawThumb(scroller, sb));
   window.addEventListener('orientationchange', () => setTimeout(toggle, 300));
+  window.addEventListener('resize', toggle);
   toggle();
 }
 
@@ -444,7 +454,7 @@ async function onActionTap(action) {
     setTimeout(() => btn.classList.remove('tapped'), 220);
   }
   if (curSlot === null) {
-    showToast('Tap a pad first.');
+    setStatusMessage('Tap a pad first to select a slot.', 'warn');
     return;
   }
   apiClear(curSlot);
@@ -473,19 +483,19 @@ function highlightTouched(el) {
 async function getState() {
   try {
     const s = await api('/api/state');
-    $('connDot').classList.add('ok');
-    $('connDot').classList.remove('bad');
     if (s && s.pads) refreshPads(s);
-    if (s && s.status) $('statusbar').textContent = s.status;
+    if (s && s.background && s.background !== currentBg) {
+      currentBg = s.background;
+      const bg = $('bgimg');
+      if (bg) bg.src = s.background;
+    }
     return s;
   } catch (e) {
-    $('connDot').classList.add('bad');
-    $('connDot').classList.remove('ok');
     return null;
   }
 }
 
-async function post(path, body, label) {
+async function post(path, body, successMsg) {
   try {
     const res = await fetch(path, {
       method: 'POST',
@@ -494,29 +504,45 @@ async function post(path, body, label) {
     });
     const data = await res.json();
     if (!data.ok) throw new Error(data.status || 'command failed');
-    showToast(label + (data.status ? ': ' + data.status : ''));
-    $('statusbar').textContent = data.status || '';
+    if (successMsg) {
+      setStatusMessage(successMsg, 'success');
+    }
     await getState();
   } catch (e) {
-    showToast(e.message || 'Could not reach the desktop app.');
+    setStatusMessage(e.message || 'Could not reach the desktop app.', 'error');
     setScreen('pad');
   }
 }
 
-function apiLoad(slot, bin) {
-  if (slot === null) { showToast('Tap a pad first.'); return; }
-  if (bin == null) { showToast('This entry has no tag data.'); return; }
-  post('/api/load', { slot: Number(slot), bin: Number(bin) }, 'LOAD');
+function apiLoad(slot, bin, name) {
+  if (slot === null) {
+    setStatusMessage('Tap a pad first to select a slot.', 'warn');
+    return;
+  }
+  if (bin == null) {
+    setStatusMessage('This entry has no tag data.', 'warn');
+    return;
+  }
+  const padName = getPadName(slot);
+  const charName = name || 'item';
+  post('/api/load', { slot: Number(slot), bin: Number(bin) }, `loaded "${charName}" into ${padName}`);
   setScreen('pad');
 }
 
 function apiMove(src, dest) {
-  post('/api/move', { src: Number(src), dest: Number(dest) }, 'MOVE');
+  const srcName = getPadName(src);
+  const destName = getPadName(dest);
+  post('/api/move', { src: Number(src), dest: Number(dest) }, `moved from ${srcName} to ${destName}`);
   setScreen('pad');
 }
 
 function apiClear(slot) {
-  post('/api/clear', { slot: Number(slot) }, 'CLEAR');
+  if (slot === null) {
+    setStatusMessage('Tap a pad first to select a slot.', 'warn');
+    return;
+  }
+  const padName = getPadName(slot);
+  post('/api/clear', { slot: Number(slot) }, `cleared ${padName}`);
   setScreen('pad');
 }
 
@@ -551,15 +577,22 @@ function setLoading(visible, text) {
 }
 
 async function boot() {
-  scaleStage();
-  window.addEventListener('resize', scaleStage);
+  // Reposition pads whenever the screen orientation crosses square threshold
+  portraitMQ.addEventListener('change', () => {
+    repositionPads();
+    updateFloatName();
+  });
+  window.addEventListener('resize', updateFloatName);
+  window.addEventListener('orientationchange', () => setTimeout(() => {
+    repositionPads();
+    updateFloatName();
+  }, 200));
   $('backBtn').addEventListener('click', goBack);
 
   setLoading(true, 'Connecting to LegoToypad…');
   try {
     CAT = await api('/api/catalog');
   } catch (e) {
-    $('connDot').classList.add('bad');
     setLoading(true, 'Cannot reach LegoToypad.\nIs the app running with the Web remote enabled?');
     return;
   }
@@ -567,8 +600,10 @@ async function boot() {
   $('loadingLogo').src = CAT.wordmark;
   document.title = CAT.appName || 'LegoToypad Remote';
 
+  currentBg = CAT.background;
   $('bgimg').src = CAT.background;
   $('wordmark').src = CAT.wordmark;
+  if ($('byHarrysof') && CAT.byMark) $('byHarrysof').src = CAT.byMark;
 
   buildPads();
   buildActionBar();
@@ -576,6 +611,7 @@ async function boot() {
 
   setScreen('pad');
   await getState();
+  setStatusMessage('Tap a pad to select, double-tap to browse characters');
   setTimeout(() => setLoading(false), 350);
   setInterval(getState, 3000);
 }

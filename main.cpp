@@ -3999,7 +3999,7 @@ if (changed)
 	// The live pad-state snapshot, read on the UI thread through a WebJob.
 	void BuildStateJson(WebJob& job)
 	{
-		std::string out = "{\"pads\":[";
+		std::string out = "{\"background\":\"" + IdUrl(CurrentBackgroundResourceId()) + "\",\"pads\":[";
 		for (size_t i = 0; i < 7; ++i)
 		{
 			if (i != 0)

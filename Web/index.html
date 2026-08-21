@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>LegoToypad Remote</title>
-<link rel="stylesheet" href="/style.css?v=8">
+<link rel="stylesheet" href="/style.css?v=17">
 </head>
 <body>
 <div id="stage">
@@ -18,37 +18,54 @@
   <img id="bgimg" alt="">
   <div id="topbar">
     <img id="wordmark" alt="">
-    <div id="connDot" title="Connection to desktop app"></div>
+    <img id="byHarrysof" alt="by harrysof">
   </div>
 
   <div id="padScreen" class="screen active">
-    <div id="pads"></div>
-    <div id="actionBar"></div>
+    <div class="pad-layout-wrapper">
+      <div class="pad-deck-card">
+        <div id="pads"></div>
+      </div>
+      <div class="pad-controls-card">
+        <div id="actionBar"></div>
+        <div id="statusMessage" class="status-message"></div>
+      </div>
+    </div>
   </div>
 
   <div id="franchiseScreen" class="screen">
-    <div id="franchiseTitle">PICK A WORLD</div>
-    <div id="franchiseGrid"></div>
-    <div class="scrollbar" id="franchiseScroll"><img src="" alt=""></div>
+    <div class="screen-header">
+      <div id="franchiseTitle">PICK A WORLD</div>
+    </div>
+    <div class="grid-wrapper">
+      <div id="franchiseGrid"></div>
+      <div class="scrollbar" id="franchiseScroll"><img src="" alt=""></div>
+    </div>
   </div>
 
   <div id="rosterScreen" class="screen">
-    <img id="worldLogo" alt="">
-    <div id="rosterGrid"></div>
-    <div class="scrollbar" id="rosterScroll"><img src="" alt=""></div>
+    <div class="screen-header">
+      <img id="worldLogo" alt="">
+    </div>
+    <div class="grid-wrapper">
+      <div id="rosterGrid"></div>
+      <div class="scrollbar" id="rosterScroll"><img src="" alt=""></div>
+    </div>
   </div>
 
   <div id="plusScreen" class="screen">
-    <img id="plusWorldLogo" alt="">
-    <div id="plusPanel"><div id="plusGrid"></div></div>
+    <div class="screen-header">
+      <img id="plusWorldLogo" alt="">
+    </div>
+    <div class="plus-wrapper">
+      <div id="plusPanel"><div id="plusGrid"></div></div>
+    </div>
   </div>
 
   <button id="backBtn">&#8249;</button>
   <div id="floatName"></div>
   <img id="dragGhost" class="dragGhost" alt="">
-  <div id="statusbar"></div>
-  <div id="toast"></div>
 </div>
-<script src="/app.js?v=8"></script>
+<script src="/app.js?v=17"></script>
 </body>
 </html>
