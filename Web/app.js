@@ -212,6 +212,93 @@ function repositionPads() {
   updateFloatName();
 }
 
+// --- portrait auto-crop cache ---------------------------------------------
+const portraitCropCache = new Map();
+
+function applyCroppedPortrait(imgElement, url) {
+  if (!url || url.endsWith('/0')) {
+    imgElement.src = url || '';
+    return;
+  }
+  if (portraitCropCache.has(url)) {
+    imgElement.src = portraitCropCache.get(url);
+    return;
+  }
+  imgElement.dataset.rawSrc = url;
+  imgElement.src = url;
+
+  const raw = new Image();
+  raw.crossOrigin = 'anonymous';
+  raw.onload = () => {
+    try {
+      const nw = raw.naturalWidth || 512;
+      const nh = raw.naturalHeight || 512;
+      const pw = Math.min(nw, 256);
+      const ph = Math.min(nh, 256);
+      const probeCanvas = document.createElement('canvas');
+      probeCanvas.width = pw;
+      probeCanvas.height = ph;
+      const pctx = probeCanvas.getContext('2d', { willReadFrequently: true });
+      pctx.drawImage(raw, 0, 0, pw, ph);
+      const data = pctx.getImageData(0, 0, pw, ph).data;
+
+      let minX = pw, minY = ph, maxX = -1, maxY = -1;
+      for (let y = 0; y < ph; y++) {
+        const rowOffset = y * pw * 4;
+        for (let x = 0; x < pw; x++) {
+          if (data[rowOffset + x * 4 + 3] > 24) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+
+      if (maxX < minX || maxY < minY) {
+        portraitCropCache.set(url, url);
+        return;
+      }
+
+      const scaleX = nw / pw;
+      const scaleY = nh / ph;
+      const srcX = Math.max(0, Math.floor(minX * scaleX));
+      const srcY = Math.max(0, Math.floor(minY * scaleY));
+      const srcW = Math.min(nw - srcX, Math.ceil((maxX - minX + 1) * scaleX));
+      const srcH = Math.min(nh - srcY, Math.ceil((maxY - minY + 1) * scaleY));
+
+      const outDim = 256;
+      const outCanvas = document.createElement('canvas');
+      outCanvas.width = outDim;
+      outCanvas.height = outDim;
+      const octx = outCanvas.getContext('2d');
+      // Scale art to fill 94% of the circular frame
+      const targetDim = outDim * 0.94;
+      const fitScale = Math.min(targetDim / srcW, targetDim / srcH);
+      const drawW = srcW * fitScale;
+      const drawH = srcH * fitScale;
+      const drawX = (outDim - drawW) / 2;
+      const drawY = (outDim - drawH) / 2;
+
+      octx.imageSmoothingEnabled = true;
+      octx.imageSmoothingQuality = 'high';
+      octx.drawImage(raw, srcX, srcY, srcW, srcH, drawX, drawY, drawW, drawH);
+
+      const croppedUrl = outCanvas.toDataURL('image/png');
+      portraitCropCache.set(url, croppedUrl);
+      if (imgElement.dataset.rawSrc === url) {
+        imgElement.src = croppedUrl;
+      }
+    } catch {
+      portraitCropCache.set(url, url);
+    }
+  };
+  raw.onerror = () => {
+    portraitCropCache.set(url, url);
+  };
+  raw.src = url;
+}
+
 function refreshPads(es) {
   lastState = es;
   const padsData = es.pads;
@@ -224,7 +311,11 @@ function refreshPads(es) {
     const dot = pad.querySelector('.padcdot');
 
     portrait.style.display = occupied ? 'block' : 'none';
-    portrait.src = occupied ? p.portrait : '';
+    if (occupied) {
+      applyCroppedPortrait(portrait, p.portrait);
+    } else {
+      portrait.src = '';
+    }
     portrait.style.border = occupied ? `3px solid ${p.color}` : 'none';
     portrait.style.boxShadow = occupied ? `0 0 16px ${rgba(p.color, 0.7)}` : 'none';
 
@@ -330,9 +421,9 @@ function makeFig(entry) {
   const hasPortrait = entry.portrait && !entry.portrait.endsWith('/0');
   if (hasPortrait) {
     const img = document.createElement('img');
-    img.src = entry.portrait;
     img.alt = entry.name;
     img.style.boxShadow = `0 0 12px ${rgba(entry.color, 0.55)}`;
+    applyCroppedPortrait(img, entry.portrait);
     ring.appendChild(img);
   } else {
     const letter = document.createElement('span');

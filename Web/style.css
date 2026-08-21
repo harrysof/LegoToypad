@@ -611,8 +611,8 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(clamp(84px, 14vw, 115px), 1fr));
-  gap: clamp(10px, 1.6vw, 16px) clamp(6px, 1.2vw, 12px);
+  grid-template-columns: repeat(auto-fill, minmax(clamp(96px, 22vw, 130px), 1fr));
+  gap: clamp(12px, 2vw, 18px) clamp(8px, 1.5vw, 14px);
   align-content: start;
   padding-right: 10px;
 }
@@ -620,7 +620,7 @@ body {
 #rosterGrid .rowsep {
   grid-column: 1 / -1;
   height: 1px;
-  margin: 4px 2px;
+  margin: 6px 2px;
   background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.22), transparent);
 }
 
@@ -638,8 +638,8 @@ body {
 
 .fig .ring {
   position: relative;
-  width: clamp(68px, 10vw, 86px);
-  height: clamp(68px, 10vw, 86px);
+  width: clamp(80px, 18vw, 102px);
+  height: clamp(80px, 18vw, 102px);
   margin: 0 auto;
 }
 
@@ -669,7 +669,7 @@ body {
   background: linear-gradient(180deg, rgba(23, 34, 44, 0.94), rgba(7, 11, 16, 0.96));
   box-shadow: 0 0 0 4px rgba(0, 0, 0, 0.30), 0 8px 18px rgba(0, 0, 0, 0.45);
   color: var(--fig-color, var(--cyan));
-  font-size: clamp(28px, 4vw, 36px);
+  font-size: clamp(32px, 5vw, 42px);
   font-weight: 850;
 }
 
@@ -681,12 +681,12 @@ body {
 .fig .lbl {
   margin-top: 6px;
   padding: 0 2px;
-  height: 32px;
+  min-height: 32px;
   overflow: hidden;
   color: var(--ink-soft);
-  font-size: clamp(10px, 1.4vw, 12px);
+  font-size: clamp(11px, 1.6vw, 13px);
   font-weight: 680;
-  line-height: 1.16;
+  line-height: 1.18;
 }
 
 .fig.touched .lbl {
@@ -706,7 +706,7 @@ body {
   align-items: center;
   justify-content: center;
   color: var(--ink);
-  font-size: clamp(30px, 4vw, 38px);
+  font-size: clamp(34px, 5vw, 44px);
   font-weight: 780;
 }
 
@@ -756,7 +756,7 @@ body {
   flex-wrap: wrap;
   align-items: center;
   justify-content: center;
-  gap: clamp(12px, 2vw, 24px);
+  gap: clamp(14px, 2.5vw, 28px);
 }
 
 #plusGrid .fig {
@@ -764,8 +764,8 @@ body {
 }
 
 #plusGrid .fig .ring {
-  width: clamp(66px, 9vw, 80px);
-  height: clamp(66px, 9vw, 80px);
+  width: clamp(78px, 16vw, 98px);
+  height: clamp(78px, 16vw, 98px);
 }
 
 /* Navigation button ------------------------------------------------------ */
