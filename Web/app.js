@@ -4,16 +4,17 @@
 
 'use strict';
 
-// Landscape layout: L-shape left, inverted-L right, large circle center
-// Percentages are of the deck container (aspect-ratio: 405/310)
+// Landscape layout: L-shape left (0, 3, 4), center circle (1), inverted-L right (2, 5, 6)
+// Percentages are of the deck container (aspect-ratio: 520 / 290, R = 1.793)
+// Wide, spread-apart portal layout with no cropping!
 const PAD_CELLS_LANDSCAPE = [
-  { x: 6.67,  y: 16.25,  w: 20.25, h: 25.625 }, // 0 Left - upper
-  { x: 34.32, y: 8.125,  w: 31.11, h: 39.375 }, // 1 Center (circle)
-  { x: 73.08, y: 16.25,  w: 20.25, h: 25.625 }, // 2 Right - upper
-  { x: 6.67,  y: 55.625, w: 20.25, h: 25.625 }, // 3 Left - lower outer
-  { x: 29.14, y: 55.625, w: 20.25, h: 25.625 }, // 4 Left - lower inner
-  { x: 50.62, y: 55.625, w: 20.25, h: 25.625 }, // 5 Right - lower inner
-  { x: 73.08, y: 55.625, w: 20.25, h: 25.625 }, // 6 Right - lower outer
+  { x: 4.0,   y: 12.0, w: 18.0, h: 34.0 },  // 0 Left - upper
+  { x: 37.5,  y: 8.0,  w: 25.0, h: 44.8 },  // 1 Center (circle)
+  { x: 78.0,  y: 12.0, w: 18.0, h: 34.0 },  // 2 Right - upper
+  { x: 4.0,   y: 54.0, w: 18.0, h: 36.0 },  // 3 Left - lower outer
+  { x: 24.5,  y: 54.0, w: 18.0, h: 36.0 },  // 4 Left - lower inner
+  { x: 57.5,  y: 54.0, w: 18.0, h: 36.0 },  // 5 Right - lower inner
+  { x: 78.0,  y: 54.0, w: 18.0, h: 36.0 },  // 6 Right - lower outer
 ];
 
 // Portrait layout: circle top → 2 upper pads → 4 lower pads (1 + 2 + 4 rows)

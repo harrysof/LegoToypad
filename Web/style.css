@@ -420,32 +420,46 @@ body {
 }
 
 /* Landscape Mode (phone rotated / tablet) -------------------------------- */
-@media (min-aspect-ratio: 1.05/1) and (min-height: 300px) {
+@media (min-aspect-ratio: 1.05/1) and (min-height: 250px) {
+  #topbar {
+    height: clamp(46px, 11vh, 58px);
+    padding: 0 clamp(14px, 3vw, 32px);
+  }
+
+  #wordmark {
+    height: clamp(32px, 8vh, 44px);
+  }
+
+  #byHarrysof {
+    height: clamp(18px, 4.5vh, 26px);
+  }
+
   .pad-layout-wrapper {
     flex-direction: row;
     align-items: center;
     justify-content: center;
-    gap: clamp(12px, 2.5vw, 36px);
+    gap: clamp(10px, 2vw, 28px);
     max-width: 1400px;
     margin: 0 auto;
     height: 100%;
-    padding: 8px clamp(10px, 2vw, 32px);
+    padding: clamp(4px, 1vh, 10px) clamp(10px, 2vw, 28px);
+    box-sizing: border-box;
   }
 
   /*
-    LANDSCAPE: HEIGHT-DRIVEN
-    Deck fills the full available height; width is derived from aspect-ratio.
-    This makes pads as large as possible on a rotated phone or tablet.
+    LANDSCAPE: HEIGHT-DRIVEN WIDE PORTAL
+    Deck fills the full available height; width is derived from 520/290 aspect-ratio.
+    Left L-shape wing, Center circle, and Right inverted-L wing are set apart!
   */
   .pad-deck-card {
     height: 100%;
+    max-height: 100%;
     width: auto;
     max-width: none;
-    /* Override the portrait width */
     min-width: 0;
-    flex: 0 0 auto;
-    align-self: stretch;
-    aspect-ratio: 405 / 310;
+    flex: 0 1 auto;
+    align-self: center;
+    aspect-ratio: 520 / 290;
     margin: 0;
   }
 
@@ -453,22 +467,23 @@ body {
     flex-direction: column;
     align-items: stretch;
     justify-content: center;
-    gap: 12px;
-    width: clamp(190px, 22vw, 300px);
-    max-width: 320px;
+    gap: clamp(8px, 1.5vh, 14px);
+    width: clamp(150px, 20vw, 240px);
+    max-width: 260px;
     flex-shrink: 0;
   }
 
   .actbtn {
     width: 100%;
-    height: clamp(60px, 10vh, 80px);
+    height: clamp(48px, 13vh, 66px);
   }
 
   .status-message {
     width: 100%;
     max-width: none;
-    min-height: clamp(48px, 8vh, 64px);
-    font-size: clamp(12px, 1.8vh, 14px);
+    min-height: clamp(38px, 9vh, 50px);
+    font-size: clamp(11px, 2.2vh, 13px);
+    padding: 4px 8px;
   }
 }
 
