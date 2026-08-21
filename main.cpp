@@ -2544,7 +2544,17 @@ case Screen::Settings:
 		icon.uID = kTrayIconId;
 		icon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
 		icon.uCallbackMessage = kTrayCallbackMessage;
-		icon.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
+		icon.hIcon = static_cast<HICON>(LoadImageW(
+			GetModuleHandleW(nullptr),
+			MAKEINTRESOURCEW(IDI_APP_ICON),
+			IMAGE_ICON,
+			GetSystemMetrics(SM_CXSMICON),
+			GetSystemMetrics(SM_CYSMICON),
+			LR_DEFAULTCOLOR | LR_SHARED));
+		if (!icon.hIcon)
+		{
+			icon.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
+		}
 		const wchar_t* tip = L"LEGO Dimensions Toypad Picker";
 		wcsncpy(icon.szTip, tip, std::size(icon.szTip) - 1);
 		icon.szTip[std::size(icon.szTip) - 1] = L'\0';

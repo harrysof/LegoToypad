@@ -777,18 +777,24 @@ def generate(root: Path, out_dir: Path) -> int:
         src.load()
 
         # Trim the transparent margins around the logo art before building the
-        # ICO frames. The raw logo PNG carries generous padding, and in the
-        # fixed-size tray slot that padding shrinks the visible art; cropping
-        # (with a small breathing margin) makes the icon render larger and
-        # crisper everywhere it gets downscaled.
+        # ICO frames. The raw logo PNG carries generous padding (and stray low-alpha
+        # artifact pixels that fool naive getbbox()). We use an alpha threshold
+        # to find the real artwork bounding box, crop it, and place it centered
+        # onto a square canvas with a minimal breathing margin so each ICO frame
+        # (16x16, 24x24, 32x32, 48x48, 256x256) is properly maximized and crisp.
         if src.mode not in ("RGBA", "LA"):
             src = src.convert("RGBA")
-        bbox = src.getbbox()
+        alpha = src.split()[-1]
+        mask = alpha.point(lambda p: 255 if p > 30 else 0)
+        bbox = mask.getbbox()
         if bbox:
-            margin = max(2, int(min(src.width, src.height) * 0.02))
-            adjusted = (max(0, bbox[0] - margin), max(0, bbox[1] - margin),
-                        min(src.width, bbox[2] + margin), min(src.height, bbox[3] + margin))
-            src = src.crop(adjusted)
+            cropped = src.crop(bbox)
+            max_dim = max(cropped.width, cropped.height)
+            margin = max(2, int(max_dim * 0.02))
+            canvas_dim = max_dim + margin * 2
+            square = Image.new("RGBA", (canvas_dim, canvas_dim), (0, 0, 0, 0))
+            square.paste(cropped, ((canvas_dim - cropped.width) // 2, (canvas_dim - cropped.height) // 2))
+            src = square
 
         buf = io.BytesIO()
         src.save(buf, format="ICO", sizes=[(s, s) for s in (16, 24, 32, 48, 256)])
