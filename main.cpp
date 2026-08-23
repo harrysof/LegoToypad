@@ -3920,7 +3920,7 @@ case Screen::RosterList:
 			// fixed-height overlay.
 			constexpr int kSettingsTop = 100;
 			constexpr int kSettingsPitch = 33;
-			constexpr float kSettingsIconH = 24.0f;
+			constexpr float kSettingsIconH = 30.0f;
 			for (size_t index = 0; index < rows.size(); ++index)
 			{
 				const int y = kSettingsTop + static_cast<int>(index) * kSettingsPitch;
@@ -3942,32 +3942,16 @@ case Screen::RosterList:
 				}
 			}
 
-			const int hintY = kSettingsTop + static_cast<int>(rows.size()) * kSettingsPitch + 12;
-			if (g_app.capturingShortcut)
+			// While a button is being captured the status line carries the
+			// whole conversation - what to press, and why a press was
+			// refused - so it is drawn under the list. Outside capture the
+			// rows already show every setting's value, and a leftover
+			// message there would just be noise.
+			if ((g_app.capturingShortcut || g_app.capturingBindingIndex >= 0) && !g_app.status.empty())
 			{
-				if (!g_app.shortcutCaptureArmed)
-					DrawTextLine(g, L"Release every controller button first...", 24, hintY, width - 48, RGB(255, 204, 51), 26);
-				else
-					DrawTextLine(g, L"Listening: press a controller combo, or a keyboard shortcut.", 24, hintY, width - 48, RGB(255, 204, 51), 26);
+				const int hintY = kSettingsTop + static_cast<int>(rows.size()) * kSettingsPitch + 10;
+				DrawTextLine(g, g_app.status, 24, hintY, width - 48, RGB(255, 204, 51), 26);
 			}
-			else if (g_app.capturingBindingIndex >= 0)
-			{
-				if (!g_app.shortcutCaptureArmed)
-					DrawTextLine(g, L"Release every controller button first...", 24, hintY, width - 48, RGB(255, 204, 51), 26);
-				else
-					DrawTextLine(g, std::wstring(L"Listening: press the new button for \"") +
-						kBindableActions[static_cast<size_t>(g_app.capturingBindingIndex)].label +
-						L"\" (any button or trigger, not the D-pad). " +
-						DescribeControllerMask(kShortcutCancelChord) + L" or Esc cancels.",
-						24, hintY, width - 48, RGB(255, 204, 51), 26);
-			}
-
-			// Settings is the one screen where every action's outcome is a
-			// message rather than something visible on the pads, so the
-			// status line is drawn here. Without it a rejected binding (the
-			// button is already taken, say) looks like nothing happened.
-			if (!g_app.status.empty())
-				DrawTextLine(g, g_app.status, 24, hintY + 26, width - 48, RGB(196, 214, 240), 26);
 			break;
 		}
 		}
@@ -4005,7 +3989,7 @@ case Screen::RosterList:
 		{
 			constexpr float kHintBottomInset = 18.0f;
 			constexpr float kHintGap = 8.0f;
-			constexpr float kHintYButtonH = 34.0f;
+			constexpr float kHintYButtonH = 44.0f;
 			constexpr float kHintTextH = 40.0f;
 			const float hintCenterY = height - kHintBottomInset - kHintTextH / 2.0f;
 
@@ -4272,7 +4256,12 @@ void PollController(HWND window)
 			if (!g_app.shortcutCaptureArmed)
 			{
 				if (combinedButtons == 0)
+				{
 					g_app.shortcutCaptureArmed = true;
+					g_app.status = L"Listening: press a controller combo, or a keyboard shortcut. " +
+						DescribeControllerMask(kShortcutCancelChord) + L" or Esc cancels.";
+					InvalidateRect(window, nullptr, FALSE);
+				}
 				return;
 			}
 
@@ -4304,7 +4293,14 @@ void PollController(HWND window)
 			if (!g_app.shortcutCaptureArmed)
 			{
 				if (combinedButtons == 0)
+				{
 					g_app.shortcutCaptureArmed = true;
+					g_app.status = std::wstring(L"Listening: press the new button for \"") +
+						kBindableActions[static_cast<size_t>(g_app.capturingBindingIndex)].label +
+						L"\" - any button or trigger except the D-pad. " +
+						DescribeControllerMask(kShortcutCancelChord) + L" or Esc cancels.";
+					InvalidateRect(window, nullptr, FALSE);
+				}
 				return;
 			}
 
