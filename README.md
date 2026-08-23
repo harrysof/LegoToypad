@@ -34,6 +34,10 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
   it — no action menu in between.
 - **Story mode**: switch character selection to the starter pack only (Batman,
   Gandalf The Grey, Wyldstyle, Batmobile) and skip the series grid entirely.
+- **Speaks your pad's language**: Xbox, DualSense, DualShock 4 and Switch pads
+  all work, and the button names in the UI follow whichever one is plugged in
+  (or a style you pin yourself). No controller connected is called out on
+  screen instead of leaving you guessing.
 - **No Background**: make the overlay's backdrop fully transparent so the game
   stays visible between the UI elements.
 - **Configurable everything**: toggle shortcut, confirm-button style, background
@@ -83,6 +87,12 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
 Every button in this table except the D-pad can be rebound from
 **Settings → Button - …**.
 
+Xbox, PlayStation (DualShock 3/4, DualSense) and Nintendo (Switch Pro,
+Joy-Cons) pads are all read through SDL's GameController API, and the labels in
+the UI follow the pad that is connected — see **Settings → Button labels**. When
+no controller is connected at all, the overlay says so in red across the middle
+of the window.
+
 Any connected controller works — player 1 through 4, not just the first pad.
 While the overlay is visible, a named Windows event tells the emulator to
 neutralize real controller input so the picker and the game never fight over
@@ -102,16 +112,24 @@ Press **Y / S** on the pad grid to open Settings:
 4. **Character selection** — **All series** (pick a world, then a figure) or
    **Story (starter pack only)**, which skips the series grid and shows just
    Batman, Gandalf The Grey, Wyldstyle and the Batmobile.
-5. **Button - …** — one row per action (Confirm, Back, Settings, Move active
+5. **Button labels** — **Auto** (default) names the buttons after whatever pad
+   is connected; **Xbox**, **DualSense**, **DualShock 4** and **Switch** pin one
+   style. This is naming only — every pad works either way. With several pads
+   connected at once, Auto prefers Xbox, then DualSense, DualShock 4, Switch.
+6. **Button - …** — one row per action (Confirm, Back, Settings, Move active
    pad, Quick load, Quick clear). Select a row, release every controller
    button, then press the button you want — including **LT / RT**, which the
    app reads as buttons even though the controller reports them as axes. The
    D-pad stays reserved for menu navigation, and a button already used by
    another action or by the overlay toggle is rejected with a message on the
    Settings screen. **Back+Start or Esc cancels.**
-6. **Clear all pad** — empty every slot at once (useful if the emulator reset
+7. **Clear all pad** — empty every slot at once (useful if the emulator reset
    its Toypad state out from under the app, e.g. after an emulator restart).
-7. **Web remote** — turn the phone UI on or off (see below).
+8. **Web remote** — turn the phone UI on or off (see below).
+
+The Settings screen also shows the app's status line under the list, so
+messages like "that button is already used by Back" are visible while you are
+rebinding.
 
 ## Overlay shortcut
 
@@ -243,6 +261,7 @@ you can tweak by hand or pre-configure a deployment.
 | `[Input]` | `ButtonConfirm` / `ButtonBack` / `ButtonSettings` | Raw XInput button for confirm / back / open settings (A=4096, B=8192, Y=32768) |
 | `[Input]` | `ButtonMoveActive` / `ButtonQuickLoad` / `ButtonQuickClear` | Raw XInput button for the one-press pad actions (X=16384, RB=512, LB=256). D-pad values are ignored and fall back to the default |
 | | | The triggers extend the XInput mask: **LT=65536**, **RT=131072**. They work anywhere a button value does, including `[Shortcut] ControllerMask` |
+| `[Input]` | `ButtonStyle` | `Auto` (follow the connected pad) / `Xbox` / `DualSense` / `DualShock4` / `Switch`. Labels only — every pad works either way |
 | `[Web]` | `Enabled` | `1` = serve the phone UI / `0` = no web server at all (default `1`) |
 | `[Web]` | `Port` | Port the HTTP server binds (default `8765`) |
 

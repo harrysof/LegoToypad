@@ -113,30 +113,66 @@ constexpr int kOverlayWidth = 900;
 	constexpr ButtonMask kTriggerRightButton = 0x00020000u;
 	constexpr int16_t kTriggerPressThreshold = 8000; // of SDL's 0..32767
 
+	// Which pad's labels the UI speaks. SDL reads Xbox, PlayStation and
+	// Nintendo pads through the same GameController API, so this only
+	// changes what the buttons are *called*, never what they do.
+	enum class ButtonStyle
+	{
+		Xbox,
+		DualSense,
+		DualShock4,
+		Nintendo,
+	};
+	constexpr size_t kButtonStyleCount = 4;
+
+	// Settings row values: Auto follows whatever is plugged in, the rest
+	// pin one style. Auto is index 0, so the explicit styles are offset
+	// by one (see ButtonStyleFromChoice).
+	constexpr size_t kButtonStyleChoiceCount = kButtonStyleCount + 1;
+
 	struct ButtonName
 	{
 		ButtonMask mask;
-		const wchar_t* name;
+		const wchar_t* xbox;
+		const wchar_t* dualSense;
+		const wchar_t* dualShock4;
+		// Nintendo face buttons keep their letters: SDL is asked to report
+		// them by label (SDL_GAMECONTROLLER_USE_BUTTON_LABELS), so the
+		// button printed "A" on the pad is the one the app calls A, even
+		// though it sits where an Xbox pad has B.
+		const wchar_t* nintendo;
 	};
 
 	constexpr std::array<ButtonName, 16> kButtonNames = {{
-		{XINPUT_GAMEPAD_DPAD_UP, L"D-Pad Up"},
-		{XINPUT_GAMEPAD_DPAD_DOWN, L"D-Pad Down"},
-		{XINPUT_GAMEPAD_DPAD_LEFT, L"D-Pad Left"},
-		{XINPUT_GAMEPAD_DPAD_RIGHT, L"D-Pad Right"},
-		{XINPUT_GAMEPAD_START, L"Start"},
-		{XINPUT_GAMEPAD_BACK, L"Back"},
-		{XINPUT_GAMEPAD_LEFT_THUMB, L"Left Stick Click"},
-		{XINPUT_GAMEPAD_RIGHT_THUMB, L"Right Stick Click"},
-		{XINPUT_GAMEPAD_LEFT_SHOULDER, L"LB"},
-		{XINPUT_GAMEPAD_RIGHT_SHOULDER, L"RB"},
-		{kTriggerLeftButton, L"LT"},
-		{kTriggerRightButton, L"RT"},
-		{XINPUT_GAMEPAD_A, L"A"},
-		{XINPUT_GAMEPAD_B, L"B"},
-		{XINPUT_GAMEPAD_X, L"X"},
-		{XINPUT_GAMEPAD_Y, L"Y"},
+		{XINPUT_GAMEPAD_DPAD_UP, L"D-Pad Up", L"D-Pad Up", L"D-Pad Up", L"D-Pad Up"},
+		{XINPUT_GAMEPAD_DPAD_DOWN, L"D-Pad Down", L"D-Pad Down", L"D-Pad Down", L"D-Pad Down"},
+		{XINPUT_GAMEPAD_DPAD_LEFT, L"D-Pad Left", L"D-Pad Left", L"D-Pad Left", L"D-Pad Left"},
+		{XINPUT_GAMEPAD_DPAD_RIGHT, L"D-Pad Right", L"D-Pad Right", L"D-Pad Right", L"D-Pad Right"},
+		{XINPUT_GAMEPAD_START, L"Start", L"Options", L"Options", L"+"},
+		{XINPUT_GAMEPAD_BACK, L"Back", L"Create", L"Share", L"-"},
+		{XINPUT_GAMEPAD_LEFT_THUMB, L"Left Stick Click", L"L3", L"L3", L"Left Stick Click"},
+		{XINPUT_GAMEPAD_RIGHT_THUMB, L"Right Stick Click", L"R3", L"R3", L"Right Stick Click"},
+		{XINPUT_GAMEPAD_LEFT_SHOULDER, L"LB", L"L1", L"L1", L"L"},
+		{XINPUT_GAMEPAD_RIGHT_SHOULDER, L"RB", L"R1", L"R1", L"R"},
+		{kTriggerLeftButton, L"LT", L"L2", L"L2", L"ZL"},
+		{kTriggerRightButton, L"RT", L"R2", L"R2", L"ZR"},
+		{XINPUT_GAMEPAD_A, L"A", L"Cross", L"Cross", L"A"},
+		{XINPUT_GAMEPAD_B, L"B", L"Circle", L"Circle", L"B"},
+		{XINPUT_GAMEPAD_X, L"X", L"Square", L"Square", L"X"},
+		{XINPUT_GAMEPAD_Y, L"Y", L"Triangle", L"Triangle", L"Y"},
 	}};
+
+	const wchar_t* ButtonNameFor(const ButtonName& entry, ButtonStyle style)
+	{
+		switch (style)
+		{
+		case ButtonStyle::DualSense: return entry.dualSense;
+		case ButtonStyle::DualShock4: return entry.dualShock4;
+		case ButtonStyle::Nintendo: return entry.nintendo;
+		case ButtonStyle::Xbox: break;
+		}
+		return entry.xbox;
+	}
 
 	// The D-pad is reserved for menu navigation and can never be rebound;
 	// the rest of the picker's own buttons live in kBindableActions and are
@@ -236,6 +272,13 @@ bool swapConfirmBackButtons = false;
 		// Index into kBindableActions while capturing a new button for one
 		// of them from Settings; -1 when no binding capture is running.
 		int capturingBindingIndex = -1;
+		// Which pad's button labels the UI uses. 0 = Auto (follow whatever
+		// is connected), 1..4 = pinned to one style.
+		size_t buttonStyleChoice = 0;
+		// Live controller facts, refreshed by every controller poll: what
+		// Auto resolves to, and whether anything is plugged in at all.
+		ButtonStyle detectedButtonStyle = ButtonStyle::Xbox;
+		bool controllerConnected = false;
 		// Web remote: the built-in HTTP server that lets the same tag library
 		// be driven from a phone browser on the local network. Runs on its own
 		// thread; requests that touch app state are marshaled back to the
@@ -293,10 +336,32 @@ bool swapConfirmBackButtons = false;
 		{L"Quick clear", L"ButtonQuickClear", &AppState::buttonQuickClear},
 	}};
 
-	// Settings rows: shortcut, confirm style, background, story mode, one
-	// rebind row per kBindableActions entry, clear all pads, web remote.
-	constexpr size_t kSettingsBindingFirst = 4;
+	// Settings rows: shortcut, confirm style, background, story mode,
+	// button labels, one rebind row per kBindableActions entry, clear all
+	// pads, web remote.
+	constexpr size_t kSettingsBindingFirst = 5;
 	constexpr size_t kSettingsItemCount = kSettingsBindingFirst + kBindableActions.size() + 2;
+
+	// Auto resolves to the connected pad's own style; a pinned choice wins
+	// over detection entirely.
+	ButtonStyle EffectiveButtonStyle()
+	{
+		if (g_app.buttonStyleChoice == 0)
+			return g_app.detectedButtonStyle;
+		return static_cast<ButtonStyle>(std::min(g_app.buttonStyleChoice, kButtonStyleCount) - 1);
+	}
+
+	std::wstring ButtonStyleName(ButtonStyle style)
+	{
+		switch (style)
+		{
+		case ButtonStyle::DualSense: return L"DualSense";
+		case ButtonStyle::DualShock4: return L"DualShock 4";
+		case ButtonStyle::Nintendo: return L"Switch";
+		case ButtonStyle::Xbox: break;
+		}
+		return L"Xbox";
+	}
 
 	// Every button the picker itself currently reacts to while the overlay
 	// is open. A toggle shortcut made up of only these would fight normal
@@ -1339,6 +1404,45 @@ void UpdateInputOwnership(HWND window);
 		g.DrawString(text.c_str(), -1, &font, rect, &format, &brush);
 	}
 
+	// A pill with a button's name in it, for hints about buttons the
+	// bundled Xbox glyph can't stand in for (a PlayStation/Switch label, or
+	// a rebound action). The rim follows the pad style so the hint still
+	// reads as "this pad's button" at a glance.
+	COLORREF ButtonStyleAccent(ButtonStyle style)
+	{
+		switch (style)
+		{
+		case ButtonStyle::DualSense: return RGB(90, 150, 224);
+		case ButtonStyle::DualShock4: return RGB(52, 108, 196);
+		case ButtonStyle::Nintendo: return RGB(230, 60, 60);
+		case ButtonStyle::Xbox: break;
+		}
+		return RGB(96, 180, 118);
+	}
+
+	void DrawButtonBadge(Gdiplus::Graphics& g, const std::wstring& label,
+		float x, float y, float w, float h)
+	{
+		const Gdiplus::RectF rect(x, y, w, h);
+		Gdiplus::GraphicsPath path;
+		AddRoundedRectPath(path, rect, h / 2.0f);
+
+		Gdiplus::SolidBrush fill(Gdiplus::Color(226, 22, 27, 38));
+		g.FillPath(&fill, &path);
+
+		const COLORREF accent = ButtonStyleAccent(EffectiveButtonStyle());
+		Gdiplus::Pen rim(ToGdiPlusColor(accent, 220), 2.0f);
+		rim.SetLineJoin(Gdiplus::LineJoinRound);
+		g.DrawPath(&rim, &path);
+
+		Gdiplus::Font font = MakeUIFont(20.0f);
+		Gdiplus::SolidBrush text(Gdiplus::Color(255, 240, 244, 250));
+		Gdiplus::StringFormat format(Gdiplus::StringFormatFlagsNoWrap);
+		format.SetAlignment(Gdiplus::StringAlignmentCenter);
+		format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+		g.DrawString(label.c_str(), -1, &font, rect, &format, &text);
+	}
+
 	std::filesystem::path GetExecutableDirectory()
 	{
 		std::array<wchar_t, 32768> path{};
@@ -1466,6 +1570,11 @@ void UpdateInputOwnership(HWND window);
 			"ButtonMoveActive=16384\n"
 			"ButtonQuickLoad=512\n"
 			"ButtonQuickClear=256\n"
+			"; ButtonStyle names the buttons in the UI: Auto | Xbox | DualSense |\n"
+			"; DualShock4 | Switch. Auto follows the connected pad (Xbox wins when\n"
+			"; several are plugged in). This is labels only - every pad works either\n"
+			"; way, and the values above stay raw XInput numbers.\n"
+			"ButtonStyle=Auto\n"
 			"\n"
 			"[Web]\n"
 			"; Web remote serves the same Toypad UI to a phone browser on your local\n"
@@ -1486,6 +1595,7 @@ void UpdateInputOwnership(HWND window);
 	{
 		if (mask == 0)
 			return L"(none)";
+		const ButtonStyle style = EffectiveButtonStyle();
 		std::wstring result;
 		for (const auto& entry : kButtonNames)
 		{
@@ -1493,7 +1603,7 @@ void UpdateInputOwnership(HWND window);
 			{
 				if (!result.empty())
 					result += L" + ";
-				result += entry.name;
+				result += ButtonNameFor(entry, style);
 			}
 		}
 		return result.empty() ? L"(unrecognized)" : result;
@@ -1566,6 +1676,41 @@ void UpdateInputOwnership(HWND window);
 		return g_app.storyMode ? L"Story (starter pack only)" : L"All series";
 	}
 
+	std::wstring DescribeButtonStyle()
+	{
+		if (g_app.buttonStyleChoice != 0)
+			return ButtonStyleName(EffectiveButtonStyle());
+		if (!g_app.controllerConnected)
+			return L"Auto (no controller, showing " + ButtonStyleName(g_app.detectedButtonStyle) + L")";
+		return L"Auto (" + ButtonStyleName(g_app.detectedButtonStyle) + L")";
+	}
+
+	// Persisted as a name rather than an index so the file stays readable
+	// and a new style in the middle of the list can't silently reinterpret
+	// an existing setting.
+	const wchar_t* ButtonStyleIniValue(size_t choice)
+	{
+		switch (choice)
+		{
+		case 1: return L"Xbox";
+		case 2: return L"DualSense";
+		case 3: return L"DualShock4";
+		case 4: return L"Switch";
+		default: break;
+		}
+		return L"Auto";
+	}
+
+	size_t ButtonStyleChoiceFromIni(const wchar_t* value)
+	{
+		for (size_t choice = 1; choice < kButtonStyleChoiceCount; ++choice)
+		{
+			if (_wcsicmp(value, ButtonStyleIniValue(choice)) == 0)
+				return choice;
+		}
+		return 0; // Auto, including anything unrecognized
+	}
+
 	// backgroundIndex == kBackgroundChoiceCount is the extra "No Background"
 	// choice appended after the bundled wallpapers: nothing is drawn behind
 	// the UI and those pixels become transparent (see ApplyOverlayTransparency).
@@ -1625,6 +1770,8 @@ void UpdateInputOwnership(HWND window);
 			std::to_wstring(ClampBackgroundIndex(g_app.backgroundIndex)).c_str(), iniPath.c_str());
 		WritePrivateProfileStringW(L"Input", L"StoryMode",
 			g_app.storyMode ? L"1" : L"0", iniPath.c_str());
+		WritePrivateProfileStringW(L"Input", L"ButtonStyle",
+			ButtonStyleIniValue(g_app.buttonStyleChoice), iniPath.c_str());
 		for (const auto& action : kBindableActions)
 			WritePrivateProfileStringW(L"Input", action.iniKey,
 				std::to_wstring(g_app.*(action.button)).c_str(), iniPath.c_str());
@@ -1639,6 +1786,10 @@ void UpdateInputOwnership(HWND window);
 			GetPrivateProfileIntW(L"Input", L"BackgroundIndex", 0, iniPath.c_str())));
 		g_app.storyMode =
 			GetPrivateProfileIntW(L"Input", L"StoryMode", 0, iniPath.c_str()) != 0;
+		std::array<wchar_t, 32> styleBuffer{};
+		GetPrivateProfileStringW(L"Input", L"ButtonStyle", L"Auto", styleBuffer.data(),
+			static_cast<DWORD>(styleBuffer.size()), iniPath.c_str());
+		g_app.buttonStyleChoice = ButtonStyleChoiceFromIni(styleBuffer.data());
 		// A hand-edited value falls back to the built-in default when it is
 		// unset (0) or a D-pad button, and is dropped entirely (leaving the
 		// action unbound, shown as "(none)" in Settings) when it collides
@@ -1662,6 +1813,13 @@ void UpdateInputOwnership(HWND window);
 		g_app.storyMode = !g_app.storyMode;
 		SaveInputSettingsToIni();
 		g_app.status = L"Character selection: " + DescribeStoryMode();
+	}
+
+	void CycleButtonStyle()
+	{
+		g_app.buttonStyleChoice = (g_app.buttonStyleChoice + 1) % kButtonStyleChoiceCount;
+		SaveInputSettingsToIni();
+		g_app.status = L"Button labels: " + DescribeButtonStyle();
 	}
 
 	void ToggleConfirmButtonMode()
@@ -2601,6 +2759,8 @@ case Screen::Settings:
 				CycleBackgroundChoice();
 			else if (g_app.settingsIndex == 3)
 				ToggleStoryMode();
+			else if (g_app.settingsIndex == 4)
+				CycleButtonStyle();
 			else if (g_app.settingsIndex >= kSettingsBindingFirst &&
 				g_app.settingsIndex < kSettingsBindingFirst + kBindableActions.size())
 				BeginBindingCapture(g_app.settingsIndex - kSettingsBindingFirst);
@@ -3631,23 +3791,25 @@ case Screen::RosterList:
 			rows.push_back(L"Confirm button: " + DescribeConfirmButtonMode());
 			rows.push_back(L"Background: " + DescribeBackgroundChoice());
 			rows.push_back(L"Character selection: " + DescribeStoryMode());
+			rows.push_back(L"Button labels: " + DescribeButtonStyle());
 			for (const auto& action : kBindableActions)
 				rows.push_back(std::wstring(L"Button - ") + action.label + L": " +
 					DescribeControllerMask(g_app.*(action.button)));
 			rows.push_back(L"Clear all pad");
 			rows.push_back(L"Web remote: " + DescribeWebRemote());
 
-			// 36px pitch (down from 40) so the grown list plus the capture
-			// hints below still fit the fixed-height overlay.
+			// 34px pitch (down from the original 40) so the grown list plus
+			// the capture hint and status line below still fit the
+			// fixed-height overlay.
 			constexpr int kSettingsTop = 100;
-			constexpr int kSettingsPitch = 36;
+			constexpr int kSettingsPitch = 34;
 			for (size_t index = 0; index < rows.size(); ++index)
 			{
 				const int y = kSettingsTop + static_cast<int>(index) * kSettingsPitch;
 				const bool selected = index == g_app.settingsIndex;
 				if (selected)
 				{
-					RECT selection{18, y - 2, width - 18, y + 32};
+					RECT selection{18, y - 2, width - 18, y + 30};
 					HBRUSH brush = CreateSolidBrush(RGB(36, 99, 170));
 					FillRect(dc, &selection, brush);
 					DeleteObject(brush);
@@ -3670,7 +3832,8 @@ case Screen::RosterList:
 				else
 					DrawTextLine(g, std::wstring(L"Listening: press the new button for \"") +
 						kBindableActions[static_cast<size_t>(g_app.capturingBindingIndex)].label +
-						L"\" (any button or trigger, not the D-pad). Back+Start or Esc cancels.",
+						L"\" (any button or trigger, not the D-pad). " +
+						DescribeControllerMask(kShortcutCancelChord) + L" or Esc cancels.",
 						24, hintY, width - 48, RGB(255, 204, 51), 26);
 			}
 
@@ -3710,9 +3873,11 @@ case Screen::RosterList:
 			}
 		}
 
-		// Settings hint in the bottom-right corner: the Y button glyph next
-		// to the "settings" label, telling the user how to reach settings
-		// from the toypad view.
+		// Settings hint in the bottom-right corner: the button that opens
+		// Settings, next to the "settings" label. The bundled glyph is an
+		// Xbox Y, so it is only drawn while it still tells the truth - Xbox
+		// labels, Settings still bound to Y. Any other pad style, or a
+		// rebound Settings button, gets a badge with that button's own name.
 		if (g_app.screen == Screen::PadViewer)
 		{
 			constexpr float kHintBottomInset = 18.0f;
@@ -3725,13 +3890,23 @@ case Screen::RosterList:
 			Gdiplus::Bitmap* settingsText = GetAssetBitmap(kSettingsTextResourceId);
 			if (yButton && settingsText)
 			{
-				const float yButtonW = yButton->GetWidth() * (kHintYButtonH / yButton->GetHeight());
+				const bool useGlyph = EffectiveButtonStyle() == ButtonStyle::Xbox &&
+					g_app.buttonSettings == XINPUT_GAMEPAD_Y;
+				const std::wstring badgeLabel = DescribeControllerMask(g_app.buttonSettings);
+				const float yButtonW = useGlyph
+					? yButton->GetWidth() * (kHintYButtonH / yButton->GetHeight())
+					: MeasureTextWidth(g, badgeLabel, 20.0f) + 26.0f;
 				const float textW = settingsText->GetWidth() * (kHintTextH / settingsText->GetHeight());
 				const float totalW = yButtonW + kHintGap + textW;
 				const float originX = width - kTopMargin - totalW;
 				const float textX = originX + yButtonW + kHintGap;
 
-				if (Gdiplus::Bitmap* cachedY = RenderScaledAsset(
+				if (!useGlyph)
+				{
+					DrawButtonBadge(g, badgeLabel, originX, hintCenterY - kHintYButtonH / 2.0f,
+						yButtonW, kHintYButtonH);
+				}
+				else if (Gdiplus::Bitmap* cachedY = RenderScaledAsset(
 					kYButtonResourceId, static_cast<int>(yButtonW), static_cast<int>(kHintYButtonH), 0))
 				{
 					g.DrawImage(cachedY, originX, hintCenterY - kHintYButtonH / 2.0f);
@@ -3744,6 +3919,30 @@ case Screen::RosterList:
 			}
 		}
 
+		// Nothing in the picker can be driven without a pad, so an empty
+		// controller list is called out over whatever screen is up. Drawn
+		// last so it sits on top of everything, on a plate because "No
+		// Background" leaves the game itself behind the text.
+		if (!g_app.controllerConnected)
+		{
+			const std::wstring warning = L"Connect a controller!";
+			constexpr float kWarningPx = 38.0f;
+			const float warningW = MeasureTextWidth(g, warning, kWarningPx);
+			const Gdiplus::RectF plate((width - warningW) / 2.0f - 26.0f,
+				height / 2.0f - 32.0f, warningW + 52.0f, 64.0f);
+			Gdiplus::GraphicsPath platePath;
+			AddRoundedRectPath(platePath, plate, 14.0f);
+			Gdiplus::SolidBrush plateFill(Gdiplus::Color(170, 8, 10, 16));
+			g.FillPath(&plateFill, &platePath);
+
+			Gdiplus::Font warningFont = MakeUIFont(kWarningPx);
+			Gdiplus::SolidBrush warningBrush(ToGdiPlusColor(RGB(236, 64, 64)));
+			Gdiplus::StringFormat warningFormat(Gdiplus::StringFormatFlagsNoWrap);
+			warningFormat.SetAlignment(Gdiplus::StringAlignmentCenter);
+			warningFormat.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+			g.DrawString(warning.c_str(), -1, &warningFont, plate, &warningFormat, &warningBrush);
+		}
+
 		BitBlt(windowDC, 0, 0, width, height, dc, 0, 0, SRCCOPY);
 
 		EndPaint(window, &paint);
@@ -3752,6 +3951,48 @@ case Screen::RosterList:
 	// ---------------------------------------------------------------------
 	// Input polling
 	// ---------------------------------------------------------------------
+
+	// SDL knows what each pad actually is, so Auto never has to guess from
+	// button counts or names. Anything unrecognized (generic HID pads, the
+	// virtual pads some remote-play tools expose) reads as Xbox, which is
+	// also what SDL's own default mapping is modelled on.
+	ButtonStyle StyleForController(SDL_GameController* controller)
+	{
+		switch (SDL_GameControllerGetType(controller))
+		{
+		case SDL_CONTROLLER_TYPE_PS5:
+			return ButtonStyle::DualSense;
+		case SDL_CONTROLLER_TYPE_PS4:
+		case SDL_CONTROLLER_TYPE_PS3:
+			return ButtonStyle::DualShock4;
+		case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+		case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+		case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+		case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+#endif
+			return ButtonStyle::Nintendo;
+		default:
+			break;
+		}
+		return ButtonStyle::Xbox;
+	}
+
+	// With several pads plugged in at once the labels have to pick one, so
+	// they follow this order. Xbox first because its labels are the ones
+	// every other pad's owner can still read (and the app's own art is an
+	// Xbox glyph); the rest simply fall in a stable order after it.
+	int ButtonStylePriority(ButtonStyle style)
+	{
+		switch (style)
+		{
+		case ButtonStyle::Xbox: return 0;
+		case ButtonStyle::DualSense: return 1;
+		case ButtonStyle::DualShock4: return 2;
+		case ButtonStyle::Nintendo: return 3;
+		}
+		return 4;
+	}
 
 void PollController(HWND window)
 	{
@@ -3764,6 +4005,7 @@ void PollController(HWND window)
 		{
 			SDL_GameController* handle = nullptr;
 			ButtonMask previousButtons = 0;
+			ButtonStyle style = ButtonStyle::Xbox; // resolved once, when opened
 		};
 		static std::unordered_map<SDL_JoystickID, ControllerState> controllers;
 		static ButtonMask previousCombinedButtons = 0;
@@ -3788,7 +4030,8 @@ void PollController(HWND window)
 					SDL_GameControllerClose(controller);
 					continue;
 				}
-				controllers[instanceId] = ControllerState{controller, 0};
+				controllers[instanceId] =
+					ControllerState{controller, 0, StyleForController(controller)};
 			}
 			else if (event.type == SDL_CONTROLLERDEVICEREMOVED)
 			{
@@ -3805,6 +4048,8 @@ void PollController(HWND window)
 		UpdateInputOwnership(window);
 
 		bool anyConnected = false;
+		ButtonStyle bestStyle = ButtonStyle::Xbox;
+		int bestStylePriority = ButtonStylePriority(ButtonStyle::Nintendo) + 1;
 		ButtonMask combinedButtons = 0;
 		ButtonMask combinedPressed = 0;
 		bool stickUp = false;
@@ -3864,6 +4109,11 @@ void PollController(HWND window)
 			const int16_t leftY = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY);
 
 			anyConnected = true;
+			if (ButtonStylePriority(state.style) < bestStylePriority)
+			{
+				bestStylePriority = ButtonStylePriority(state.style);
+				bestStyle = state.style;
+			}
 			combinedButtons |= buttons;
 			combinedPressed |= buttons & ~state.previousButtons;
 			if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || leftY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
@@ -3878,6 +4128,20 @@ void PollController(HWND window)
 		}
 		const ButtonMask previousCombined = previousCombinedButtons;
 		previousCombinedButtons = combinedButtons;
+
+		// Live controller facts drive the "Connect a controller!" warning and
+		// Auto button labels, so they are refreshed before any of the early
+		// returns below - including the one taken when nothing is connected,
+		// which is exactly when the warning has to appear.
+		if (g_app.controllerConnected != anyConnected ||
+			(anyConnected && g_app.detectedButtonStyle != bestStyle))
+		{
+			g_app.controllerConnected = anyConnected;
+			if (anyConnected)
+				g_app.detectedButtonStyle = bestStyle;
+			if (g_app.overlayVisible)
+				InvalidateRect(window, nullptr, FALSE);
+		}
 
 		// -------------------------------------------------------------
 		// Shortcut capture takes over completely while active.
@@ -5136,6 +5400,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	// joystick subsystem. If SDL itself fails to start, clean up what was
 	// already initialized and bail non-zero, mirroring the CreateWindowExW
 	// failure path below.
+	// SDL already speaks Xbox, PlayStation and Nintendo pads through its
+	// HIDAPI drivers; these hints just make that explicit rather than
+	// relying on the defaults staying put, pair loose Joy-Cons into a
+	// single controller, and ask for Nintendo face buttons by their printed
+	// label (so the button marked A is the one this app calls A). Hint
+	// names are passed as strings: an SDL build without one of them
+	// ignores it instead of failing to compile.
+	SDL_SetHint("SDL_JOYSTICK_HIDAPI", "1");
+	SDL_SetHint("SDL_JOYSTICK_HIDAPI_PS3", "1");
+	SDL_SetHint("SDL_JOYSTICK_HIDAPI_PS4", "1");
+	SDL_SetHint("SDL_JOYSTICK_HIDAPI_PS5", "1");
+	SDL_SetHint("SDL_JOYSTICK_HIDAPI_SWITCH", "1");
+	SDL_SetHint("SDL_JOYSTICK_HIDAPI_JOY_CONS", "1");
+	SDL_SetHint("SDL_JOYSTICK_HIDAPI_COMBINE_JOY_CONS", "1");
+	SDL_SetHint("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "1");
+
 	if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0)
 	{
 		Gdiplus::GdiplusShutdown(g_gdiplusToken);
@@ -5164,6 +5444,7 @@ g_app.status = std::to_wstring(embeddedTags) +
 		L" | Toggle: " + DescribeShortcut() +
 		L" | Confirm: " + DescribeConfirmButtonMode() +
 		L" | Background: " + DescribeBackgroundChoice() +
+		L" | Buttons: " + DescribeButtonStyle() +
 		L" | Web remote: " + (g_app.webEnabled ? L"on" : L"off");
 
 	g_inputOwnershipEvent = CreateEventW(nullptr, TRUE, FALSE, kLegoToypadInputEvent);
