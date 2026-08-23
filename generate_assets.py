@@ -41,8 +41,8 @@ APP_ICON_ID = 100
 # Version metadata stamped into the exe's VERSIONINFO resource. Bump these
 # together with the release tag; the comma form is what rc.exe's
 # FILEVERSION/PRODUCTVERSION statements require.
-APP_VERSION = "1.3.0"
-APP_VERSION_COMMA = "1,3,0,0"
+APP_VERSION = "1.5.0"
+APP_VERSION_COMMA = "1,5,0,0"
 APP_COMPANY = "HarrysofXD"
 APP_DESCRIPTION = "Controller-driven LEGO Dimensions Toypad companion for Cemu and Rpcs3"
 

@@ -63,7 +63,7 @@ constexpr int kOverlayWidth = 900;
 	// dark enough that no UI element ever produces this exact value itself.
 	constexpr COLORREF kNoBackgroundColorKey = RGB(8, 0, 8);
 	constexpr int kWindowCornerRadius = 6;
-	constexpr wchar_t kAppVersion[] = L"1.3.0";
+	constexpr wchar_t kAppVersion[] = L"1.5.0";
 
 	// Tray icon / menu.
 	constexpr UINT kTrayCallbackMessage = WM_APP + 1;

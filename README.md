@@ -41,8 +41,9 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
 - **No Background**: make the overlay's backdrop fully transparent so the game
   stays visible between the UI elements.
 - **Configurable everything**: toggle shortcut, confirm-button style, background
-  selection, story mode, and a rebindable button for every picker action all
-  live in the in-app Settings screen.
+  selection, story mode, button-icon style and a rebindable button for every
+  picker action all live in the in-app Settings screen — with a one-row reset
+  back to the defaults.
 
 ## Screenshots
 
@@ -60,8 +61,8 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
 1. Launch the exe: it sits in the tray and stays hidden until triggered. A toast
    on first run tells you the toggle shortcut.
 2. Press the toggle shortcut (default: controller **Back**) to show the overlay.
-3. On the pad screen you'll see the 7 Toypad slots. A "Y / Settings" hint in the
-   bottom-right corner reminds you how to reach Settings.
+3. On the pad screen you'll see the 7 Toypad slots. A hint in the bottom-right
+   corner shows the button that opens Settings, drawn as your own pad's button.
 4. With a pad focused you can act on it in one press: **X** picks its figure up
    for a move, **RB** goes straight to figure selection, **LB** clears it.
 5. Or pick a pad and confirm to get its action menu:
@@ -134,9 +135,9 @@ Press **Y / S** on the pad grid to open Settings:
    default bindings. The listener and web-remote *ports* are left alone, since
    those live only in `LegoToypad.ini`.
 
-The Settings screen also shows the app's status line under the list, so
-messages like "that button is already used by Back" are visible while you are
-rebinding.
+While a button is being captured, the line under the list tells you what to
+press and why a press was refused ("that button is already used by Back"), so
+rebinding never fails silently.
 
 ## Overlay shortcut
 
@@ -188,9 +189,10 @@ Regenerating the embedded assets happens automatically on every build
 (`generate_assets.py` walks the `All Bin Files` + `Assets` folders and emits
 `resources.rc`, `GeneratedAssetTable.{h,cpp}` and `app.ico` into `build\generated`).
 The `Assets` tree is organized into category folders — `Wallpapers` (backgrounds),
-`Pads` (the 7 Toypad slot art), `Tiles`, `Buttons`, `Branding` and `Fonts` — and
-the generator gathers them recursively, so drop a file in the right folder and
-rebuild. Legacy art in `Assets/Old` is skipped.
+`Pads` (the 7 Toypad slot art), `Tiles`, `Buttons`, `ControllerIcons` (one folder
+per pad style, one PNG per button — see `Assets/ControllerIcons/SOURCES.md`),
+`Branding` and `Fonts` — and the generator gathers them recursively, so drop a
+file in the right folder and rebuild. Legacy art in `Assets/Old` is skipped.
 The script only rewrites a file when its content changes, so incremental builds
 don't recompile the resources unnecessarily. Add or change a `.bin`/`.png` in
 the source folders and just rebuild - no manual step.
@@ -215,7 +217,7 @@ mkdir dist
 copy build\Release\LegoToypad.exe dist\
 copy LegoToypad.ini dist\
 copy README.md dist\
-Compress-Archive -Path dist\* -DestinationPath LegoToypad-v1.3.0-win64.zip
+Compress-Archive -Path dist\* -DestinationPath LegoToypad-v1.5.0-win64.zip
 ```
 
 The exe carries the full tag library and all images inside it - there is
@@ -226,15 +228,15 @@ nothing else to bundle.
 ```powershell
 git add -A
 git commit -m "Describe changes here"
-git tag v1.3.0
+git tag v1.5.0
 git push origin main --tags
 ```
 
 Then, with the `gh` CLI:
 
 ```powershell
-gh release create v1.3.0 LegoToypad-v1.3.0-win64.zip `
-  --title "LegoToypad v1.3.0" `
+gh release create v1.5.0 LegoToypad-v1.5.0-win64.zip `
+  --title "LegoToypad v1.5.0" `
   --notes "Self-contained single exe with embedded tag library and artwork; franchise browsing with glossy pads and portraits."
 ```
 
