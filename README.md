@@ -76,9 +76,9 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
 | A / Enter | Select / confirm |
 | B / Escape | Back |
 | Y / S | Open settings (from the pad grid) |
-| X | Pick the focused pad's figure up and move it (from the pad grid) |
-| RB | Load a figure onto the focused pad (straight to selection) |
-| LB | Clear the focused pad |
+| X / M | Pick the focused pad's figure up and move it (from the pad grid) |
+| RB / L | Load a figure onto the focused pad (straight to selection) |
+| LB / C | Clear the focused pad |
 
 Every button in this table except the D-pad can be rebound from
 **Settings → Button - …**.

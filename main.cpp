@@ -4872,6 +4872,30 @@ if (changed)
 				if (g_app.screen == Screen::PadViewer)
 					g_app.screen = Screen::Settings;
 				break;
+			// Keyboard equivalents of the one-press pad actions bound to
+			// X / RB / LB on a controller.
+			case 'M':
+				if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
+					BeginMoveFromSelectedPad();
+				break;
+			case 'L':
+				if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
+				{
+					if (g_app.storyMode)
+						OpenStoryRoster();
+					else
+						OpenFranchiseList();
+				}
+				break;
+			case 'C':
+				if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
+				{
+					if (g_app.padState[g_app.slotIndex].occupied)
+						ClearSlot(g_app.slotIndex, true);
+					else
+						g_app.status = L"There is nothing tracked on that pad to clear.";
+				}
+				break;
 			}
 			InvalidateRect(window, nullptr, FALSE);
 			return 0;
