@@ -116,14 +116,15 @@ constexpr int kOverlayWidth = 900;
 	// Which pad's labels the UI speaks. SDL reads Xbox, PlayStation and
 	// Nintendo pads through the same GameController API, so this only
 	// changes what the buttons are *called*, never what they do.
+	// Order matches the style order of kControllerIconResourceIds, so a
+	// style doubles as the row index into the bundled icon table.
 	enum class ButtonStyle
 	{
 		Xbox,
-		DualSense,
 		DualShock4,
 		Nintendo,
 	};
-	constexpr size_t kButtonStyleCount = 4;
+	constexpr size_t kButtonStyleCount = 3;
 
 	// Settings row values: Auto follows whatever is plugged in, the rest
 	// pin one style. Auto is index 0, so the explicit styles are offset
@@ -134,7 +135,6 @@ constexpr int kOverlayWidth = 900;
 	{
 		ButtonMask mask;
 		const wchar_t* xbox;
-		const wchar_t* dualSense;
 		const wchar_t* dualShock4;
 		// Nintendo face buttons keep their letters: SDL is asked to report
 		// them by label (SDL_GAMECONTROLLER_USE_BUTTON_LABELS), so the
@@ -143,35 +143,46 @@ constexpr int kOverlayWidth = 900;
 		const wchar_t* nintendo;
 	};
 
+	// Order matches the button order of kControllerIconResourceIds, so an
+	// entry's index here is also its column in the bundled icon table.
 	constexpr std::array<ButtonName, 16> kButtonNames = {{
-		{XINPUT_GAMEPAD_DPAD_UP, L"D-Pad Up", L"D-Pad Up", L"D-Pad Up", L"D-Pad Up"},
-		{XINPUT_GAMEPAD_DPAD_DOWN, L"D-Pad Down", L"D-Pad Down", L"D-Pad Down", L"D-Pad Down"},
-		{XINPUT_GAMEPAD_DPAD_LEFT, L"D-Pad Left", L"D-Pad Left", L"D-Pad Left", L"D-Pad Left"},
-		{XINPUT_GAMEPAD_DPAD_RIGHT, L"D-Pad Right", L"D-Pad Right", L"D-Pad Right", L"D-Pad Right"},
-		{XINPUT_GAMEPAD_START, L"Start", L"Options", L"Options", L"+"},
-		{XINPUT_GAMEPAD_BACK, L"Back", L"Create", L"Share", L"-"},
-		{XINPUT_GAMEPAD_LEFT_THUMB, L"Left Stick Click", L"L3", L"L3", L"Left Stick Click"},
-		{XINPUT_GAMEPAD_RIGHT_THUMB, L"Right Stick Click", L"R3", L"R3", L"Right Stick Click"},
-		{XINPUT_GAMEPAD_LEFT_SHOULDER, L"LB", L"L1", L"L1", L"L"},
-		{XINPUT_GAMEPAD_RIGHT_SHOULDER, L"RB", L"R1", L"R1", L"R"},
-		{kTriggerLeftButton, L"LT", L"L2", L"L2", L"ZL"},
-		{kTriggerRightButton, L"RT", L"R2", L"R2", L"ZR"},
-		{XINPUT_GAMEPAD_A, L"A", L"Cross", L"Cross", L"A"},
-		{XINPUT_GAMEPAD_B, L"B", L"Circle", L"Circle", L"B"},
-		{XINPUT_GAMEPAD_X, L"X", L"Square", L"Square", L"X"},
-		{XINPUT_GAMEPAD_Y, L"Y", L"Triangle", L"Triangle", L"Y"},
+		{XINPUT_GAMEPAD_DPAD_UP, L"D-Pad Up", L"D-Pad Up", L"D-Pad Up"},
+		{XINPUT_GAMEPAD_DPAD_DOWN, L"D-Pad Down", L"D-Pad Down", L"D-Pad Down"},
+		{XINPUT_GAMEPAD_DPAD_LEFT, L"D-Pad Left", L"D-Pad Left", L"D-Pad Left"},
+		{XINPUT_GAMEPAD_DPAD_RIGHT, L"D-Pad Right", L"D-Pad Right", L"D-Pad Right"},
+		{XINPUT_GAMEPAD_START, L"Start", L"Options", L"+"},
+		{XINPUT_GAMEPAD_BACK, L"Back", L"Share", L"-"},
+		{XINPUT_GAMEPAD_LEFT_THUMB, L"Left Stick Click", L"L3", L"Left Stick Click"},
+		{XINPUT_GAMEPAD_RIGHT_THUMB, L"Right Stick Click", L"R3", L"Right Stick Click"},
+		{XINPUT_GAMEPAD_LEFT_SHOULDER, L"LB", L"L1", L"L"},
+		{XINPUT_GAMEPAD_RIGHT_SHOULDER, L"RB", L"R1", L"R"},
+		{kTriggerLeftButton, L"LT", L"L2", L"ZL"},
+		{kTriggerRightButton, L"RT", L"R2", L"ZR"},
+		{XINPUT_GAMEPAD_A, L"A", L"Cross", L"A"},
+		{XINPUT_GAMEPAD_B, L"B", L"Circle", L"B"},
+		{XINPUT_GAMEPAD_X, L"X", L"Square", L"X"},
+		{XINPUT_GAMEPAD_Y, L"Y", L"Triangle", L"Y"},
 	}};
 
 	const wchar_t* ButtonNameFor(const ButtonName& entry, ButtonStyle style)
 	{
 		switch (style)
 		{
-		case ButtonStyle::DualSense: return entry.dualSense;
 		case ButtonStyle::DualShock4: return entry.dualShock4;
 		case ButtonStyle::Nintendo: return entry.nintendo;
 		case ButtonStyle::Xbox: break;
 		}
 		return entry.xbox;
+	}
+
+	// The bundled icon for one button in one style, or 0 when that style's
+	// set doesn't include it (the caller then falls back to the name).
+	int ButtonIconResourceId(size_t buttonIndex, ButtonStyle style)
+	{
+		const size_t styleIndex = static_cast<size_t>(style);
+		if (styleIndex >= kControllerIconStyleCount || buttonIndex >= kControllerIconButtonCount)
+			return 0;
+		return kControllerIconResourceIds[styleIndex][buttonIndex];
 	}
 
 	// The D-pad is reserved for menu navigation and can never be rebound;
@@ -338,9 +349,9 @@ bool swapConfirmBackButtons = false;
 
 	// Settings rows: shortcut, confirm style, background, story mode,
 	// button labels, one rebind row per kBindableActions entry, clear all
-	// pads, web remote.
+	// pads, web remote, reset to defaults.
 	constexpr size_t kSettingsBindingFirst = 5;
-	constexpr size_t kSettingsItemCount = kSettingsBindingFirst + kBindableActions.size() + 2;
+	constexpr size_t kSettingsItemCount = kSettingsBindingFirst + kBindableActions.size() + 3;
 
 	// Auto resolves to the connected pad's own style; a pinned choice wins
 	// over detection entirely.
@@ -355,7 +366,6 @@ bool swapConfirmBackButtons = false;
 	{
 		switch (style)
 		{
-		case ButtonStyle::DualSense: return L"DualSense";
 		case ButtonStyle::DualShock4: return L"DualShock 4";
 		case ButtonStyle::Nintendo: return L"Switch";
 		case ButtonStyle::Xbox: break;
@@ -417,6 +427,7 @@ void UpdateInputOwnership(HWND window);
 	void CancelShortcutCapture();
 	void BeginBindingCapture(size_t actionIndex);
 	void CancelBindingCapture();
+	void ResetSettingsToDefaults();
 	void ApplyOverlayTransparency(HWND window);
 	int CurrentBackgroundResourceId();
 	bool StartWebServer(HWND window);
@@ -1412,7 +1423,6 @@ void UpdateInputOwnership(HWND window);
 	{
 		switch (style)
 		{
-		case ButtonStyle::DualSense: return RGB(90, 150, 224);
 		case ButtonStyle::DualShock4: return RGB(52, 108, 196);
 		case ButtonStyle::Nintendo: return RGB(230, 60, 60);
 		case ButtonStyle::Xbox: break;
@@ -1421,7 +1431,7 @@ void UpdateInputOwnership(HWND window);
 	}
 
 	void DrawButtonBadge(Gdiplus::Graphics& g, const std::wstring& label,
-		float x, float y, float w, float h)
+		float x, float y, float w, float h, float px)
 	{
 		const Gdiplus::RectF rect(x, y, w, h);
 		Gdiplus::GraphicsPath path;
@@ -1435,12 +1445,70 @@ void UpdateInputOwnership(HWND window);
 		rim.SetLineJoin(Gdiplus::LineJoinRound);
 		g.DrawPath(&rim, &path);
 
-		Gdiplus::Font font = MakeUIFont(20.0f);
+		Gdiplus::Font font = MakeUIFont(px);
 		Gdiplus::SolidBrush text(Gdiplus::Color(255, 240, 244, 250));
 		Gdiplus::StringFormat format(Gdiplus::StringFormatFlagsNoWrap);
 		format.SetAlignment(Gdiplus::StringAlignmentCenter);
 		format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
 		g.DrawString(label.c_str(), -1, &font, rect, &format, &text);
+	}
+
+	// One button as the connected pad would print it: the bundled icon when
+	// this style ships one, otherwise a badge with the button's name (which
+	// is what keeps an incomplete icon set usable). Returns the width used,
+	// and with `draw` false only measures, so callers can right-align a row
+	// before committing to it.
+	float DrawPadButton(Gdiplus::Graphics& g, size_t buttonIndex, float x, float y, float h, bool draw)
+	{
+		const ButtonStyle style = EffectiveButtonStyle();
+		const int resId = ButtonIconResourceId(buttonIndex, style);
+		if (Gdiplus::Bitmap* icon = GetAssetBitmap(resId))
+		{
+			const float w = h * icon->GetWidth() / static_cast<float>(icon->GetHeight());
+			if (draw)
+			{
+				if (Gdiplus::Bitmap* scaled = RenderScaledAsset(
+					resId, static_cast<int>(w), static_cast<int>(h), 0))
+				{
+					g.DrawImage(scaled, x, y);
+				}
+			}
+			return w;
+		}
+
+		const float px = h * 0.62f;
+		const std::wstring label = ButtonNameFor(kButtonNames[buttonIndex], style);
+		const float w = MeasureTextWidth(g, label, px) + 20.0f;
+		if (draw)
+			DrawButtonBadge(g, label, x, y, w, h, px);
+		return w;
+	}
+
+	// A whole mask: one button normally, several joined by "+" for a chord
+	// like the overlay toggle.
+	float DrawPadButtonMask(Gdiplus::Graphics& g, ButtonMask mask, float x, float y, float h, bool draw)
+	{
+		constexpr float kGap = 5.0f;
+		float cursor = 0.0f;
+		bool first = true;
+		for (size_t index = 0; index < kButtonNames.size(); ++index)
+		{
+			if ((mask & kButtonNames[index].mask) == 0)
+				continue;
+			if (!first)
+			{
+				const float plusW = MeasureTextWidth(g, L"+", h * 0.62f);
+				if (draw)
+				{
+					DrawTextLineCentered(g, L"+", static_cast<int>(x + cursor + kGap),
+						static_cast<int>(y), static_cast<int>(plusW), RGB(206, 214, 228), static_cast<int>(h));
+				}
+				cursor += kGap + plusW + kGap;
+			}
+			cursor += DrawPadButton(g, index, x + cursor, y, h, draw);
+			first = false;
+		}
+		return cursor;
 	}
 
 	std::filesystem::path GetExecutableDirectory()
@@ -1570,10 +1638,10 @@ void UpdateInputOwnership(HWND window);
 			"ButtonMoveActive=16384\n"
 			"ButtonQuickLoad=512\n"
 			"ButtonQuickClear=256\n"
-			"; ButtonStyle names the buttons in the UI: Auto | Xbox | DualSense |\n"
-			"; DualShock4 | Switch. Auto follows the connected pad (Xbox wins when\n"
-			"; several are plugged in). This is labels only - every pad works either\n"
-			"; way, and the values above stay raw XInput numbers.\n"
+			"; ButtonStyle picks the button icons/names shown in the UI:\n"
+			"; Auto | Xbox | DualShock4 | Switch. Auto follows the connected pad\n"
+			"; (Xbox wins when several are plugged in). Icons only - every pad works\n"
+			"; either way, and the values above stay raw XInput numbers.\n"
 			"ButtonStyle=Auto\n"
 			"\n"
 			"[Web]\n"
@@ -1693,9 +1761,8 @@ void UpdateInputOwnership(HWND window);
 		switch (choice)
 		{
 		case 1: return L"Xbox";
-		case 2: return L"DualSense";
-		case 3: return L"DualShock4";
-		case 4: return L"Switch";
+		case 2: return L"DualShock4";
+		case 3: return L"Switch";
 		default: break;
 		}
 		return L"Auto";
@@ -1708,6 +1775,10 @@ void UpdateInputOwnership(HWND window);
 			if (_wcsicmp(value, ButtonStyleIniValue(choice)) == 0)
 				return choice;
 		}
+		// A DualSense setting written by an earlier build maps onto the
+		// PlayStation labels that replaced it.
+		if (_wcsicmp(value, L"DualSense") == 0)
+			return 2;
 		return 0; // Auto, including anything unrecognized
 	}
 
@@ -2764,10 +2835,12 @@ case Screen::Settings:
 			else if (g_app.settingsIndex >= kSettingsBindingFirst &&
 				g_app.settingsIndex < kSettingsBindingFirst + kBindableActions.size())
 				BeginBindingCapture(g_app.settingsIndex - kSettingsBindingFirst);
-			else if (g_app.settingsIndex == kSettingsItemCount - 2)
+			else if (g_app.settingsIndex == kSettingsItemCount - 3)
 				ClearAllPads(true);
-			else if (g_app.settingsIndex == kSettingsItemCount - 1)
+			else if (g_app.settingsIndex == kSettingsItemCount - 2)
 				ToggleWebRemote();
+			else if (g_app.settingsIndex == kSettingsItemCount - 1)
+				ResetSettingsToDefaults();
 			break;
 		}
 	}
@@ -3018,6 +3091,38 @@ case Screen::Settings:
 	{
 		g_app.capturingBindingIndex = -1;
 		g_app.status = L"Button binding unchanged.";
+	}
+
+	// Everything the Settings screen can change goes back to the values a
+	// fresh install starts with - including character selection back to All
+	// series. A default-constructed AppState *is* the defaults, so this
+	// can't drift away from the field initialisers.
+	//
+	// The web remote's port and the listener port are deliberately left
+	// alone: they only exist in LegoToypad.ini, never in this screen.
+	void ResetSettingsToDefaults()
+	{
+		const AppState defaults;
+
+		if (g_app.webEnabled != defaults.webEnabled)
+			ToggleWebRemote(); // starts/stops the server and saves [Web]
+
+		g_app.shortcutType = defaults.shortcutType;
+		g_app.shortcutControllerMask = defaults.shortcutControllerMask;
+		g_app.shortcutKeyModifiers = defaults.shortcutKeyModifiers;
+		g_app.shortcutKeyCode = defaults.shortcutKeyCode;
+		g_app.swapConfirmBackButtons = defaults.swapConfirmBackButtons;
+		g_app.backgroundIndex = defaults.backgroundIndex;
+		g_app.storyMode = defaults.storyMode;
+		g_app.buttonStyleChoice = defaults.buttonStyleChoice;
+		for (const auto& action : kBindableActions)
+			g_app.*(action.button) = defaults.*(action.button);
+
+		SaveShortcutToIni();
+		SaveInputSettingsToIni();
+		RegisterToggleHotkeyIfNeeded(g_mainWindow);
+		ApplyOverlayTransparency(g_mainWindow);
+		g_app.status = L"Settings reset to defaults. Toggle: " + DescribeShortcut() + L".";
 	}
 
 	// Assigns a captured single button to the action being rebound. The
@@ -3785,24 +3890,37 @@ case Screen::RosterList:
 		}
 		case Screen::Settings:
 		{
-			std::vector<std::wstring> rows;
+			// A row is text, optionally followed by the pad icons for a
+			// button mask - that is how a binding shows the button itself
+			// rather than spelling its name out.
+			struct SettingsRow
+			{
+				std::wstring text;
+				ButtonMask icons = 0;
+			};
+			std::vector<SettingsRow> rows;
 			rows.reserve(kSettingsItemCount);
-			rows.push_back(L"Toggle shortcut: " + DescribeShortcut());
-			rows.push_back(L"Confirm button: " + DescribeConfirmButtonMode());
-			rows.push_back(L"Background: " + DescribeBackgroundChoice());
-			rows.push_back(L"Character selection: " + DescribeStoryMode());
-			rows.push_back(L"Button labels: " + DescribeButtonStyle());
+			if (g_app.shortcutType == ShortcutType::Controller)
+				rows.push_back({L"Toggle shortcut: ", g_app.shortcutControllerMask});
+			else
+				rows.push_back({L"Toggle shortcut: " + DescribeShortcut(), 0});
+			rows.push_back({L"Confirm button: " + DescribeConfirmButtonMode(), 0});
+			rows.push_back({L"Background: " + DescribeBackgroundChoice(), 0});
+			rows.push_back({L"Character selection: " + DescribeStoryMode(), 0});
+			rows.push_back({L"Button labels: " + DescribeButtonStyle(), 0});
 			for (const auto& action : kBindableActions)
-				rows.push_back(std::wstring(L"Button - ") + action.label + L": " +
-					DescribeControllerMask(g_app.*(action.button)));
-			rows.push_back(L"Clear all pad");
-			rows.push_back(L"Web remote: " + DescribeWebRemote());
+				rows.push_back({std::wstring(L"Button - ") + action.label + L": ",
+					g_app.*(action.button)});
+			rows.push_back({L"Clear all pad", 0});
+			rows.push_back({L"Web remote: " + DescribeWebRemote(), 0});
+			rows.push_back({L"Reset all settings to defaults", 0});
 
-			// 34px pitch (down from the original 40) so the grown list plus
+			// 33px pitch (down from the original 40) so the grown list plus
 			// the capture hint and status line below still fit the
 			// fixed-height overlay.
 			constexpr int kSettingsTop = 100;
-			constexpr int kSettingsPitch = 34;
+			constexpr int kSettingsPitch = 33;
+			constexpr float kSettingsIconH = 24.0f;
 			for (size_t index = 0; index < rows.size(); ++index)
 			{
 				const int y = kSettingsTop + static_cast<int>(index) * kSettingsPitch;
@@ -3814,7 +3932,14 @@ case Screen::RosterList:
 					FillRect(dc, &selection, brush);
 					DeleteObject(brush);
 				}
-				DrawTextLine(g, rows[index], 30, y, width - 60, selected ? RGB(255, 255, 255) : RGB(228, 232, 238));
+				DrawTextLine(g, rows[index].text, 30, y, width - 60,
+					selected ? RGB(255, 255, 255) : RGB(228, 232, 238));
+				if (rows[index].icons != 0)
+				{
+					const float iconX = 30.0f + MeasureTextWidth(g, rows[index].text, 22.0f);
+					DrawPadButtonMask(g, rows[index].icons, iconX,
+						y + (30.0f - kSettingsIconH) / 2.0f, kSettingsIconH, true);
+				}
 			}
 
 			const int hintY = kSettingsTop + static_cast<int>(rows.size()) * kSettingsPitch + 12;
@@ -3873,11 +3998,9 @@ case Screen::RosterList:
 			}
 		}
 
-		// Settings hint in the bottom-right corner: the button that opens
-		// Settings, next to the "settings" label. The bundled glyph is an
-		// Xbox Y, so it is only drawn while it still tells the truth - Xbox
-		// labels, Settings still bound to Y. Any other pad style, or a
-		// rebound Settings button, gets a badge with that button's own name.
+		// Settings hint in the bottom-right corner: the icon of whatever
+		// button currently opens Settings, in the connected pad's own
+		// style, next to the "settings" label.
 		if (g_app.screen == Screen::PadViewer)
 		{
 			constexpr float kHintBottomInset = 18.0f;
@@ -3886,31 +4009,18 @@ case Screen::RosterList:
 			constexpr float kHintTextH = 40.0f;
 			const float hintCenterY = height - kHintBottomInset - kHintTextH / 2.0f;
 
-			Gdiplus::Bitmap* yButton = GetAssetBitmap(kYButtonResourceId);
 			Gdiplus::Bitmap* settingsText = GetAssetBitmap(kSettingsTextResourceId);
-			if (yButton && settingsText)
+			if (settingsText)
 			{
-				const bool useGlyph = EffectiveButtonStyle() == ButtonStyle::Xbox &&
-					g_app.buttonSettings == XINPUT_GAMEPAD_Y;
-				const std::wstring badgeLabel = DescribeControllerMask(g_app.buttonSettings);
-				const float yButtonW = useGlyph
-					? yButton->GetWidth() * (kHintYButtonH / yButton->GetHeight())
-					: MeasureTextWidth(g, badgeLabel, 20.0f) + 26.0f;
+				const float buttonW = DrawPadButtonMask(g, g_app.buttonSettings, 0.0f, 0.0f,
+					kHintYButtonH, false);
 				const float textW = settingsText->GetWidth() * (kHintTextH / settingsText->GetHeight());
-				const float totalW = yButtonW + kHintGap + textW;
+				const float totalW = buttonW + kHintGap + textW;
 				const float originX = width - kTopMargin - totalW;
-				const float textX = originX + yButtonW + kHintGap;
+				const float textX = originX + buttonW + kHintGap;
 
-				if (!useGlyph)
-				{
-					DrawButtonBadge(g, badgeLabel, originX, hintCenterY - kHintYButtonH / 2.0f,
-						yButtonW, kHintYButtonH);
-				}
-				else if (Gdiplus::Bitmap* cachedY = RenderScaledAsset(
-					kYButtonResourceId, static_cast<int>(yButtonW), static_cast<int>(kHintYButtonH), 0))
-				{
-					g.DrawImage(cachedY, originX, hintCenterY - kHintYButtonH / 2.0f);
-				}
+				DrawPadButtonMask(g, g_app.buttonSettings, originX,
+					hintCenterY - kHintYButtonH / 2.0f, kHintYButtonH, true);
 				if (Gdiplus::Bitmap* cachedText = RenderScaledAsset(
 					kSettingsTextResourceId, static_cast<int>(textW), static_cast<int>(kHintTextH), 0))
 				{
@@ -3960,8 +4070,10 @@ case Screen::RosterList:
 	{
 		switch (SDL_GameControllerGetType(controller))
 		{
+		// A DualSense reads as DualShock 4 here: the two label sets only
+		// differ in Create vs Share, and the app ships one PlayStation
+		// icon set rather than two nearly identical ones.
 		case SDL_CONTROLLER_TYPE_PS5:
-			return ButtonStyle::DualSense;
 		case SDL_CONTROLLER_TYPE_PS4:
 		case SDL_CONTROLLER_TYPE_PS3:
 			return ButtonStyle::DualShock4;
@@ -3987,11 +4099,10 @@ case Screen::RosterList:
 		switch (style)
 		{
 		case ButtonStyle::Xbox: return 0;
-		case ButtonStyle::DualSense: return 1;
-		case ButtonStyle::DualShock4: return 2;
-		case ButtonStyle::Nintendo: return 3;
+		case ButtonStyle::DualShock4: return 1;
+		case ButtonStyle::Nintendo: return 2;
 		}
-		return 4;
+		return 3;
 	}
 
 void PollController(HWND window)

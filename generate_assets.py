@@ -471,6 +471,35 @@ def generate(root: Path, out_dir: Path) -> int:
         else:
             warnings.append("missing action-bar asset: %s" % name)
 
+    # ---- controller button icons ------------------------------------------
+    # Assets/ControllerIcons/<Style>/<Button>.png: one folder per pad style,
+    # one file per button, both in the fixed orders below (the button order
+    # matches kButtonNames in main.cpp). A missing file is left as id 0 and
+    # the app draws that button's name instead, so an incomplete icon set
+    # degrades one button at a time rather than breaking the build.
+    controller_icon_styles = ["Xbox", "DualShock4", "Switch"]
+    controller_icon_buttons = [
+        "DpadUp", "DpadDown", "DpadLeft", "DpadRight", "Start", "Back",
+        "LeftStickClick", "RightStickClick", "LB", "RB", "LT", "RT",
+        "A", "B", "X", "Y",
+    ]
+    controller_icons_root = discover_case_insensitive(assets_root, "ControllerIcons")
+    controller_icon_syms = []
+    for style in controller_icon_styles:
+        style_dir = discover_case_insensitive(controller_icons_root, style) if controller_icons_root else None
+        by_stem = {p.stem.casefold(): p for p in image_files(style_dir)} if style_dir else {}
+        row = []
+        for button in controller_icon_buttons:
+            file = by_stem.get(button.casefold())
+            if file is None:
+                warnings.append("missing controller icon: ControllerIcons/%s/%s.png" % (style, button))
+                row.append(None)
+                continue
+            ascii_ok([str(file)], warnings)
+            row.append(symbols.allocate(
+                "ASSET_PADICON_%s_%s" % (sanitize(style), sanitize(button)), file))
+        controller_icon_syms.append(row)
+
     # ---- UI font -----------------------------------------------------------
     # The Compacta-typeface font embedded for GDI/GDI+ in-memory loading.
     # GDI/GDI+ only consume raw SFNT (.ttf/.otf) bytes in memory, so web-font
@@ -691,6 +720,12 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kByHarrysofResourceId;")
     header.append("extern const int kYButtonResourceId;")
     header.append("extern const int kSettingsTextResourceId;")
+    header.append("// [style][button]; style order Xbox, DualShock4, Switch, button")
+    header.append("// order as in kButtonNames. 0 = no icon bundled for that button.")
+    header.append("extern const int kControllerIconResourceIds[%d][%d];"
+                  % (len(controller_icon_styles), len(controller_icon_buttons)))
+    header.append("extern const size_t kControllerIconStyleCount;")
+    header.append("extern const size_t kControllerIconButtonCount;")
     header.append("")
     header.append("#endif  // RC_INVOKED")
     header.append("")
@@ -726,6 +761,15 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kByHarrysofResourceId = %s;" % (by_harrysof_sym["name"] if by_harrysof_sym else "0"))
     cpp.append("const int kYButtonResourceId = %s;" % (y_button_sym["name"] if y_button_sym else "0"))
     cpp.append("const int kSettingsTextResourceId = %s;" % (settings_text_sym["name"] if settings_text_sym else "0"))
+    cpp.append("")
+    cpp.append("const int kControllerIconResourceIds[%d][%d] = {"
+               % (len(controller_icon_styles), len(controller_icon_buttons)))
+    for style, row in zip(controller_icon_styles, controller_icon_syms):
+        cpp.append("    { %s }, // %s"
+                   % (", ".join(sym["name"] if sym else "0" for sym in row), style))
+    cpp.append("};")
+    cpp.append("const size_t kControllerIconStyleCount = %d;" % len(controller_icon_styles))
+    cpp.append("const size_t kControllerIconButtonCount = %d;" % len(controller_icon_buttons))
     cpp.append("")
     cpp.append("const BackgroundChoice kBackgroundChoices[] = {")
     for item in background_choice_syms:
