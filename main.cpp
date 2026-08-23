@@ -56,6 +56,12 @@ namespace
 constexpr int kOverlayWidth = 900;
 	constexpr int kOverlayHeight = 610;
 	constexpr BYTE kOverlayAlpha = 235; // 0-255, uniform translucency for the whole panel.
+	// Color that turns fully transparent when the "No Background" choice is
+	// active (LWA_COLORKEY): the frame is painted onto this color instead of
+	// a wallpaper, so everything between the UI elements shows the game.
+	// Nearly black, so antialiased edges blending toward it stay clean, but
+	// dark enough that no UI element ever produces this exact value itself.
+	constexpr COLORREF kNoBackgroundColorKey = RGB(8, 0, 8);
 	constexpr int kWindowCornerRadius = 6;
 	constexpr wchar_t kAppVersion[] = L"1.3.0";
 
@@ -116,12 +122,12 @@ constexpr int kOverlayWidth = 900;
 		{XINPUT_GAMEPAD_Y, L"Y"},
 	}};
 
-	// Buttons already bound to in-app menu navigation (confirm, back, jump
-	// to settings, list scrolling). A captured shortcut made up of only
-	// these would immediately fight with normal use of the picker, so at
-	// least one other button is always required alongside them.
-	constexpr WORD kNavigationButtons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_Y |
-		XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN;
+	// The D-pad is reserved for menu navigation and can never be rebound;
+	// the rest of the picker's own buttons live in kBindableActions and are
+	// checked dynamically (see ReservedNavigationMask below), since every
+	// one of them is remappable from the Settings screen.
+	constexpr WORD kDpadButtons = XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN |
+		XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT;
 
 	// Reserved chord that always cancels shortcut capture on a controller,
 	// regardless of what is being assigned. Keyboard capture is cancelled
@@ -147,8 +153,6 @@ constexpr int kOverlayWidth = 900;
 		Clear,
 	};
 	constexpr size_t kPadActionCount = 3;
-
-	constexpr size_t kSettingsItemCount = 5; // shortcut, A/B confirm style, background, clear all pads, web remote
 
 	enum class ShortcutType
 	{
@@ -201,6 +205,21 @@ constexpr int kOverlayWidth = 900;
 bool swapConfirmBackButtons = false;
 		size_t backgroundIndex = 0;
 		bool capturingShortcut = false;
+		// Story mode: picking a figure skips the series grid entirely and
+		// shows only the starter-pack roster (Batman, Gandalf The Grey,
+		// Wyldstyle, Batmobile), like the game's own story campaign.
+		bool storyMode = false;
+		// Controller bindings for the picker's own actions. Single-button
+		// masks, remappable from the Settings screen, persisted in [Input].
+		WORD buttonConfirm = XINPUT_GAMEPAD_A;
+		WORD buttonBack = XINPUT_GAMEPAD_B;
+		WORD buttonSettings = XINPUT_GAMEPAD_Y;
+		WORD buttonMoveActive = XINPUT_GAMEPAD_X;
+		WORD buttonQuickLoad = XINPUT_GAMEPAD_RIGHT_SHOULDER;
+		WORD buttonQuickClear = XINPUT_GAMEPAD_LEFT_SHOULDER;
+		// Index into kBindableActions while capturing a new button for one
+		// of them from Settings; -1 when no binding capture is running.
+		int capturingBindingIndex = -1;
 		// Web remote: the built-in HTTP server that lets the same tag library
 		// be driven from a phone browser on the local network. Runs on its own
 		// thread; requests that touch app state are marshaled back to the
@@ -221,6 +240,11 @@ bool swapConfirmBackButtons = false;
 		bool selectingMoveDestination = false;
 		size_t moveSourceSlotIndex = 0;
 
+		// True while the RosterList screen is showing the story-mode starter
+		// roster instead of a franchise's roster, so Back returns straight
+		// to the pad viewer and no franchise logo is drawn as the header.
+		bool storyRosterActive = false;
+
 		// Franchise / roster browsing state.
 		size_t franchiseIndex = 0;
 		int franchiseTopRow = 0; // first visible franchise row (scrolled grid)
@@ -233,6 +257,43 @@ bool swapConfirmBackButtons = false;
 
 	AppState g_app;
 	HANDLE g_inputOwnershipEvent = nullptr;
+
+	// The picker's rebindable actions, in the order they appear as Settings
+	// rows. Confirm/Back stay subject to the swap-confirm-back setting on
+	// top of whatever buttons they are bound to.
+	struct BindableAction
+	{
+		const wchar_t* label;   // Settings row / status text
+		const wchar_t* iniKey;  // [Input] key it persists under
+		WORD AppState::*button; // the binding itself
+	};
+
+	constexpr std::array<BindableAction, 6> kBindableActions = {{
+		{L"Confirm", L"ButtonConfirm", &AppState::buttonConfirm},
+		{L"Back", L"ButtonBack", &AppState::buttonBack},
+		{L"Settings", L"ButtonSettings", &AppState::buttonSettings},
+		{L"Move active pad", L"ButtonMoveActive", &AppState::buttonMoveActive},
+		{L"Quick load", L"ButtonQuickLoad", &AppState::buttonQuickLoad},
+		{L"Quick clear", L"ButtonQuickClear", &AppState::buttonQuickClear},
+	}};
+
+	// Settings rows: shortcut, confirm style, background, story mode, one
+	// rebind row per kBindableActions entry, clear all pads, web remote.
+	constexpr size_t kSettingsBindingFirst = 4;
+	constexpr size_t kSettingsItemCount = kSettingsBindingFirst + kBindableActions.size() + 2;
+
+	// Every button the picker itself currently reacts to while the overlay
+	// is open. A toggle shortcut made up of only these would fight normal
+	// use of the picker, so shortcut capture requires at least one button
+	// outside this set. Computed at call time because the bindings are
+	// remappable.
+	WORD ReservedNavigationMask()
+	{
+		WORD mask = kDpadButtons;
+		for (const auto& action : kBindableActions)
+			mask |= g_app.*(action.button);
+		return mask;
+	}
 
 	// ---------------------------------------------------------------------
 	// Web remote (phone browser control)
@@ -273,6 +334,9 @@ void UpdateInputOwnership(HWND window);
 	void HideOverlay(HWND window);
 	void BeginShortcutCapture();
 	void CancelShortcutCapture();
+	void BeginBindingCapture(size_t actionIndex);
+	void CancelBindingCapture();
+	void ApplyOverlayTransparency(HWND window);
 	int CurrentBackgroundResourceId();
 	bool StartWebServer(HWND window);
 	void StopWebServer();
@@ -1107,6 +1171,18 @@ void UpdateInputOwnership(HWND window);
 		Gdiplus::Graphics g(bitmap);
 		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
 
+		if (backgroundResourceId == 0)
+		{
+			// "No Background": the whole frame starts as the transparent
+			// color key, so everything the UI doesn't cover shows the game.
+			// No legibility overlay either - there is nothing to darken.
+			Gdiplus::SolidBrush keyFill(Gdiplus::Color(255,
+				GetRValue(kNoBackgroundColorKey), GetGValue(kNoBackgroundColorKey), GetBValue(kNoBackgroundColorKey)));
+			g.FillRectangle(&keyFill, 0, 0, width, height);
+			g_glossCache[key] = bitmap;
+			return bitmap;
+		}
+
 		Gdiplus::Bitmap* background = GetAssetBitmap(backgroundResourceId);
 		if (background)
 		{
@@ -1340,8 +1416,8 @@ void UpdateInputOwnership(HWND window);
 			"Type=Controller\n"
 			"; Controller: raw XInput button bitmask (Back = 32). Combine buttons for a\n"
 			"; chord by adding their values, e.g. LB (256) + RB (512) = 768.\n"
-			"; Must include at least one button that isn't A/B/Y/D-pad Up/D-pad Down,\n"
-			"; since those are already used to navigate the picker's own menus.\n"
+			"; Must include at least one button that isn't the D-pad or one of the\n"
+			"; Button* bindings below, since those already drive the picker's menus.\n"
 			"ControllerMask=32\n"
 			"; Keyboard: modifier bitmask (Alt=1, Ctrl=2, Shift=4, Win=8) and a virtual-key\n"
 			"; code. Must include at least one modifier, or the key would be stolen from\n"
@@ -1356,7 +1432,22 @@ void UpdateInputOwnership(HWND window);
 			"; SwapConfirmBackButtons = 1 uses B to enter and A to go back (Cemu style).\n"
 			"SwapConfirmBackButtons=0\n"
 "; BackgroundIndex selects the app background from bundled Assets/Wallpapers images.\n"
+			"; The value one past the last wallpaper means No Background: the overlay\n"
+			"; is drawn transparent between the UI elements so the game shows through.\n"
 			"BackgroundIndex=0\n"
+			"; StoryMode = 1 shows only the starter pack (Batman, Gandalf The Grey,\n"
+			"; Wyldstyle, Batmobile) when picking a figure, skipping the series grid.\n"
+			"StoryMode=0\n"
+			"; Controller bindings for the picker's own actions, as raw XInput button\n"
+			"; values (A=4096, B=8192, X=16384, Y=32768, LB=256, RB=512, Start=16,\n"
+			"; Back=32, stick clicks=64/128). One button per action; easiest to set\n"
+			"; them from the in-app Settings screen instead of editing these by hand.\n"
+			"ButtonConfirm=4096\n"
+			"ButtonBack=8192\n"
+			"ButtonSettings=32768\n"
+			"ButtonMoveActive=16384\n"
+			"ButtonQuickLoad=512\n"
+			"ButtonQuickClear=256\n"
 			"\n"
 			"[Web]\n"
 			"; Web remote serves the same Toypad UI to a phone browser on your local\n"
@@ -1430,16 +1521,44 @@ void UpdateInputOwnership(HWND window);
 			: L"Keyboard: " + DescribeKeyboardKey(g_app.shortcutKeyModifiers, g_app.shortcutKeyCode);
 	}
 
-	std::wstring DescribeConfirmButtonMode()
+	// The confirm/back buttons the picker actually reacts to: the bound
+	// buttons, swapped as a pair when the RPCS3/Cemu style toggle says so.
+	WORD EffectiveConfirmMask()
 	{
-		return g_app.swapConfirmBackButtons
-			? L"B (Cemu)"
-			: L"A (RPCS3)";
+		return g_app.swapConfirmBackButtons ? g_app.buttonBack : g_app.buttonConfirm;
 	}
 
+	WORD EffectiveBackMask()
+	{
+		return g_app.swapConfirmBackButtons ? g_app.buttonConfirm : g_app.buttonBack;
+	}
+
+	std::wstring DescribeConfirmButtonMode()
+	{
+		const WORD confirm = EffectiveConfirmMask();
+		if (confirm == XINPUT_GAMEPAD_A)
+			return L"A (RPCS3)";
+		if (confirm == XINPUT_GAMEPAD_B)
+			return L"B (Cemu)";
+		return DescribeControllerMask(confirm);
+	}
+
+	std::wstring DescribeStoryMode()
+	{
+		return g_app.storyMode ? L"Story (starter pack only)" : L"All series";
+	}
+
+	// backgroundIndex == kBackgroundChoiceCount is the extra "No Background"
+	// choice appended after the bundled wallpapers: nothing is drawn behind
+	// the UI and those pixels become transparent (see ApplyOverlayTransparency).
 	size_t ClampBackgroundIndex(size_t index)
 	{
-		return kBackgroundChoiceCount == 0 ? 0 : std::min(index, kBackgroundChoiceCount - 1);
+		return kBackgroundChoiceCount == 0 ? 0 : std::min(index, kBackgroundChoiceCount);
+	}
+
+	bool IsNoBackground()
+	{
+		return kBackgroundChoiceCount != 0 && ClampBackgroundIndex(g_app.backgroundIndex) == kBackgroundChoiceCount;
 	}
 
 	const BackgroundChoice* CurrentBackgroundChoice()
@@ -1447,19 +1566,36 @@ void UpdateInputOwnership(HWND window);
 		if (kBackgroundChoiceCount == 0)
 			return nullptr;
 		g_app.backgroundIndex = ClampBackgroundIndex(g_app.backgroundIndex);
+		if (g_app.backgroundIndex == kBackgroundChoiceCount)
+			return nullptr; // No Background
 		return &kBackgroundChoices[g_app.backgroundIndex];
 	}
 
 	int CurrentBackgroundResourceId()
 	{
+		if (IsNoBackground())
+			return 0;
 		const BackgroundChoice* choice = CurrentBackgroundChoice();
 		return choice ? choice->resourceId : kBackgroundResourceId;
 	}
 
 	std::wstring DescribeBackgroundChoice()
 	{
+		if (IsNoBackground())
+			return L"No Background";
 		const BackgroundChoice* choice = CurrentBackgroundChoice();
 		return choice ? choice->name : L"(none)";
+	}
+
+	// The web remote always renders on a wallpaper - the phone browser has
+	// no game behind it to show through - so "No Background" falls back to
+	// the first bundled wallpaper there.
+	int WebBackgroundResourceId()
+	{
+		const int resourceId = CurrentBackgroundResourceId();
+		if (resourceId != 0)
+			return resourceId;
+		return kBackgroundChoiceCount != 0 ? kBackgroundChoices[0].resourceId : kBackgroundResourceId;
 	}
 
 	void SaveInputSettingsToIni()
@@ -1469,6 +1605,11 @@ void UpdateInputOwnership(HWND window);
 			g_app.swapConfirmBackButtons ? L"1" : L"0", iniPath.c_str());
 		WritePrivateProfileStringW(L"Input", L"BackgroundIndex",
 			std::to_wstring(ClampBackgroundIndex(g_app.backgroundIndex)).c_str(), iniPath.c_str());
+		WritePrivateProfileStringW(L"Input", L"StoryMode",
+			g_app.storyMode ? L"1" : L"0", iniPath.c_str());
+		for (const auto& action : kBindableActions)
+			WritePrivateProfileStringW(L"Input", action.iniKey,
+				std::to_wstring(g_app.*(action.button)).c_str(), iniPath.c_str());
 	}
 
 	void LoadInputSettingsFromIni()
@@ -1478,6 +1619,31 @@ void UpdateInputOwnership(HWND window);
 			GetPrivateProfileIntW(L"Input", L"SwapConfirmBackButtons", 0, iniPath.c_str()) != 0;
 		g_app.backgroundIndex = ClampBackgroundIndex(static_cast<size_t>(
 			GetPrivateProfileIntW(L"Input", L"BackgroundIndex", 0, iniPath.c_str())));
+		g_app.storyMode =
+			GetPrivateProfileIntW(L"Input", L"StoryMode", 0, iniPath.c_str()) != 0;
+		// A hand-edited value falls back to the built-in default when it is
+		// unset (0) or a D-pad button, and is dropped entirely (leaving the
+		// action unbound, shown as "(none)" in Settings) when it collides
+		// with an action earlier in the list - one press firing two actions
+		// is worse than one action the user can simply rebind.
+		WORD usedButtons = 0;
+		for (const auto& action : kBindableActions)
+		{
+			const WORD stored = static_cast<WORD>(GetPrivateProfileIntW(
+				L"Input", action.iniKey, g_app.*(action.button), iniPath.c_str()));
+			WORD value = (stored != 0 && (stored & kDpadButtons) == 0) ? stored : g_app.*(action.button);
+			if (value & usedButtons)
+				value = 0;
+			usedButtons |= value;
+			g_app.*(action.button) = value;
+		}
+	}
+
+	void ToggleStoryMode()
+	{
+		g_app.storyMode = !g_app.storyMode;
+		SaveInputSettingsToIni();
+		g_app.status = L"Character selection: " + DescribeStoryMode();
 	}
 
 	void ToggleConfirmButtonMode()
@@ -1487,15 +1653,32 @@ void UpdateInputOwnership(HWND window);
 		g_app.status = L"Confirm button: " + DescribeConfirmButtonMode();
 	}
 
+	// Uniform-alpha only, or alpha plus the transparent color key when the
+	// "No Background" choice is active. Re-applied whenever the background
+	// choice changes, so a wallpaper never gets key-color holes punched in
+	// it and No Background always shows the game between UI elements.
+	void ApplyOverlayTransparency(HWND window)
+	{
+		if (!window)
+			return;
+		if (IsNoBackground())
+			SetLayeredWindowAttributes(window, kNoBackgroundColorKey, kOverlayAlpha, LWA_ALPHA | LWA_COLORKEY);
+		else
+			SetLayeredWindowAttributes(window, 0, kOverlayAlpha, LWA_ALPHA);
+	}
+
 	void CycleBackgroundChoice()
 	{
-		if (kBackgroundChoiceCount <= 1)
+		if (kBackgroundChoiceCount == 0)
 		{
-			g_app.status = L"No extra backgrounds are bundled in Assets/Wallpapers.";
+			g_app.status = L"No backgrounds are bundled in Assets/Wallpapers.";
 			return;
 		}
-		g_app.backgroundIndex = (g_app.backgroundIndex + 1) % kBackgroundChoiceCount;
+		// The cycle covers every bundled wallpaper plus the trailing
+		// "No Background" choice.
+		g_app.backgroundIndex = (ClampBackgroundIndex(g_app.backgroundIndex) + 1) % (kBackgroundChoiceCount + 1);
 		SaveInputSettingsToIni();
+		ApplyOverlayTransparency(g_mainWindow);
 		g_app.status = L"Background: " + DescribeBackgroundChoice();
 	}
 
@@ -1729,6 +1912,7 @@ void UpdateInputOwnership(HWND window);
 		g_app.status = L"LOAD sent: " + name + L" -> " + kSlots[slotIndex].label;
 		if (updateUi)
 		{
+			g_app.storyRosterActive = false;
 			g_app.screen = Screen::PadViewer;
 			InvalidateRect(g_mainWindow, nullptr, FALSE);
 		}
@@ -1862,6 +2046,22 @@ void UpdateInputOwnership(HWND window);
 	void MoveToDestination(size_t destIndex)
 	{
 		MoveSlotToSlot(g_app.moveSourceSlotIndex, destIndex, true);
+	}
+
+	// One-press Move (the "Move active pad" binding, X by default): picks
+	// up whatever is on the focused pad and goes straight to choosing the
+	// destination, skipping the Load/Move/Clear action bar.
+	void BeginMoveFromSelectedPad()
+	{
+		if (!g_app.padState[g_app.slotIndex].occupied)
+		{
+			g_app.status = L"There is nothing tracked on that pad to move.";
+			return;
+		}
+		g_app.moveSourceSlotIndex = g_app.slotIndex;
+		g_app.selectingMoveDestination = true;
+		g_app.screen = Screen::PadViewer;
+		g_app.status = L"Move: pick a destination pad.";
 	}
 
 	// ---------------------------------------------------------------------
@@ -2238,6 +2438,71 @@ void UpdateInputOwnership(HWND window);
 		g_app.rosterIndex = 0;
 		g_app.rosterTopRow = 0;
 		g_app.plusGroup = nullptr;
+		g_app.storyRosterActive = false;
+		g_app.screen = Screen::RosterList;
+	}
+
+	const RosterEntry* FindCharacterEntry(const wchar_t* franchiseName, const wchar_t* characterName)
+	{
+		for (size_t i = 0; i < kFranchiseCount; ++i)
+		{
+			if (kFranchises[i].name != franchiseName)
+				continue;
+			for (const auto& character : kFranchises[i].characters)
+			{
+				if (character.name == characterName)
+					return &character;
+			}
+		}
+		return nullptr;
+	}
+
+	const VehicleGroup* FindVehicleGroupEntry(const wchar_t* franchiseName, const wchar_t* baseName)
+	{
+		for (size_t i = 0; i < kFranchiseCount; ++i)
+		{
+			if (kFranchises[i].name != franchiseName)
+				continue;
+			for (const auto& vehicle : kFranchises[i].vehicles)
+			{
+				if (vehicle.baseName == baseName)
+					return &vehicle;
+			}
+		}
+		return nullptr;
+	}
+
+	// Story mode: the four starter-pack figures shown directly on the
+	// roster screen, with no franchise grid in between - the exact cast the
+	// game's story campaign starts you with.
+	void OpenStoryRoster()
+	{
+		g_app.rosterSlots.clear();
+
+		constexpr struct { const wchar_t* franchise; const wchar_t* name; } kStoryCharacters[] = {
+			{L"DC Comics", L"Batman"},
+			{L"Lord of the Rings", L"Gandalf The Grey"},
+			{L"The LEGO Movie", L"Wyldstyle"},
+		};
+		for (const auto& character : kStoryCharacters)
+		{
+			if (const RosterEntry* entry = FindCharacterEntry(character.franchise, character.name))
+				g_app.rosterSlots.push_back({RosterSlot::Kind::Character, entry, nullptr});
+		}
+		if (const VehicleGroup* batmobile = FindVehicleGroupEntry(L"DC Comics", L"Batmobile"))
+		{
+			if (!batmobile->builds.empty())
+			{
+				g_app.rosterSlots.push_back({RosterSlot::Kind::Vehicle, &batmobile->builds.front(), batmobile});
+				if (batmobile->builds.size() > 1)
+					g_app.rosterSlots.push_back({RosterSlot::Kind::Plus, nullptr, batmobile});
+			}
+		}
+
+		g_app.rosterIndex = 0;
+		g_app.rosterTopRow = 0;
+		g_app.plusGroup = nullptr;
+		g_app.storyRosterActive = true;
 		g_app.screen = Screen::RosterList;
 	}
 
@@ -2265,7 +2530,10 @@ void UpdateInputOwnership(HWND window);
 			switch (static_cast<PadActionKind>(g_app.padActionIndex))
 			{
 			case PadActionKind::Load:
-				OpenFranchiseList();
+				if (g_app.storyMode)
+					OpenStoryRoster();
+				else
+					OpenFranchiseList();
 				break;
 			case PadActionKind::Clear:
 				ClearSelectedPad();
@@ -2314,8 +2582,13 @@ case Screen::Settings:
 			else if (g_app.settingsIndex == 2)
 				CycleBackgroundChoice();
 			else if (g_app.settingsIndex == 3)
+				ToggleStoryMode();
+			else if (g_app.settingsIndex >= kSettingsBindingFirst &&
+				g_app.settingsIndex < kSettingsBindingFirst + kBindableActions.size())
+				BeginBindingCapture(g_app.settingsIndex - kSettingsBindingFirst);
+			else if (g_app.settingsIndex == kSettingsItemCount - 2)
 				ClearAllPads(true);
-			else if (g_app.settingsIndex == 4)
+			else if (g_app.settingsIndex == kSettingsItemCount - 1)
 				ToggleWebRemote();
 			break;
 		}
@@ -2326,6 +2599,11 @@ case Screen::Settings:
 		if (g_app.capturingShortcut)
 		{
 			CancelShortcutCapture();
+			return;
+		}
+		if (g_app.capturingBindingIndex >= 0)
+		{
+			CancelBindingCapture();
 			return;
 		}
 		switch (g_app.screen)
@@ -2355,11 +2633,24 @@ case Screen::Settings:
 			g_app.screen = Screen::PadViewer;
 			break;
 		case Screen::RosterList:
-			g_app.screen = Screen::FranchiseList;
+			if (g_app.storyRosterActive)
+			{
+				// The story roster was opened straight from the pad viewer,
+				// so Back skips the franchise grid on the way out too.
+				g_app.storyRosterActive = false;
+				g_app.screen = Screen::PadViewer;
+			}
+			else
+			{
+				g_app.screen = Screen::FranchiseList;
+			}
 			break;
 		case Screen::PlusPicker:
 			g_app.plusGroup = nullptr;
-			OpenRosterList();
+			if (g_app.storyRosterActive)
+				OpenStoryRoster();
+			else
+				OpenRosterList();
 			break;
 		case Screen::Settings:
 			g_app.screen = Screen::PadViewer;
@@ -2457,6 +2748,7 @@ case Screen::Settings:
 		ShowWindow(window, SW_HIDE);
 		g_app.overlayVisible = false;
 		g_app.capturingShortcut = false;
+		g_app.capturingBindingIndex = -1;
 		// Release ownership only once the overlay is hidden, so the very
 		// button press that closed it never reaches the game either.
 		UpdateInputOwnership(window);
@@ -2530,6 +2822,62 @@ case Screen::Settings:
 		RegisterToggleHotkeyIfNeeded(window);
 		SaveShortcutToIni();
 		g_app.status = L"Shortcut set to " + DescribeShortcut();
+	}
+
+	// ---------------------------------------------------------------------
+	// Action binding capture (the per-action button rows in Settings)
+	// ---------------------------------------------------------------------
+
+	void BeginBindingCapture(size_t actionIndex)
+	{
+		g_app.capturingBindingIndex = static_cast<int>(actionIndex);
+		g_app.shortcutCaptureArmed = false;
+		g_app.status = std::wstring(L"Release all controller buttons, then press the new button for \"") +
+			kBindableActions[actionIndex].label + L"\".";
+	}
+
+	void CancelBindingCapture()
+	{
+		g_app.capturingBindingIndex = -1;
+		g_app.status = L"Button binding unchanged.";
+	}
+
+	// Assigns a captured single button to the action being rebound. The
+	// D-pad, the current toggle shortcut and buttons already used by another
+	// action are rejected with an explanation instead of silently creating
+	// two actions that fire from one press.
+	void ApplyBinding(WORD button)
+	{
+		if (g_app.capturingBindingIndex < 0 ||
+			static_cast<size_t>(g_app.capturingBindingIndex) >= kBindableActions.size())
+			return;
+		const size_t actionIndex = static_cast<size_t>(g_app.capturingBindingIndex);
+
+		if (button & kDpadButtons)
+		{
+			g_app.status = L"The D-pad is reserved for menu navigation. Pick another button.";
+			return;
+		}
+		if (g_app.shortcutType == ShortcutType::Controller && button == g_app.shortcutControllerMask)
+		{
+			g_app.status = L"That button already toggles the overlay. Pick another button.";
+			return;
+		}
+		for (size_t other = 0; other < kBindableActions.size(); ++other)
+		{
+			if (other != actionIndex && g_app.*(kBindableActions[other].button) == button)
+			{
+				g_app.status = std::wstring(L"Already used by \"") + kBindableActions[other].label +
+					L"\". Pick another button.";
+				return;
+			}
+		}
+
+		g_app.*(kBindableActions[actionIndex].button) = button;
+		g_app.capturingBindingIndex = -1;
+		SaveInputSettingsToIni();
+		g_app.status = std::wstring(kBindableActions[actionIndex].label) + L" is now " +
+			DescribeControllerMask(button) + L".";
 	}
 
 	// ---------------------------------------------------------------------
@@ -3195,6 +3543,8 @@ case Screen::Settings:
 case Screen::RosterList:
 		{
 			// The current world's logo at top-center, above the roster grid.
+			// The story roster spans several worlds, so it has no logo header.
+			if (!g_app.storyRosterActive)
 			{
 				const Gdiplus::RectF box((width - 360.0f) / 2.0f, 24.0f, 360.0f, 62.0f);
 				Gdiplus::Bitmap* worldLogo = GetAssetBitmap(kFranchises[g_app.franchiseIndex].logoResourceId);
@@ -3233,7 +3583,9 @@ case Screen::RosterList:
 		case Screen::PlusPicker:
 		{
 			// The current world's logo above the builds panel, the same
-			// header the roster screen (this screen's parent) uses.
+			// header the roster screen (this screen's parent) uses. Skipped
+			// when the parent is the story roster, which has no single world.
+			if (!g_app.storyRosterActive)
 			{
 				const Gdiplus::RectF box((width - 360.0f) / 2.0f, 8.0f, 360.0f, 62.0f);
 				Gdiplus::Bitmap* worldLogo = GetAssetBitmap(kFranchises[g_app.franchiseIndex].logoResourceId);
@@ -3255,20 +3607,29 @@ case Screen::RosterList:
 		}
 		case Screen::Settings:
 		{
-const std::array<std::wstring, kSettingsItemCount> rows = {
-				L"Toggle shortcut: " + DescribeShortcut(),
-				L"Confirm button: " + DescribeConfirmButtonMode(),
-				L"Background: " + DescribeBackgroundChoice(),
-				L"Clear all pad",
-				L"Web remote: " + DescribeWebRemote(),
-			};
+			std::vector<std::wstring> rows;
+			rows.reserve(kSettingsItemCount);
+			rows.push_back(L"Toggle shortcut: " + DescribeShortcut());
+			rows.push_back(L"Confirm button: " + DescribeConfirmButtonMode());
+			rows.push_back(L"Background: " + DescribeBackgroundChoice());
+			rows.push_back(L"Character selection: " + DescribeStoryMode());
+			for (const auto& action : kBindableActions)
+				rows.push_back(std::wstring(L"Button - ") + action.label + L": " +
+					DescribeControllerMask(g_app.*(action.button)));
+			rows.push_back(L"Clear all pad");
+			rows.push_back(L"Web remote: " + DescribeWebRemote());
+
+			// 36px pitch (down from 40) so the grown list plus the capture
+			// hints below still fit the fixed-height overlay.
+			constexpr int kSettingsTop = 100;
+			constexpr int kSettingsPitch = 36;
 			for (size_t index = 0; index < rows.size(); ++index)
 			{
-				const int y = 108 + static_cast<int>(index) * 40;
+				const int y = kSettingsTop + static_cast<int>(index) * kSettingsPitch;
 				const bool selected = index == g_app.settingsIndex;
 				if (selected)
 				{
-					RECT selection{18, y - 2, width - 18, y + 34};
+					RECT selection{18, y - 2, width - 18, y + 32};
 					HBRUSH brush = CreateSolidBrush(RGB(36, 99, 170));
 					FillRect(dc, &selection, brush);
 					DeleteObject(brush);
@@ -3276,14 +3637,24 @@ const std::array<std::wstring, kSettingsItemCount> rows = {
 				DrawTextLine(g, rows[index], 30, y, width - 60, selected ? RGB(255, 255, 255) : RGB(228, 232, 238));
 			}
 
+			const int hintY = kSettingsTop + static_cast<int>(rows.size()) * kSettingsPitch + 12;
 			if (g_app.capturingShortcut)
 			{
-				const int y = 108 + static_cast<int>(rows.size()) * 40 + 16;
 				if (!g_app.shortcutCaptureArmed)
-					DrawTextLine(g, L"Release every controller button first...", 24, y, width - 48, RGB(255, 204, 51), 26);
+					DrawTextLine(g, L"Release every controller button first...", 24, hintY, width - 48, RGB(255, 204, 51), 26);
 				else
-					DrawTextLine(g, L"Listening: press a controller combo, or a keyboard shortcut.", 24, y, width - 48, RGB(255, 204, 51), 26);
-				DrawTextLine(g, L"Controller combo needs a non-nav button. Back+Start cancels. Keyboard needs a modifier. Esc cancels.", 24, y + 26, width - 48, RGB(255, 204, 51), 26);
+					DrawTextLine(g, L"Listening: press a controller combo, or a keyboard shortcut.", 24, hintY, width - 48, RGB(255, 204, 51), 26);
+				DrawTextLine(g, L"Combo needs a button the picker doesn't use. Back+Start cancels. Keyboard needs a modifier. Esc cancels.", 24, hintY + 26, width - 48, RGB(255, 204, 51), 26);
+			}
+			else if (g_app.capturingBindingIndex >= 0)
+			{
+				if (!g_app.shortcutCaptureArmed)
+					DrawTextLine(g, L"Release every controller button first...", 24, hintY, width - 48, RGB(255, 204, 51), 26);
+				else
+					DrawTextLine(g, std::wstring(L"Listening: press the new button for \"") +
+						kBindableActions[static_cast<size_t>(g_app.capturingBindingIndex)].label + L"\".",
+						24, hintY, width - 48, RGB(255, 204, 51), 26);
+				DrawTextLine(g, L"One button, not the D-pad. Back+Start or Esc cancels.", 24, hintY + 26, width - 48, RGB(255, 204, 51), 26);
 			}
 			break;
 		}
@@ -3505,14 +3876,45 @@ void PollController(HWND window)
 				{
 					CancelShortcutCapture();
 				}
-				else if ((combinedButtons & ~kNavigationButtons) == 0)
+				else if ((combinedButtons & ~ReservedNavigationMask()) == 0)
 				{
-					g_app.status = L"That combo is only menu-navigation buttons. Add LB, RB, X, "
-						L"Back, Start, or a stick click. Back+Start cancels.";
+					g_app.status = L"That combo is only buttons the picker already uses. Add one it "
+						L"doesn't (e.g. Start or a stick click). Back+Start cancels.";
 				}
 				else
 				{
 					ApplyControllerShortcut(window, combinedButtons);
+				}
+				InvalidateRect(window, nullptr, FALSE);
+			}
+			return;
+		}
+
+		// Action-binding capture mirrors shortcut capture (arm on full
+		// release, Back+Start cancels), but takes a single button: the first
+		// newly pressed one this tick.
+		if (g_app.capturingBindingIndex >= 0)
+		{
+			if (!g_app.shortcutCaptureArmed)
+			{
+				if (combinedButtons == 0)
+					g_app.shortcutCaptureArmed = true;
+				return;
+			}
+
+			if (anyConnected && combinedPressed != 0)
+			{
+				if (combinedButtons == kShortcutCancelChord)
+				{
+					CancelBindingCapture();
+				}
+				else
+				{
+					// Lowest set bit of the newly pressed buttons: bindings
+					// are single buttons, so a simultaneous multi-press just
+					// takes the lowest-valued one.
+					const WORD firstPressed = static_cast<WORD>(combinedPressed & (0u - static_cast<unsigned>(combinedPressed)));
+					ApplyBinding(firstPressed);
 				}
 				InvalidateRect(window, nullptr, FALSE);
 			}
@@ -3548,8 +3950,8 @@ void PollController(HWND window)
 		// ~60Hz repaint path exactly as cheap as the old bitmap draws.
 		bool changed = false;
 
-		const WORD confirmButton = g_app.swapConfirmBackButtons ? XINPUT_GAMEPAD_B : XINPUT_GAMEPAD_A;
-		const WORD backButton = g_app.swapConfirmBackButtons ? XINPUT_GAMEPAD_A : XINPUT_GAMEPAD_B;
+		const WORD confirmButton = EffectiveConfirmMask();
+		const WORD backButton = EffectiveBackMask();
 
 		if (combinedPressed & confirmButton)
 		{
@@ -3561,10 +3963,41 @@ void PollController(HWND window)
 			Back(window);
 			changed = true;
 		}
-		if ((combinedPressed & XINPUT_GAMEPAD_Y) && g_app.screen == Screen::PadViewer)
+		if ((combinedPressed & g_app.buttonSettings) && g_app.screen == Screen::PadViewer)
 		{
 			g_app.screen = Screen::Settings;
 			changed = true;
+		}
+
+		// One-press pad shortcuts, all acting on the focused (active) pad
+		// cell of the pad viewer. Suppressed while a Move destination is
+		// being picked so they can't yank that flow out from underneath.
+		if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
+		{
+			if (combinedPressed & g_app.buttonMoveActive)
+			{
+				// X by default: pick the cell up for moving right away.
+				BeginMoveFromSelectedPad();
+				changed = true;
+			}
+			if (combinedPressed & g_app.buttonQuickLoad)
+			{
+				// RB by default: straight into figure selection for this cell.
+				if (g_app.storyMode)
+					OpenStoryRoster();
+				else
+					OpenFranchiseList();
+				changed = true;
+			}
+			if (combinedPressed & g_app.buttonQuickClear)
+			{
+				// LB by default: remove whatever is on this cell.
+				if (g_app.padState[g_app.slotIndex].occupied)
+					ClearSlot(g_app.slotIndex, true);
+				else
+					g_app.status = L"There is nothing tracked on that pad to clear.";
+				changed = true;
+			}
 		}
 
 		const bool gridScreen = g_app.screen == Screen::PadViewer ||
@@ -3952,7 +4385,7 @@ if (changed)
 		out += "\"listenerPort\":" + std::to_string(g_app.port) + ",";
 		out += "\"wordmark\":\"" + IdUrl(kWordmarkResourceId) + "\",";
 		out += "\"byMark\":\"" + IdUrl(kByHarrysofResourceId) + "\",";
-		out += "\"background\":\"" + IdUrl(CurrentBackgroundResourceId()) + "\",";
+		out += "\"background\":\"" + IdUrl(WebBackgroundResourceId()) + "\",";
 		const int fontResource = kUIFontWebResourceId != 0 ? kUIFontWebResourceId : kUIFontResourceId;
 		out += "\"fontUrl\":\"" + IdUrl(fontResource) + "\",";
 		out += "\"yButton\":\"" + IdUrl(kYButtonResourceId) + "\",";
@@ -4009,7 +4442,7 @@ if (changed)
 	// The live pad-state snapshot, read on the UI thread through a WebJob.
 	void BuildStateJson(WebJob& job)
 	{
-		std::string out = "{\"background\":\"" + IdUrl(CurrentBackgroundResourceId()) + "\",\"pads\":[";
+		std::string out = "{\"background\":\"" + IdUrl(WebBackgroundResourceId()) + "\",\"pads\":[";
 		for (size_t i = 0; i < 7; ++i)
 		{
 			if (i != 0)
@@ -4379,6 +4812,15 @@ if (changed)
 			Paint(window);
 			return 0;
 		case WM_KEYDOWN:
+			if (g_app.capturingBindingIndex >= 0)
+			{
+				// Binding capture is controller-only; the keyboard can only
+				// bail out of it.
+				if (wParam == VK_ESCAPE)
+					CancelBindingCapture();
+				InvalidateRect(window, nullptr, FALSE);
+				return 0;
+			}
 			if (g_app.capturingShortcut)
 			{
 				if (wParam == VK_ESCAPE)
@@ -4697,7 +5139,7 @@ if (!window)
 		return 1;
 	}
 	g_mainWindow = window;
-	SetLayeredWindowAttributes(window, 0, kOverlayAlpha, LWA_ALPHA);
+	ApplyOverlayTransparency(window);
 	ApplyWindowCornerRadius(window);
 	AddTrayIcon(window);
 	RegisterToggleHotkeyIfNeeded(window);

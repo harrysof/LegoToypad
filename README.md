@@ -29,8 +29,16 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
 - **Web remote**: a phone-friendly HTML UI is embedded in the exe and served
   over your LAN, mirroring the desktop overlay so you can Load/Move/Clear tags
   from any device on your network.
-- **Configurable everything**: toggle shortcut, confirm-button style, and
-  bundled background selection all live in the in-app Settings screen.
+- **One-press pad shortcuts**: with a pad focused, **X** picks that figure up to
+  move it, **RB** jumps straight into figure selection for it, and **LB** clears
+  it — no action menu in between.
+- **Story mode**: switch character selection to the starter pack only (Batman,
+  Gandalf The Grey, Wyldstyle, Batmobile) and skip the series grid entirely.
+- **No Background**: make the overlay's backdrop fully transparent so the game
+  stays visible between the UI elements.
+- **Configurable everything**: toggle shortcut, confirm-button style, background
+  selection, story mode, and a rebindable button for every picker action all
+  live in the in-app Settings screen.
 
 ## Screenshots
 
@@ -50,7 +58,9 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
 2. Press the toggle shortcut (default: controller **Back**) to show the overlay.
 3. On the pad screen you'll see the 7 Toypad slots. A "Y / Settings" hint in the
    bottom-right corner reminds you how to reach Settings.
-4. Pick a pad and confirm to get its action menu:
+4. With a pad focused you can act on it in one press: **X** picks its figure up
+   for a move, **RB** goes straight to figure selection, **LB** clears it.
+5. Or pick a pad and confirm to get its action menu:
    - **Load** — opens the franchise grid. Pick a world, then a character or
      vehicle. Multi-build vehicles open a build picker (Build 1/2/3) before
      loading. The tag is sent to the emulator instantly.
@@ -66,6 +76,12 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
 | A / Enter | Select / confirm |
 | B / Escape | Back |
 | Y / S | Open settings (from the pad grid) |
+| X | Pick the focused pad's figure up and move it (from the pad grid) |
+| RB | Load a figure onto the focused pad (straight to selection) |
+| LB | Clear the focused pad |
+
+Every button in this table except the D-pad can be rebound from
+**Settings → Button - …**.
 
 Any connected controller works — player 1 through 4, not just the first pad.
 While the overlay is visible, a named Windows event tells the emulator to
@@ -79,17 +95,27 @@ Press **Y / S** on the pad grid to open Settings:
 1. **Toggle shortcut** — rebind the show/hide overlay trigger (controller combo
    or keyboard shortcut, see below).
 2. **Confirm button** — swap A/B confirm style: **A (RPCS3)** or **B (Cemu)**.
-3. **Background** — cycle through the bundled background images (drop more
-   `background*.png` files into `Assets/Wallpapers` and rebuild to add your
-   own).
-4. **Clear all pad** — empty every slot at once (useful if the emulator reset
+3. **Background** — cycle through the bundled background images, plus a final
+   **No Background** choice that makes the backdrop fully transparent so the
+   game shows through between the UI elements (drop more `background*.png`
+   files into `Assets/Wallpapers` and rebuild to add your own).
+4. **Character selection** — **All series** (pick a world, then a figure) or
+   **Story (starter pack only)**, which skips the series grid and shows just
+   Batman, Gandalf The Grey, Wyldstyle and the Batmobile.
+5. **Button - …** — one row per action (Confirm, Back, Settings, Move active
+   pad, Quick load, Quick clear). Select a row, release every controller
+   button, then press the button you want. The D-pad stays reserved for menu
+   navigation, and a button already used by another action or by the overlay
+   toggle is rejected. **Back+Start or Esc cancels.**
+6. **Clear all pad** — empty every slot at once (useful if the emulator reset
    its Toypad state out from under the app, e.g. after an emulator restart).
+7. **Web remote** — turn the phone UI on or off (see below).
 
 ## Overlay shortcut
 
 Default toggle is the controller **Back** button. Change it from Settings → Toggle shortcut:
 
-- **Controller combo:** release everything first, then press the new combo. It must include something other than A/B/Y/D-pad up-down (those are already used for menu navigation) — LB, RB, X, Back, Start, or a stick click all work. **Back+Start always cancels.**
+- **Controller combo:** release everything first, then press the new combo. It must include at least one button the picker doesn't already use itself — the D-pad and whatever is currently bound to Confirm / Back / Settings / Move active pad / Quick load / Quick clear are all off-limits on their own, so Back, Start or a stick click are the usual picks. **Back+Start always cancels.**
 - **Keyboard shortcut:** must include Ctrl, Alt, Shift, or Win. A bare key is rejected, since an unmodified global hotkey would swallow that key everywhere on your PC while the app is running. **Esc cancels.**
 
 ## System tray
@@ -210,7 +236,10 @@ you can tweak by hand or pre-configure a deployment.
 | `[Shortcut]` | `KeyModifiers` | Keyboard modifier bitmask (Alt=1, Ctrl=2, Shift=4, Win=8) |
 | `[Shortcut]` | `KeyCode` | Keyboard virtual-key code (must have a modifier) |
 | `[Input]` | `SwapConfirmBackButtons` | `0` = A confirm / B back (RPCS3 style), `1` = B confirm / A back (Cemu style) |
-| `[Input]` | `BackgroundIndex` | Index into the bundled `Assets/Wallpapers/background*.png` choices |
+| `[Input]` | `BackgroundIndex` | Index into the bundled `Assets/Wallpapers/background*.png` choices; one past the last one means **No Background** (transparent backdrop) |
+| `[Input]` | `StoryMode` | `1` = show only the starter pack when picking a figure, `0` = all series |
+| `[Input]` | `ButtonConfirm` / `ButtonBack` / `ButtonSettings` | Raw XInput button for confirm / back / open settings (A=4096, B=8192, Y=32768) |
+| `[Input]` | `ButtonMoveActive` / `ButtonQuickLoad` / `ButtonQuickClear` | Raw XInput button for the one-press pad actions (X=16384, RB=512, LB=256). D-pad values are ignored and fall back to the default |
 | `[Web]` | `Enabled` | `1` = serve the phone UI / `0` = no web server at all (default `1`) |
 | `[Web]` | `Port` | Port the HTTP server binds (default `8765`) |
 
