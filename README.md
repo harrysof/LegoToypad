@@ -104,9 +104,11 @@ Press **Y / S** on the pad grid to open Settings:
    Batman, Gandalf The Grey, Wyldstyle and the Batmobile.
 5. **Button - …** — one row per action (Confirm, Back, Settings, Move active
    pad, Quick load, Quick clear). Select a row, release every controller
-   button, then press the button you want. The D-pad stays reserved for menu
-   navigation, and a button already used by another action or by the overlay
-   toggle is rejected. **Back+Start or Esc cancels.**
+   button, then press the button you want — including **LT / RT**, which the
+   app reads as buttons even though the controller reports them as axes. The
+   D-pad stays reserved for menu navigation, and a button already used by
+   another action or by the overlay toggle is rejected with a message on the
+   Settings screen. **Back+Start or Esc cancels.**
 6. **Clear all pad** — empty every slot at once (useful if the emulator reset
    its Toypad state out from under the app, e.g. after an emulator restart).
 7. **Web remote** — turn the phone UI on or off (see below).
@@ -115,7 +117,7 @@ Press **Y / S** on the pad grid to open Settings:
 
 Default toggle is the controller **Back** button. Change it from Settings → Toggle shortcut:
 
-- **Controller combo:** release everything first, then press the new combo. It must include at least one button the picker doesn't already use itself — the D-pad and whatever is currently bound to Confirm / Back / Settings / Move active pad / Quick load / Quick clear are all off-limits on their own, so Back, Start or a stick click are the usual picks. **Back+Start always cancels.**
+- **Controller combo:** release everything first, then press the new combo (LT and RT count as buttons here too). It must include at least one button the picker doesn't already use itself — the D-pad and whatever is currently bound to Confirm / Back / Settings / Move active pad / Quick load / Quick clear are all off-limits on their own, so Back, Start or a stick click are the usual picks. **Back+Start always cancels.**
 - **Keyboard shortcut:** must include Ctrl, Alt, Shift, or Win. A bare key is rejected, since an unmodified global hotkey would swallow that key everywhere on your PC while the app is running. **Esc cancels.**
 
 ## System tray
@@ -240,6 +242,7 @@ you can tweak by hand or pre-configure a deployment.
 | `[Input]` | `StoryMode` | `1` = show only the starter pack when picking a figure, `0` = all series |
 | `[Input]` | `ButtonConfirm` / `ButtonBack` / `ButtonSettings` | Raw XInput button for confirm / back / open settings (A=4096, B=8192, Y=32768) |
 | `[Input]` | `ButtonMoveActive` / `ButtonQuickLoad` / `ButtonQuickClear` | Raw XInput button for the one-press pad actions (X=16384, RB=512, LB=256). D-pad values are ignored and fall back to the default |
+| | | The triggers extend the XInput mask: **LT=65536**, **RT=131072**. They work anywhere a button value does, including `[Shortcut] ControllerMask` |
 | `[Web]` | `Enabled` | `1` = serve the phone UI / `0` = no web server at all (default `1`) |
 | `[Web]` | `Port` | Port the HTTP server binds (default `8765`) |
 

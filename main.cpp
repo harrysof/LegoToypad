@@ -99,13 +99,27 @@ constexpr int kOverlayWidth = 900;
 		{3, 6, L"Right - lower right"},
 	}};
 
+	// Controller inputs as a bitmask. XInput's own WORD is full (0x0001 to
+	// 0x8000), so the analog triggers - which XInput reports as axes, not
+	// buttons - get bits above it and this stays 32-bit wide. Everything
+	// that stores or compares a button set uses this type, including the
+	// values persisted in LegoToypad.ini.
+	using ButtonMask = uint32_t;
+
+	// LT / RT as pressable buttons. A trigger counts as pressed past this
+	// much of its travel; XInput's own recommended threshold is 30/255,
+	// but a higher one keeps a resting finger from arming a binding.
+	constexpr ButtonMask kTriggerLeftButton = 0x00010000u;
+	constexpr ButtonMask kTriggerRightButton = 0x00020000u;
+	constexpr int16_t kTriggerPressThreshold = 8000; // of SDL's 0..32767
+
 	struct ButtonName
 	{
-		WORD mask;
+		ButtonMask mask;
 		const wchar_t* name;
 	};
 
-	constexpr std::array<ButtonName, 14> kButtonNames = {{
+	constexpr std::array<ButtonName, 16> kButtonNames = {{
 		{XINPUT_GAMEPAD_DPAD_UP, L"D-Pad Up"},
 		{XINPUT_GAMEPAD_DPAD_DOWN, L"D-Pad Down"},
 		{XINPUT_GAMEPAD_DPAD_LEFT, L"D-Pad Left"},
@@ -116,6 +130,8 @@ constexpr int kOverlayWidth = 900;
 		{XINPUT_GAMEPAD_RIGHT_THUMB, L"Right Stick Click"},
 		{XINPUT_GAMEPAD_LEFT_SHOULDER, L"LB"},
 		{XINPUT_GAMEPAD_RIGHT_SHOULDER, L"RB"},
+		{kTriggerLeftButton, L"LT"},
+		{kTriggerRightButton, L"RT"},
 		{XINPUT_GAMEPAD_A, L"A"},
 		{XINPUT_GAMEPAD_B, L"B"},
 		{XINPUT_GAMEPAD_X, L"X"},
@@ -126,14 +142,14 @@ constexpr int kOverlayWidth = 900;
 	// the rest of the picker's own buttons live in kBindableActions and are
 	// checked dynamically (see ReservedNavigationMask below), since every
 	// one of them is remappable from the Settings screen.
-	constexpr WORD kDpadButtons = XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN |
+	constexpr ButtonMask kDpadButtons = XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN |
 		XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT;
 
 	// Reserved chord that always cancels shortcut capture on a controller,
 	// regardless of what is being assigned. Keyboard capture is cancelled
 	// with Esc instead. This guarantees there is always a way to back out
 	// without a mouse or keyboard.
-	constexpr WORD kShortcutCancelChord = XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_START;
+	constexpr ButtonMask kShortcutCancelChord = XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_START;
 
 	enum class Screen
 	{
@@ -199,7 +215,7 @@ constexpr int kOverlayWidth = 900;
 		HWND previousForegroundWindow = nullptr;
 
 		ShortcutType shortcutType = ShortcutType::Controller;
-		WORD shortcutControllerMask = XINPUT_GAMEPAD_BACK;
+		ButtonMask shortcutControllerMask = XINPUT_GAMEPAD_BACK;
 		UINT shortcutKeyModifiers = 0;
 		UINT shortcutKeyCode = 0;
 bool swapConfirmBackButtons = false;
@@ -211,12 +227,12 @@ bool swapConfirmBackButtons = false;
 		bool storyMode = false;
 		// Controller bindings for the picker's own actions. Single-button
 		// masks, remappable from the Settings screen, persisted in [Input].
-		WORD buttonConfirm = XINPUT_GAMEPAD_A;
-		WORD buttonBack = XINPUT_GAMEPAD_B;
-		WORD buttonSettings = XINPUT_GAMEPAD_Y;
-		WORD buttonMoveActive = XINPUT_GAMEPAD_X;
-		WORD buttonQuickLoad = XINPUT_GAMEPAD_RIGHT_SHOULDER;
-		WORD buttonQuickClear = XINPUT_GAMEPAD_LEFT_SHOULDER;
+		ButtonMask buttonConfirm = XINPUT_GAMEPAD_A;
+		ButtonMask buttonBack = XINPUT_GAMEPAD_B;
+		ButtonMask buttonSettings = XINPUT_GAMEPAD_Y;
+		ButtonMask buttonMoveActive = XINPUT_GAMEPAD_X;
+		ButtonMask buttonQuickLoad = XINPUT_GAMEPAD_RIGHT_SHOULDER;
+		ButtonMask buttonQuickClear = XINPUT_GAMEPAD_LEFT_SHOULDER;
 		// Index into kBindableActions while capturing a new button for one
 		// of them from Settings; -1 when no binding capture is running.
 		int capturingBindingIndex = -1;
@@ -265,7 +281,7 @@ bool swapConfirmBackButtons = false;
 	{
 		const wchar_t* label;   // Settings row / status text
 		const wchar_t* iniKey;  // [Input] key it persists under
-		WORD AppState::*button; // the binding itself
+		ButtonMask AppState::*button; // the binding itself
 	};
 
 	constexpr std::array<BindableAction, 6> kBindableActions = {{
@@ -287,9 +303,9 @@ bool swapConfirmBackButtons = false;
 	// use of the picker, so shortcut capture requires at least one button
 	// outside this set. Computed at call time because the bindings are
 	// remappable.
-	WORD ReservedNavigationMask()
+	ButtonMask ReservedNavigationMask()
 	{
-		WORD mask = kDpadButtons;
+		ButtonMask mask = kDpadButtons;
 		for (const auto& action : kBindableActions)
 			mask |= g_app.*(action.button);
 		return mask;
@@ -1414,8 +1430,9 @@ void UpdateInputOwnership(HWND window);
 			"[Shortcut]\n"
 			"; Type = Controller | Keyboard\n"
 			"Type=Controller\n"
-			"; Controller: raw XInput button bitmask (Back = 32). Combine buttons for a\n"
-			"; chord by adding their values, e.g. LB (256) + RB (512) = 768.\n"
+			"; Controller: raw XInput button bitmask (Back = 32), plus LT = 65536 and\n"
+			"; RT = 131072 for the analog triggers. Combine buttons for a chord by\n"
+			"; adding their values, e.g. LB (256) + RB (512) = 768.\n"
 			"; Must include at least one button that isn't the D-pad or one of the\n"
 			"; Button* bindings below, since those already drive the picker's menus.\n"
 			"ControllerMask=32\n"
@@ -1439,9 +1456,10 @@ void UpdateInputOwnership(HWND window);
 			"; Wyldstyle, Batmobile) when picking a figure, skipping the series grid.\n"
 			"StoryMode=0\n"
 			"; Controller bindings for the picker's own actions, as raw XInput button\n"
-			"; values (A=4096, B=8192, X=16384, Y=32768, LB=256, RB=512, Start=16,\n"
-			"; Back=32, stick clicks=64/128). One button per action; easiest to set\n"
-			"; them from the in-app Settings screen instead of editing these by hand.\n"
+			"; values (A=4096, B=8192, X=16384, Y=32768, LB=256, RB=512, LT=65536,\n"
+			"; RT=131072, Start=16, Back=32, stick clicks=64/128). One button per\n"
+			"; action; easiest to set them from the in-app Settings screen instead of\n"
+			"; editing these by hand.\n"
 			"ButtonConfirm=4096\n"
 			"ButtonBack=8192\n"
 			"ButtonSettings=32768\n"
@@ -1464,7 +1482,7 @@ void UpdateInputOwnership(HWND window);
 	// Shortcut description / persistence
 	// ---------------------------------------------------------------------
 
-	std::wstring DescribeControllerMask(WORD mask)
+	std::wstring DescribeControllerMask(ButtonMask mask)
 	{
 		if (mask == 0)
 			return L"(none)";
@@ -1523,19 +1541,19 @@ void UpdateInputOwnership(HWND window);
 
 	// The confirm/back buttons the picker actually reacts to: the bound
 	// buttons, swapped as a pair when the RPCS3/Cemu style toggle says so.
-	WORD EffectiveConfirmMask()
+	ButtonMask EffectiveConfirmMask()
 	{
 		return g_app.swapConfirmBackButtons ? g_app.buttonBack : g_app.buttonConfirm;
 	}
 
-	WORD EffectiveBackMask()
+	ButtonMask EffectiveBackMask()
 	{
 		return g_app.swapConfirmBackButtons ? g_app.buttonConfirm : g_app.buttonBack;
 	}
 
 	std::wstring DescribeConfirmButtonMode()
 	{
-		const WORD confirm = EffectiveConfirmMask();
+		const ButtonMask confirm = EffectiveConfirmMask();
 		if (confirm == XINPUT_GAMEPAD_A)
 			return L"A (RPCS3)";
 		if (confirm == XINPUT_GAMEPAD_B)
@@ -1626,12 +1644,12 @@ void UpdateInputOwnership(HWND window);
 		// action unbound, shown as "(none)" in Settings) when it collides
 		// with an action earlier in the list - one press firing two actions
 		// is worse than one action the user can simply rebind.
-		WORD usedButtons = 0;
+		ButtonMask usedButtons = 0;
 		for (const auto& action : kBindableActions)
 		{
-			const WORD stored = static_cast<WORD>(GetPrivateProfileIntW(
+			const ButtonMask stored = static_cast<ButtonMask>(GetPrivateProfileIntW(
 				L"Input", action.iniKey, g_app.*(action.button), iniPath.c_str()));
-			WORD value = (stored != 0 && (stored & kDpadButtons) == 0) ? stored : g_app.*(action.button);
+			ButtonMask value = (stored != 0 && (stored & kDpadButtons) == 0) ? stored : g_app.*(action.button);
 			if (value & usedButtons)
 				value = 0;
 			usedButtons |= value;
@@ -1702,7 +1720,7 @@ void UpdateInputOwnership(HWND window);
 		GetPrivateProfileStringW(L"Shortcut", L"Type", L"Controller", typeBuffer.data(),
 			static_cast<DWORD>(typeBuffer.size()), iniPath.c_str());
 		g_app.shortcutType = _wcsicmp(typeBuffer.data(), L"Keyboard") == 0 ? ShortcutType::Keyboard : ShortcutType::Controller;
-		g_app.shortcutControllerMask = static_cast<WORD>(
+		g_app.shortcutControllerMask = static_cast<ButtonMask>(
 			GetPrivateProfileIntW(L"Shortcut", L"ControllerMask", XINPUT_GAMEPAD_BACK, iniPath.c_str()));
 		g_app.shortcutKeyModifiers = static_cast<UINT>(
 			GetPrivateProfileIntW(L"Shortcut", L"KeyModifiers", 0, iniPath.c_str()));
@@ -2803,7 +2821,7 @@ case Screen::Settings:
 		g_app.status = L"Shortcut unchanged: " + DescribeShortcut();
 	}
 
-	void ApplyControllerShortcut(HWND window, WORD mask)
+	void ApplyControllerShortcut(HWND window, ButtonMask mask)
 	{
 		g_app.shortcutType = ShortcutType::Controller;
 		g_app.shortcutControllerMask = mask;
@@ -2846,7 +2864,7 @@ case Screen::Settings:
 	// D-pad, the current toggle shortcut and buttons already used by another
 	// action are rejected with an explanation instead of silently creating
 	// two actions that fire from one press.
-	void ApplyBinding(WORD button)
+	void ApplyBinding(ButtonMask button)
 	{
 		if (g_app.capturingBindingIndex < 0 ||
 			static_cast<size_t>(g_app.capturingBindingIndex) >= kBindableActions.size())
@@ -3644,7 +3662,6 @@ case Screen::RosterList:
 					DrawTextLine(g, L"Release every controller button first...", 24, hintY, width - 48, RGB(255, 204, 51), 26);
 				else
 					DrawTextLine(g, L"Listening: press a controller combo, or a keyboard shortcut.", 24, hintY, width - 48, RGB(255, 204, 51), 26);
-				DrawTextLine(g, L"Combo needs a button the picker doesn't use. Back+Start cancels. Keyboard needs a modifier. Esc cancels.", 24, hintY + 26, width - 48, RGB(255, 204, 51), 26);
 			}
 			else if (g_app.capturingBindingIndex >= 0)
 			{
@@ -3652,10 +3669,17 @@ case Screen::RosterList:
 					DrawTextLine(g, L"Release every controller button first...", 24, hintY, width - 48, RGB(255, 204, 51), 26);
 				else
 					DrawTextLine(g, std::wstring(L"Listening: press the new button for \"") +
-						kBindableActions[static_cast<size_t>(g_app.capturingBindingIndex)].label + L"\".",
+						kBindableActions[static_cast<size_t>(g_app.capturingBindingIndex)].label +
+						L"\" (any button or trigger, not the D-pad). Back+Start or Esc cancels.",
 						24, hintY, width - 48, RGB(255, 204, 51), 26);
-				DrawTextLine(g, L"One button, not the D-pad. Back+Start or Esc cancels.", 24, hintY + 26, width - 48, RGB(255, 204, 51), 26);
 			}
+
+			// Settings is the one screen where every action's outcome is a
+			// message rather than something visible on the pads, so the
+			// status line is drawn here. Without it a rejected binding (the
+			// button is already taken, say) looks like nothing happened.
+			if (!g_app.status.empty())
+				DrawTextLine(g, g_app.status, 24, hintY + 26, width - 48, RGB(196, 214, 240), 26);
 			break;
 		}
 		}
@@ -3739,10 +3763,10 @@ void PollController(HWND window)
 		struct ControllerState
 		{
 			SDL_GameController* handle = nullptr;
-			WORD previousButtons = 0;
+			ButtonMask previousButtons = 0;
 		};
 		static std::unordered_map<SDL_JoystickID, ControllerState> controllers;
-		static WORD previousCombinedButtons = 0;
+		static ButtonMask previousCombinedButtons = 0;
 		static DWORD lastNavigation = 0;
 
 		SDL_Event event;
@@ -3781,8 +3805,8 @@ void PollController(HWND window)
 		UpdateInputOwnership(window);
 
 		bool anyConnected = false;
-		WORD combinedButtons = 0;
-		WORD combinedPressed = 0;
+		ButtonMask combinedButtons = 0;
+		ButtonMask combinedPressed = 0;
 		bool stickUp = false;
 		bool stickDown = false;
 		bool stickLeft = false;
@@ -3792,7 +3816,7 @@ void PollController(HWND window)
 		{
 			(void)deviceId;
 			SDL_GameController* controller = state.handle;
-			WORD buttons = 0;
+			ButtonMask buttons = 0;
 			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_UP))
 				buttons |= XINPUT_GAMEPAD_DPAD_UP;
 			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN))
@@ -3825,6 +3849,13 @@ void PollController(HWND window)
 				buttons |= XINPUT_GAMEPAD_X;
 			if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_Y))
 				buttons |= XINPUT_GAMEPAD_Y;
+			// The triggers are axes, not buttons, so they are thresholded
+			// into their own mask bits here - otherwise LT/RT could never be
+			// bound to anything, or trigger a shortcut.
+			if (SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > kTriggerPressThreshold)
+				buttons |= kTriggerLeftButton;
+			if (SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > kTriggerPressThreshold)
+				buttons |= kTriggerRightButton;
 
 			// SDL2 reports stick Y negative = up / positive = down, inverted
 			// relative to XInput's sThumbLY; the 7849 deadzone threshold
@@ -3845,7 +3876,7 @@ void PollController(HWND window)
 				stickRight = true;
 			state.previousButtons = buttons;
 		}
-		const WORD previousCombined = previousCombinedButtons;
+		const ButtonMask previousCombined = previousCombinedButtons;
 		previousCombinedButtons = combinedButtons;
 
 		// -------------------------------------------------------------
@@ -3913,7 +3944,7 @@ void PollController(HWND window)
 					// Lowest set bit of the newly pressed buttons: bindings
 					// are single buttons, so a simultaneous multi-press just
 					// takes the lowest-valued one.
-					const WORD firstPressed = static_cast<WORD>(combinedPressed & (0u - static_cast<unsigned>(combinedPressed)));
+					const ButtonMask firstPressed = static_cast<ButtonMask>(combinedPressed & (0u - static_cast<unsigned>(combinedPressed)));
 					ApplyBinding(firstPressed);
 				}
 				InvalidateRect(window, nullptr, FALSE);
@@ -3950,8 +3981,8 @@ void PollController(HWND window)
 		// ~60Hz repaint path exactly as cheap as the old bitmap draws.
 		bool changed = false;
 
-		const WORD confirmButton = EffectiveConfirmMask();
-		const WORD backButton = EffectiveBackMask();
+		const ButtonMask confirmButton = EffectiveConfirmMask();
+		const ButtonMask backButton = EffectiveBackMask();
 
 		if (combinedPressed & confirmButton)
 		{
