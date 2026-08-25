@@ -22,8 +22,13 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
   required. Keyboard and mouse work too.
 - **True Toypad geometry**: 7 glossy pad slots matching the real 3/1/3 Toypad
   layout, with Load, Move and Clear actions per slot.
+- **Live Toypad LEDs**: the pads glow exactly as the game lights them — solid,
+  flashing or fading, per LED region — mirrored from the emulator in real time.
+  While the LEDs are on the pads render as bare outlines so the colour reads
+  true and every step of a fade is visible.
 - **Rounded-corner overlay window**: hovers above the emulator, drawn with GDI+
-  and rendered to an off-screen buffer for a flicker-free frame.
+  into a 32-bit alpha buffer and presented per-pixel, so glows fade out cleanly
+  over the game instead of leaving hard edges.
 - **Sits in the system tray**: stays hidden until the toggle shortcut shows it,
   launching with a one-time toast notification.
 - **Web remote**: a phone-friendly HTML UI is embedded in the exe and served
@@ -38,11 +43,11 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
   and bindings are shown as that pad's own button icons — following whichever
   pad is plugged in, or a style you pin yourself. No controller connected is
   called out on screen instead of leaving you guessing.
-- **No Background**: make the overlay's backdrop fully transparent so the game
-  stays visible between the UI elements.
+- **No Background**: make the overlay's backdrop genuinely transparent so the
+  game stays visible between the UI elements.
 - **Configurable everything**: toggle shortcut, confirm-button style, background
-  selection, story mode, button-icon style and a rebindable button for every
-  picker action all live in the in-app Settings screen — with a one-row reset
+  selection, story mode, button-icon style, Toypad LEDs and a rebindable button
+  for every picker action all live in the in-app Settings screen — with a one-row reset
   back to the defaults.
 
 ## Screenshots
@@ -119,25 +124,59 @@ Press **Y / S** on the pad grid to open Settings:
    presentation only — every pad works either way. With several pads connected
    at once, Auto prefers Xbox, then DualShock 4, then Switch. (A DualSense uses
    the DualShock 4 icons.)
-6. **Button - …** — one row per action (Confirm, Back, Settings, Move active
+6. **Toypad LEDs** — mirror the running game's Toypad lights onto the pads
+   (default **On**). Off stops the poll thread entirely — nothing is sent to the
+   listener — and the pads go back to their printed artwork. On relights
+   immediately from the game's current state. Needs a listener build that
+   answers `GET_LED`; see **Listener protocol** below.
+7. **Button - …** — one row per action (Confirm, Back, Settings, Move active
    pad, Quick load, Quick clear). Select a row, release every controller
    button, then press the button you want — including **LT / RT**, which the
    app reads as buttons even though the controller reports them as axes. The
    D-pad stays reserved for menu navigation, and a button already used by
    another action or by the overlay toggle is rejected with a message on the
    Settings screen. **Back+Start or Esc cancels.**
-7. **Clear all pad** — empty every slot at once (useful if the emulator reset
+8. **Clear all pad** — empty every slot at once (useful if the emulator reset
    its Toypad state out from under the app, e.g. after an emulator restart).
-8. **Web remote** — turn the phone UI on or off (see below).
-9. **Reset all settings to defaults** — puts every row above back to its
+9. **Web remote** — turn the phone UI on or off (see below).
+10. **Reset all settings to defaults** — puts every row above back to its
    out-of-the-box value: controller **Back** toggle, A-confirm, first
-   background, **All series** character selection, Auto button labels and the
-   default bindings. The listener and web-remote *ports* are left alone, since
+   background, **All series** character selection, Auto button labels, Toypad
+   LEDs on and the default bindings. The listener and web-remote *ports* are left alone, since
    those live only in `LegoToypad.ini`.
 
 While a button is being captured, the line under the list tells you what to
 press and why a press was refused ("that button is already used by Back"), so
 rebinding never fails silently.
+
+## Toypad LEDs
+
+LEGO Dimensions drives the physical Toypad's three LED regions (left, centre and
+right) constantly — not just during keystone puzzles — and the overlay mirrors
+that live. It polls the emulator's listener ~30 times a second with a `GET_LED`
+request and renders whatever the game last set: a steady colour, a flash on its
+real on/off timing, or a fade breathing between levels.
+
+The colours are the game's own. The app assigns no meaning to them; it paints
+the exact RGB the game sent.
+
+While the LEDs are on the pads are drawn as **bare outlined boxes** at the same
+size, position and shape as the artwork they replace. A colour laid over the
+dark printed glass reads as a muddy wash and its fade is almost impossible to
+follow; over an empty box the hue is true and the whole ramp is visible.
+Characters and vehicles are drawn on top of the tint, so a lit pad never hides
+which figure is standing on it. Turn the LEDs off and the artwork comes back.
+
+This needs a listener build that answers the `GET_LED` command — the
+[Cemu 2.6 Remote Toypad Build](https://github.com/harrysof/Cemu-2.6-Remote-Toypad-Build)
+release that ships alongside this one. Against an older listener the request
+goes unanswered and the pads simply stay unlit.
+
+Press **G** on the pad screen for a built-in demo (solid blue centre, flashing
+green left, breathing red right) to check the rendering without a game running.
+The status line also reports `LED: serial=N`, which advances whenever the game
+changes a region — handy for telling "the game isn't sending anything" apart
+from "the mirror is broken".
 
 ## Overlay shortcut
 
@@ -270,6 +309,7 @@ you can tweak by hand or pre-configure a deployment.
 | `[Input]` | `ButtonConfirm` / `ButtonBack` / `ButtonSettings` | Raw XInput button for confirm / back / open settings (A=4096, B=8192, Y=32768) |
 | `[Input]` | `ButtonMoveActive` / `ButtonQuickLoad` / `ButtonQuickClear` | Raw XInput button for the one-press pad actions (X=16384, RB=512, LB=256). D-pad values are ignored and fall back to the default |
 | | | The triggers extend the XInput mask: **LT=65536**, **RT=131072**. They work anywhere a button value does, including `[Shortcut] ControllerMask` |
+| `[Input]` | `ToypadLeds` | `1` = mirror the game's Toypad LEDs onto the pads / `0` = off, no LED polling at all (default `1`) |
 | `[Input]` | `ButtonStyle` | `Auto` (follow the connected pad) / `Xbox` / `DualShock4` / `Switch`. Icons only — every pad works either way |
 | `[Web]` | `Enabled` | `1` = serve the phone UI / `0` = no web server at all (default `1`) |
 | `[Web]` | `Port` | Port the HTTP server binds (default `8765`) |
@@ -283,11 +323,27 @@ A tiny fire-and-forget TCP protocol on loopback to the emulator's listener:
 | **LOAD** | `0x01`, pad, index, `0x00`, `0x00` | 180 raw tag bytes + 2-byte little-endian path length + path |
 | **REMOVE** | `0x02`, pad, index, `0x00`, `0x00` | — |
 | **MOVE** | `0x03`, destPad, destIndex, srcPad, srcIndex | — |
+| **GET_LED** | `0x04`, `0x00`, `0x00`, `0x00`, `0x00` | — (the listener replies, see below) |
 
 `pad`/`index` select one of the emulator's 7 Toypad slots. Tag bytes come from
 the embedded resources, and since there is no on-disk `.bin` anymore the LOAD
 path length is `0` — game writes stay in the emulator's memory for the session
 instead of persisting to a file.
+
+`GET_LED` is the one message that expects a reply: a fixed 30-byte LED
+snapshot.
+
+```
+[0]   0x4C  'L' magic
+[1]   serial       increments whenever any region actually changes
+[2]   0x03         region count
+[3..] 3 x 9 bytes: pad, mode, r, g, b, onTicks, offTicks, count, speedTicks
+```
+
+`mode` is `0 = off, 1 = solid, 2 = flash, 3 = fade`; `pad` is the wire value
+(`1 = centre, 2 = left, 3 = right`). Durations are Toypad ticks of ~40ms each.
+The serial lets the app skip a snapshot it has already applied, so an unchanged
+flash is never restarted mid-cycle.
 
 ## Notes
 

@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -56,14 +58,8 @@ namespace
 constexpr int kOverlayWidth = 900;
 	constexpr int kOverlayHeight = 610;
 	constexpr BYTE kOverlayAlpha = 235; // 0-255, uniform translucency for the whole panel.
-	// Color that turns fully transparent when the "No Background" choice is
-	// active (LWA_COLORKEY): the frame is painted onto this color instead of
-	// a wallpaper, so everything between the UI elements shows the game.
-	// Nearly black, so antialiased edges blending toward it stay clean, but
-	// dark enough that no UI element ever produces this exact value itself.
-	constexpr COLORREF kNoBackgroundColorKey = RGB(8, 0, 8);
 	constexpr int kWindowCornerRadius = 6;
-	constexpr wchar_t kAppVersion[] = L"1.5.0";
+	constexpr wchar_t kAppVersion[] = L"1.6.0";
 
 	// Tray icon / menu.
 	constexpr UINT kTrayCallbackMessage = WM_APP + 1;
@@ -238,6 +234,29 @@ constexpr int kOverlayWidth = 900;
 		unsigned int ringColor = 0;
 	};
 
+	// How a physical pad region's LED is behaving, as commanded by the game's
+	// HID LED commands (0xC0..0xC8). The app mirrors this so the overlay glows
+	// like the real toypad during keystone puzzles. ApplyLedCommand is the seam
+	// the wire poll (and the mock demo) drives.
+	//
+	// Durations arrive as toypad *ticks*, not milliseconds - the wire fields are
+	// single bytes, so a millisecond reading would cap every effect at 255ms and
+	// make finite ones expire before the first repaint. See kLedTickMs.
+	enum class LedMode : uint8_t { Off, Solid, Flash, Fade };
+
+	struct LedRegion
+	{
+		LedMode mode = LedMode::Off;
+		uint8_t r = 0, g = 0, b = 0;
+		int onTicks = 0;    // Flash: lit duration, in toypad ticks
+		int offTicks = 0;   // Flash: dark duration, in toypad ticks
+		int count = 0;      // Flash/Fade: cycle count, 0 = repeat until next command
+		int speedTicks = 0; // Fade: ticks per fade step
+		DWORD cycleStart = 0;
+		float intensity = 0.0f;      // 0..1, computed by the animation tick
+		float startIntensity = 0.0f; // Brightness the current fade ramps from
+	};
+
 	// One flat slot in the roster grid: either a character portrait, a
 	// vehicle's build-1 portrait, or the "+" tile of a multi-build vehicle.
 	struct RosterSlot
@@ -286,6 +305,11 @@ bool swapConfirmBackButtons = false;
 		// Which pad's button labels the UI uses. 0 = Auto (follow whatever
 		// is connected), 1..4 = pinned to one style.
 		size_t buttonStyleChoice = 0;
+		// Mirrors the running game's toypad LEDs onto the overlay's pads.
+		// On by default, because the lights are the point of the mirror; off
+		// stops the poll thread entirely, so nothing talks to the listener
+		// and the pads stay their plain colours.
+		bool ledMirrorEnabled = true;
 		// Live controller facts, refreshed by every controller poll: what
 		// Auto resolves to, and whether anything is plugged in at all.
 		ButtonStyle detectedButtonStyle = ButtonStyle::Xbox;
@@ -304,6 +328,7 @@ bool swapConfirmBackButtons = false;
 		bool shortcutCaptureArmed = false;
 
 		std::array<PadSlot, 7> padState{};
+		std::array<LedRegion, 3> ledRegions{};
 		// True while PadViewer is being shown specifically to pick a Move's
 		// destination pad, rather than the normal "pick a pad to act on"
 		// mode. Reuses the same screen/grid per the original design intent.
@@ -350,7 +375,7 @@ bool swapConfirmBackButtons = false;
 	// Settings rows: shortcut, confirm style, background, story mode,
 	// button labels, one rebind row per kBindableActions entry, clear all
 	// pads, web remote, reset to defaults.
-	constexpr size_t kSettingsBindingFirst = 5;
+	constexpr size_t kSettingsBindingFirst = 6;
 	constexpr size_t kSettingsItemCount = kSettingsBindingFirst + kBindableActions.size() + 3;
 
 	// Auto resolves to the connected pad's own style; a pinned choice wins
@@ -412,6 +437,10 @@ bool swapConfirmBackButtons = false;
 	HWND g_webWindow = nullptr;
 	std::thread g_webThread;
 	HWND g_mainWindow = nullptr;
+	// Serialises all loopback connections to the emulator's Toypad listener:
+	// the LED poll thread and the LOAD/REMOVE/MOVE sends run concurrently, and
+	// the listener serves one connection at a time, so only one is ever open.
+	std::mutex g_socketMutex;
 
 	// The library catalog is static once the app is running, so it is built a
 	// single time on the UI thread (it reads live background settings) and
@@ -433,6 +462,9 @@ void UpdateInputOwnership(HWND window);
 	bool StartWebServer(HWND window);
 	void StopWebServer();
 	void ToggleWebRemote();
+	void ToggleLedMirror();
+	void SetLedMirrorEnabled(bool enabled);
+	std::wstring DescribeLedMirror();
 	std::wstring DescribeWebRemote();
 	std::wstring GetLanAddress();
 	void HandleWebJob(WebJob& job);
@@ -468,6 +500,7 @@ void UpdateInputOwnership(HWND window);
 		PillRow,      // capsule focus highlight row
 		Background,   // full-window starfield + dark overlay
 		ScaledImage,  // raw asset rescaled (optionally rounded-rect clipped) once
+		LedHalo,      // per-region LED glow (tinted soft halo, cached per color+level)
 	};
 
 	struct GlossKey
@@ -762,13 +795,26 @@ void UpdateInputOwnership(HWND window);
 	// crisp focus edge so they stay cheap to render.
 	// the slot's background resource id, since each of the 7 pads renders a
 	// different base image even at identical visuals/size.
+	//
+	// `outlineOnly` strips the pad back to an empty outlined box at exactly the
+	// same size, position and corner shape: the printed glass art and the
+	// occupant tint are both skipped, so DrawLedRegionTint's colour lands on
+	// bare transparency. A colour over dark printed art reads as a muddy wash
+	// and its fade is almost impossible to follow; over an empty box the hue is
+	// true and every step of the ramp is visible. It follows the Toypad LEDs
+	// setting rather than whether a region happens to be lit right now, so pads
+	// never flip between art and outline mid-flash. It is a separate cache
+	// variant, so the switch costs one extra cached bitmap per pad.
 	constexpr int kPadGlowMargin = 8;
+	constexpr int kPadOutlineVariantBit = 0x100;
 
-	Gdiplus::Bitmap* RenderPad(int slotIndex, const RECT& cell, PadVisual visual, unsigned int occupantColor)
+	Gdiplus::Bitmap* RenderPad(int slotIndex, const RECT& cell, PadVisual visual, unsigned int occupantColor,
+		bool outlineOnly)
 	{
 		const int w = (cell.right - cell.left) + kPadGlowMargin * 2;
 		const int h = (cell.bottom - cell.top) + kPadGlowMargin * 2;
-		const GlossKey key{GlossKind::Pad, static_cast<int>(visual), kPadBackgroundResourceIds[slotIndex], occupantColor, w, h};
+		const int variant = static_cast<int>(visual) | (outlineOnly ? kPadOutlineVariantBit : 0);
+		const GlossKey key{GlossKind::Pad, variant, kPadBackgroundResourceIds[slotIndex], occupantColor, w, h};
 		const auto cached = g_glossCache.find(key);
 		if (cached != g_glossCache.end())
 			return cached->second;
@@ -793,7 +839,7 @@ void UpdateInputOwnership(HWND window);
 		// The real pad art (already includes the glass/gloss look) fills the
 		// cell rect; the procedural gradient and synthetic glossy streak are
 		// gone. The rounded-rect clip keeps the shape's outline crisp.
-		Gdiplus::Bitmap* padImage = GetAssetBitmap(kPadBackgroundResourceIds[slotIndex]);
+		Gdiplus::Bitmap* padImage = outlineOnly ? nullptr : GetAssetBitmap(kPadBackgroundResourceIds[slotIndex]);
 		if (padImage)
 		{
 			Gdiplus::Region clip(&path);
@@ -805,7 +851,7 @@ void UpdateInputOwnership(HWND window);
 		const unsigned int occupiedColor = occupantColor != 0 ? occupantColor : kPadBorderOccupied;
 		// Occupied has no dedicated art, so the loaded figure's generated
 		// color becomes a soft per-pad tint over the same glass texture.
-		if (occupied)
+		if (occupied && !outlineOnly)
 		{
 			Gdiplus::SolidBrush tint(Gdiplus::Color(
 				42, GetRValue(occupiedColor), GetGValue(occupiedColor), GetBValue(occupiedColor)));
@@ -1265,12 +1311,10 @@ void UpdateInputOwnership(HWND window);
 
 		if (backgroundResourceId == 0)
 		{
-			// "No Background": the whole frame starts as the transparent
-			// color key, so everything the UI doesn't cover shows the game.
-			// No legibility overlay either - there is nothing to darken.
-			Gdiplus::SolidBrush keyFill(Gdiplus::Color(255,
-				GetRValue(kNoBackgroundColorKey), GetGValue(kNoBackgroundColorKey), GetBValue(kNoBackgroundColorKey)));
-			g.FillRectangle(&keyFill, 0, 0, width, height);
+			// "No Background": nothing is drawn at all, so the frame stays
+			// fully transparent (alpha 0) and everything the UI doesn't
+			// cover shows the game. No legibility overlay either - there is
+			// nothing to darken.
 			g_glossCache[key] = bitmap;
 			return bitmap;
 		}
@@ -1843,6 +1887,8 @@ void UpdateInputOwnership(HWND window);
 			g_app.storyMode ? L"1" : L"0", iniPath.c_str());
 		WritePrivateProfileStringW(L"Input", L"ButtonStyle",
 			ButtonStyleIniValue(g_app.buttonStyleChoice), iniPath.c_str());
+		WritePrivateProfileStringW(L"Input", L"ToypadLeds",
+			g_app.ledMirrorEnabled ? L"1" : L"0", iniPath.c_str());
 		for (const auto& action : kBindableActions)
 			WritePrivateProfileStringW(L"Input", action.iniKey,
 				std::to_wstring(g_app.*(action.button)).c_str(), iniPath.c_str());
@@ -1861,6 +1907,8 @@ void UpdateInputOwnership(HWND window);
 		GetPrivateProfileStringW(L"Input", L"ButtonStyle", L"Auto", styleBuffer.data(),
 			static_cast<DWORD>(styleBuffer.size()), iniPath.c_str());
 		g_app.buttonStyleChoice = ButtonStyleChoiceFromIni(styleBuffer.data());
+		g_app.ledMirrorEnabled =
+			GetPrivateProfileIntW(L"Input", L"ToypadLeds", 1, iniPath.c_str()) != 0;
 		// A hand-edited value falls back to the built-in default when it is
 		// unset (0) or a D-pad button, and is dropped entirely (leaving the
 		// action unbound, shown as "(none)" in Settings) when it collides
@@ -1900,18 +1948,17 @@ void UpdateInputOwnership(HWND window);
 		g_app.status = L"Confirm button: " + DescribeConfirmButtonMode();
 	}
 
-	// Uniform-alpha only, or alpha plus the transparent color key when the
-	// "No Background" choice is active. Re-applied whenever the background
-	// choice changes, so a wallpaper never gets key-color holes punched in
-	// it and No Background always shows the game between UI elements.
+	// The frame carries its own alpha channel and reaches the screen through
+	// UpdateLayeredWindow (see Paint), so switching backgrounds needs nothing
+	// more than a repaint: "No Background" simply leaves those pixels at
+	// alpha 0. SetLayeredWindowAttributes must never be called on this window
+	// - it would put it back into whole-pixel (color-key) transparency and
+	// make every later UpdateLayeredWindow fail.
 	void ApplyOverlayTransparency(HWND window)
 	{
 		if (!window)
 			return;
-		if (IsNoBackground())
-			SetLayeredWindowAttributes(window, kNoBackgroundColorKey, kOverlayAlpha, LWA_ALPHA | LWA_COLORKEY);
-		else
-			SetLayeredWindowAttributes(window, 0, kOverlayAlpha, LWA_ALPHA);
+		InvalidateRect(window, nullptr, FALSE);
 	}
 
 	void CycleBackgroundChoice()
@@ -2049,6 +2096,9 @@ void UpdateInputOwnership(HWND window);
 	// set to a message suitable for g_app.status and false is returned.
 	bool SendToypadMessage(const uint8_t* data, size_t length, std::wstring& errorOut)
 	{
+		// One listener connection at a time: the LED poll uses the same port, so
+		// hold the shared mutex for the whole connect/send/close transaction.
+		std::lock_guard lock(g_socketMutex);
 		SOCKET clientSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (clientSocket == INVALID_SOCKET)
 		{
@@ -2832,6 +2882,8 @@ case Screen::Settings:
 				ToggleStoryMode();
 			else if (g_app.settingsIndex == 4)
 				CycleButtonStyle();
+			else if (g_app.settingsIndex == 5)
+				ToggleLedMirror();
 			else if (g_app.settingsIndex >= kSettingsBindingFirst &&
 				g_app.settingsIndex < kSettingsBindingFirst + kBindableActions.size())
 				BeginBindingCapture(g_app.settingsIndex - kSettingsBindingFirst);
@@ -3115,6 +3167,8 @@ case Screen::Settings:
 		g_app.backgroundIndex = defaults.backgroundIndex;
 		g_app.storyMode = defaults.storyMode;
 		g_app.buttonStyleChoice = defaults.buttonStyleChoice;
+		if (g_app.ledMirrorEnabled != defaults.ledMirrorEnabled)
+			SetLedMirrorEnabled(defaults.ledMirrorEnabled); // starts/stops the poll
 		for (const auto& action : kBindableActions)
 			g_app.*(action.button) = defaults.*(action.button);
 
@@ -3276,6 +3330,493 @@ case Screen::Settings:
 		{664, 364, 800, 500}, // 6 Right - lower right
 	}};
 
+	// ---------------------------------------------------------------------
+	// Toypad LED mirror: the physical pad's three RGB LED regions (left,
+	// center, right) glow during keystone puzzles, driven by the game's HID
+	// LED commands (0xC0..0xC8). The exact wire byte layout is still
+	// unconfirmed, so ApplyLedCommand is the seam that a future parser (and
+	// the mock demo below) calls; it needs only a pad region, a mode and a
+	// color. The overlay renders a soft tinted halo per region using the same
+	// box-blur glow as every other cached surface, quantized so a fade reuses
+	// a bounded set of cached halos instead of re-blurring every frame.
+	// ---------------------------------------------------------------------
+
+	// Slot indices covered by each region (0=left, 1=center, 2=right), one
+	// entry per physical pad: pad 2 = left, pad 1 = center, pad 3 = right.
+	constexpr std::array<std::array<int, 3>, 3> kLedRegionSlots = {{
+		{0, 3, 4}, // left
+		{1, 1, 1}, // center (single circular slot)
+		{2, 5, 6}, // right
+	}};
+	constexpr std::array<int, 3> kLedRegionSlotCount = {3, 1, 3};
+
+	constexpr int kLedGlowRadius = 14;
+	constexpr int kLedGlowMargin = kLedGlowRadius + 8;
+	constexpr int kLedIntensityLevels = 9;
+
+	// Milliseconds per toypad duration tick. The wire carries single-byte tick
+	// counts, so this is what turns them into wall-clock time. Calibrated from a
+	// LEGO Dimensions trace: the game's idle rainbow issues a Fade All with
+	// tickTime = 0x1E (30) and re-issues the next colour ~1.2s later, so one
+	// tick lands at ~40ms and a fade fills exactly the interval before it.
+	constexpr int kLedTickMs = 40;
+
+	RECT LedRegionBounds(int region)
+	{
+		RECT bbox{INT_MAX, INT_MAX, INT_MIN, INT_MIN};
+		for (int i = 0; i < kLedRegionSlotCount[region]; ++i)
+		{
+			const RECT& cell = kPadCells[static_cast<size_t>(kLedRegionSlots[region][i])];
+			bbox.left = std::min(bbox.left, cell.left);
+			bbox.top = std::min(bbox.top, cell.top);
+			bbox.right = std::max(bbox.right, cell.right);
+			bbox.bottom = std::max(bbox.bottom, cell.bottom);
+		}
+		return bbox;
+	}
+
+	// Adds one region's pad silhouettes to `path`, translated by (dx, dy) so
+	// the same shapes can be drawn either in window space or in a small
+	// cached halo bitmap's local space.
+	void AppendLedRegionShape(Gdiplus::GraphicsPath& path, int region, float dx, float dy)
+	{
+		for (int i = 0; i < kLedRegionSlotCount[region]; ++i)
+		{
+			const RECT& cell = kPadCells[static_cast<size_t>(kLedRegionSlots[region][i])];
+			const Gdiplus::RectF rect(
+				static_cast<float>(cell.left) + dx,
+				static_cast<float>(cell.top) + dy,
+				static_cast<float>(cell.right - cell.left),
+				static_cast<float>(cell.bottom - cell.top));
+			if (kLedRegionSlots[region][i] == 1)
+			{
+				path.AddEllipse(rect);
+			}
+			else
+			{
+				const float radius = 14.0f;
+				const float diameter = radius * 2.0f;
+				const float right = rect.X + rect.Width;
+				const float bottom = rect.Y + rect.Height;
+				path.StartFigure();
+				path.AddArc(rect.X, rect.Y, diameter, diameter, 180.0f, 90.0f);
+				path.AddArc(right - diameter, rect.Y, diameter, diameter, 270.0f, 90.0f);
+				path.AddArc(right - diameter, bottom - diameter, diameter, diameter, 0.0f, 90.0f);
+				path.AddArc(rect.X, bottom - diameter, diameter, diameter, 90.0f, 90.0f);
+				path.CloseFigure();
+			}
+		}
+	}
+
+	// Map a wire-protocol pad (1=center, 2=left, 3=right) to a region index.
+	int LedRegionForPad(uint8_t pad)
+	{
+		switch (pad)
+		{
+		case 2: return 0; // left
+		case 1: return 1; // center
+		case 3: return 2; // right
+		}
+		return -1;
+	}
+
+	// Entry point for LED state: mirrors one pad region's glow. This is the
+	// seam the future HID parser (and the mock demo) drives.
+	void ApplyLedCommand(uint8_t pad, LedMode mode, uint8_t r, uint8_t g, uint8_t b,
+		int onTicks = 0, int offTicks = 0, int count = 0, int speedTicks = 0)
+	{
+		const int region = LedRegionForPad(pad);
+		if (region < 0)
+			return;
+		LedRegion& led = g_app.ledRegions[static_cast<size_t>(region)];
+		// A fade ramps from whatever the pad is showing now, so a colour change
+		// mid-glow transitions instead of blacking out and climbing back up.
+		led.startIntensity = (led.mode == LedMode::Off) ? 0.0f : led.intensity;
+		led.mode = mode;
+		led.r = r; led.g = g; led.b = b;
+		led.onTicks = onTicks; led.offTicks = offTicks;
+		led.count = count; led.speedTicks = speedTicks;
+		led.cycleStart = GetTickCount();
+		led.intensity = (mode == LedMode::Off) ? 0.0f
+			: (mode == LedMode::Fade) ? led.startIntensity
+			: 1.0f;
+	}
+
+	// Computes a region's current glow brightness from the clock, converting the
+	// wire's tick durations to milliseconds. Finite flashes expire dark once
+	// their cycles run out; finite fades settle *lit* on their target colour,
+	// which is what the hardware does - a fade is a transition, not a pulse.
+	// Settling matters beyond looks: the emulator suppresses a repeated
+	// identical command, so a region that extinguished itself would never be
+	// told to light up again.
+	float ComputeLedIntensity(LedRegion& led, DWORD now)
+	{
+		if (led.mode == LedMode::Off)
+			return 0.0f;
+		if (led.mode == LedMode::Solid)
+			return 1.0f;
+
+		const int elapsed = static_cast<int>(now - led.cycleStart);
+
+		if (led.mode == LedMode::Flash)
+		{
+			const int period = (led.onTicks + led.offTicks) * kLedTickMs;
+			if (period <= 0)
+				return 1.0f; // Degenerate flash: treat as steady rather than strobing.
+			if (led.count > 0 && elapsed >= period * led.count)
+			{
+				led.mode = LedMode::Off;
+				return 0.0f;
+			}
+			const DWORD phase = static_cast<DWORD>(elapsed) % static_cast<DWORD>(period);
+			return phase < static_cast<DWORD>(led.onTicks * kLedTickMs) ? 1.0f : 0.0f;
+		}
+
+		// Fade. count == 0 means "keep going until the next command", which the
+		// pad shows as continuous breathing; a finite count ramps to full over
+		// its run and then holds as a steady glow.
+		const int step = (led.speedTicks > 0 ? led.speedTicks : 25) * kLedTickMs;
+		if (led.count <= 0)
+		{
+			const double t = (static_cast<DWORD>(elapsed) % static_cast<DWORD>(step)) / static_cast<double>(step);
+			return static_cast<float>(0.5 - 0.5 * std::cos(t * 6.28318530717958647692));
+		}
+
+		const int duration = step * led.count;
+		if (elapsed >= duration)
+		{
+			led.mode = LedMode::Solid;
+			return 1.0f;
+		}
+		const float t = static_cast<float>(elapsed) / static_cast<float>(duration);
+		return led.startIntensity + (1.0f - led.startIntensity) * t;
+	}
+
+	// Advances the animation clock and reports whether any region is still
+	// animating (flash/fade) and therefore needs continuous repaints.
+	bool AdvanceLedAnimation()
+	{
+		const DWORD now = GetTickCount();
+		bool animating = false;
+		for (auto& led : g_app.ledRegions)
+		{
+			if (led.mode == LedMode::Flash || led.mode == LedMode::Fade)
+				animating = true;
+			led.intensity = ComputeLedIntensity(led, now);
+		}
+		return animating;
+	}
+
+	// Cached soft tinted halo for one region at one brightness level. The
+	// expensive blur runs once per (region, color, level); steady-state fades
+	// then just DrawImage a cached bitmap.
+	Gdiplus::Bitmap* RenderLedHalo(int region, uint8_t r, uint8_t g, uint8_t b, int level)
+	{
+		if (level <= 0)
+			return nullptr;
+
+		const RECT bbox = LedRegionBounds(region);
+		if (bbox.left == INT_MAX)
+			return nullptr;
+
+		const int w = (bbox.right - bbox.left) + kLedGlowMargin * 2;
+		const int h = (bbox.bottom - bbox.top) + kLedGlowMargin * 2;
+		const unsigned int color = (static_cast<unsigned int>(level) << 24) |
+			(static_cast<unsigned int>(r) << 16) | (static_cast<unsigned int>(g) << 8) | b;
+		const GlossKey key{GlossKind::LedHalo, region, 0, color, w, h};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
+		Gdiplus::Graphics gfx(bitmap);
+		gfx.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+		Gdiplus::GraphicsPath path;
+		AppendLedRegionShape(path, region,
+			static_cast<float>(kLedGlowMargin - bbox.left),
+			static_cast<float>(kLedGlowMargin - bbox.top));
+
+		const float intensity = static_cast<float>(level) / static_cast<float>(kLedIntensityLevels - 1);
+		const BYTE rr = static_cast<BYTE>(r * intensity);
+		const BYTE gg = static_cast<BYTE>(g * intensity);
+		const BYTE bb = static_cast<BYTE>(b * intensity);
+		DrawGlow(gfx, path, RGB(rr, gg, bb), kLedGlowRadius, w, h);
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
+
+	// Draws the glow for any lit LED region, behind the pads. Called from
+	// Paint's pad screens before the pad loop.
+	void DrawLedRegionGlows(Gdiplus::Graphics& g)
+	{
+		for (int region = 0; region < 3; ++region)
+		{
+			const LedRegion& led = g_app.ledRegions[static_cast<size_t>(region)];
+			if (led.mode == LedMode::Off || led.intensity <= 0.004f)
+				continue;
+			const int level = std::clamp(
+				static_cast<int>(led.intensity * (kLedIntensityLevels - 1) + 0.5f),
+				1, kLedIntensityLevels - 1);
+			Gdiplus::Bitmap* halo = RenderLedHalo(region, led.r, led.g, led.b, level);
+			if (!halo)
+				continue;
+			const RECT bbox = LedRegionBounds(region);
+			g.DrawImage(halo, static_cast<int>(bbox.left) - kLedGlowMargin,
+				static_cast<int>(bbox.top) - kLedGlowMargin);
+		}
+	}
+
+	// Tints the actual pad surfaces with the LED colour, drawn on top of the
+	// pad art so the glow is unmistakable (the soft halo in DrawLedRegionGlows
+	// is behind the pads and would otherwise be hidden by the art). Alpha is
+	// scaled by the region's live intensity so solid pads stay lit and flash /
+	// fade pulses clearly.
+	void DrawLedRegionTint(Gdiplus::Graphics& g)
+	{
+		for (int region = 0; region < 3; ++region)
+		{
+			const LedRegion& led = g_app.ledRegions[static_cast<size_t>(region)];
+			if (led.mode == LedMode::Off || led.intensity <= 0.004f)
+				continue;
+			Gdiplus::GraphicsPath path;
+			AppendLedRegionShape(path, region, 0.0f, 0.0f); // window coordinates
+			// 210 rather than the old 140: with the LEDs on the pads are drawn
+			// as empty boxes, so this fill is the LED itself, not a stain on
+			// top of artwork. Scaling by intensity keeps the whole fade ramp
+			// legible from a bare glimmer up to full brightness.
+			const BYTE alpha = static_cast<BYTE>(std::clamp(210.0f * led.intensity, 0.0f, 255.0f));
+			Gdiplus::SolidBrush brush(Gdiplus::Color(alpha, led.r, led.g, led.b));
+			g.FillPath(&brush, &path);
+		}
+	}
+
+	// Mock feed: toggles a keystone-like scene so the LED glow can be seen
+	// before the real wire parser lands. Key 'G' from the pad viewer.
+	void ToggleLedDemo()
+	{
+		if (!g_app.ledMirrorEnabled)
+		{
+			g_app.status = L"Toypad LEDs are off - turn them on in Settings first.";
+			return;
+		}
+		static bool demoOn = false;
+		demoOn = !demoOn;
+		if (demoOn)
+		{
+			// Durations are toypad ticks (kLedTickMs each), matching the wire:
+			// 8 ticks ~ 320ms of flash, 35 ticks ~ 1.4s per breath.
+			ApplyLedCommand(1, LedMode::Solid, 40, 120, 255);           // center: solid blue
+			ApplyLedCommand(2, LedMode::Flash, 0, 220, 90, 8, 8);       // left: flashing green
+			ApplyLedCommand(3, LedMode::Fade, 230, 40, 40, 0, 0, 0, 35); // right: breathing red
+			g_app.status = L"LED demo ON - press G to stop.";
+		}
+		else
+		{
+			ApplyLedCommand(1, LedMode::Off, 0, 0, 0);
+			ApplyLedCommand(2, LedMode::Off, 0, 0, 0);
+			ApplyLedCommand(3, LedMode::Off, 0, 0, 0);
+			g_app.status = L"LED demo OFF.";
+		}
+	}
+
+	// ---------------------------------------------------------------------
+	// LED polling transport to the emulator's Toypad listener. A 5-byte GET_LED
+	// request elicits a fixed 30-byte LED snapshot, so the running game's
+	// keystone-puzzle pad glows can be mirrored without any push channel.
+	// The poll runs on its own thread and is serialised with LOAD/REMOVE/MOVE
+	// via g_socketMutex (the listener serves one connection at a time); parsed
+	// snapshots are marshalled back to the UI thread via kLedMessage so the
+	// glow never races the renderer.
+	// ---------------------------------------------------------------------
+	constexpr UINT kLedMessage = WM_APP + 3;
+	constexpr uint8_t kGetLedCommand = 0x04;
+	constexpr uint8_t kLedPollHeaderSize = 5;
+	constexpr uint8_t kLedResponseSize = 3 + 3 * 9;
+	constexpr int kLedPollIntervalMs = 33;
+
+	std::atomic<bool> g_ledPollRunning{false};
+	std::thread g_ledPollThread;
+	uint8_t g_lastLedSerial = 0xFF;
+
+	struct LedPollFrame
+	{
+		uint8_t serial;
+		std::array<uint8_t, 3> pad{};
+		std::array<uint8_t, 3> mode{};
+		std::array<uint8_t, 3> r{};
+		std::array<uint8_t, 3> g{};
+		std::array<uint8_t, 3> b{};
+		std::array<uint8_t, 3> onTicks{};
+		std::array<uint8_t, 3> offTicks{};
+		std::array<uint8_t, 3> count{};
+		std::array<uint8_t, 3> speedTicks{};
+	};
+
+	// Applies one polled snapshot, re-issuing a command only when a region's
+	// state actually changed (so an unchanged flash isn't restarted every poll).
+	// Runs on the UI thread via kLedMessage.
+	void ApplyLedFrame(const LedPollFrame& frame)
+	{
+		// The poll thread is stopped when the mirror is off, but a snapshot
+		// posted just before that can still arrive afterwards.
+		if (!g_app.ledMirrorEnabled)
+			return;
+		if (frame.serial == g_lastLedSerial)
+			return;
+		g_lastLedSerial = frame.serial;
+		bool changed = false;
+		for (size_t i = 0; i < 3; ++i)
+		{
+			const int region = LedRegionForPad(frame.pad[i]);
+			if (region < 0)
+				continue;
+			const LedRegion& current = g_app.ledRegions[static_cast<size_t>(region)];
+			const auto mode = static_cast<LedMode>(frame.mode[i]);
+			if (current.mode == mode && current.r == frame.r[i] && current.g == frame.g[i] &&
+				current.b == frame.b[i] && current.onTicks == frame.onTicks[i] && current.offTicks == frame.offTicks[i] &&
+				current.count == frame.count[i] && current.speedTicks == frame.speedTicks[i])
+				continue;
+			ApplyLedCommand(frame.pad[i], mode, frame.r[i], frame.g[i], frame.b[i],
+				frame.onTicks[i], frame.offTicks[i], frame.count[i], frame.speedTicks[i]);
+			changed = true;
+		}
+		// Diagnostic: report the LED serial so it's obvious whether the poll is
+		// receiving data. The number advances only when the game drives the pads.
+		g_app.status = L"LED: serial=" + std::to_wstring(frame.serial) + (changed ? L" (lit)" : L" (idle)");
+		if (g_app.overlayVisible)
+			InvalidateRect(g_mainWindow, nullptr, FALSE);
+	}
+
+	void LedPollThread(HWND window)
+	{
+		while (g_ledPollRunning)
+		{
+			{
+				std::lock_guard lock(g_socketMutex);
+				const SOCKET clientSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+				if (clientSocket != INVALID_SOCKET)
+				{
+					// A dead listener must never pin the shared mutex for long.
+					DWORD recvTimeout = 250;
+					setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO,
+						reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
+
+					sockaddr_in address{};
+					address.sin_family = AF_INET;
+					address.sin_port = htons(g_app.port);
+					address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+					if (connect(clientSocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR)
+					{
+						closesocket(clientSocket);
+					}
+					else
+					{
+						const uint8_t request[kLedPollHeaderSize] = {kGetLedCommand, 0, 0, 0, 0};
+						bool ok = SendAll(clientSocket, request, sizeof(request));
+						std::array<uint8_t, kLedResponseSize> response{};
+						if (ok)
+						{
+							size_t received = 0;
+							while (received < response.size())
+							{
+								const int got = recv(clientSocket,
+									reinterpret_cast<char*>(response.data() + received),
+									static_cast<int>(response.size() - received), 0);
+								if (got == SOCKET_ERROR || got == 0)
+								{
+									ok = false;
+									break;
+								}
+								received += static_cast<size_t>(got);
+							}
+						}
+						closesocket(clientSocket);
+						if (ok && response[0] == 0x4C && response[2] == 0x03)
+						{
+							LedPollFrame* frame = new LedPollFrame();
+							frame->serial = response[1];
+							for (size_t i = 0; i < 3; ++i)
+							{
+								const size_t off = 3 + i * 9;
+								frame->pad[i] = response[off + 0];
+								frame->mode[i] = response[off + 1];
+								frame->r[i] = response[off + 2];
+								frame->g[i] = response[off + 3];
+								frame->b[i] = response[off + 4];
+								frame->onTicks[i] = response[off + 5];
+								frame->offTicks[i] = response[off + 6];
+								frame->count[i] = response[off + 7];
+								frame->speedTicks[i] = response[off + 8];
+							}
+							if (!PostMessageW(window, kLedMessage, reinterpret_cast<WPARAM>(frame), 0))
+								delete frame;
+						}
+					}
+				}
+			}
+			if (!g_ledPollRunning)
+				break;
+			Sleep(kLedPollIntervalMs);
+		}
+	}
+
+	void StartLedPoll(HWND window)
+	{
+		bool expected = false;
+		if (!g_ledPollRunning.compare_exchange_strong(expected, true))
+			return;
+		g_ledPollThread = std::thread(LedPollThread, window);
+	}
+
+	void StopLedPoll()
+	{
+		if (!g_ledPollRunning.exchange(false))
+			return;
+		if (g_ledPollThread.joinable())
+			g_ledPollThread.join();
+	}
+
+	std::wstring DescribeLedMirror()
+	{
+		return g_app.ledMirrorEnabled ? L"On (mirror the game)" : L"Off";
+	}
+
+	// Turning the mirror off stops the poll thread (no more traffic to the
+	// listener) and darkens the three regions, so the pads go back to their
+	// plain colours instead of freezing on whatever the game last sent.
+	// Turning it on clears the remembered serial, so the very next snapshot
+	// counts as a change and lights the pads again immediately.
+	void SetLedMirrorEnabled(bool enabled)
+	{
+		g_app.ledMirrorEnabled = enabled;
+		if (enabled)
+		{
+			g_lastLedSerial = 0xFF;
+			StartLedPoll(g_mainWindow);
+		}
+		else
+		{
+			StopLedPoll();
+			for (auto& led : g_app.ledRegions)
+			{
+				led.mode = LedMode::Off;
+				led.intensity = 0.0f;
+				led.startIntensity = 0.0f;
+			}
+		}
+		if (g_mainWindow)
+			InvalidateRect(g_mainWindow, nullptr, FALSE);
+	}
+
+	void ToggleLedMirror()
+	{
+		SetLedMirrorEnabled(!g_app.ledMirrorEnabled);
+		SaveInputSettingsToIni();
+		g_app.status = L"Toypad LEDs: " + DescribeLedMirror();
+	}
+
 	// Franchise grid layout: 4 columns of large logo tiles, scrolled vertically.
 	constexpr int kFranchiseOriginX = 40;
 	constexpr int kFranchiseOriginY = 106;
@@ -3300,11 +3841,12 @@ case Screen::Settings:
 	constexpr int kPillRowH = 36;
 	constexpr int kPillPadV = 7;
 
-	// The glossy pad itself, plus a large centered occupant portrait when
-	// loaded. An empty pad is just the bare glass tile - no placeholder
-	// dot, no label - matching the reference design. No name text is
-	// drawn for occupied pads either; the portrait alone is the label.
-	void DrawPad(Gdiplus::Graphics& g, HDC dc, size_t index)
+	// The pad surface only - the glossy tile (or, with the LEDs on, its bare
+	// outline). The occupant portrait is deliberately NOT drawn here: it goes
+	// on in DrawPadOccupant after DrawLedRegionTint, so the LED colour passes
+	// behind the figure instead of washing over it. An empty pad is just the
+	// bare tile - no placeholder dot, no label - matching the reference design.
+	void DrawPad(Gdiplus::Graphics& g, size_t index)
 	{
 		const RECT& cell = kPadCells[index];
 		const bool selected = index == g_app.slotIndex;
@@ -3324,13 +3866,23 @@ case Screen::Settings:
 			visual = PadVisual::Idle;
 
 		const unsigned int occupantColor = occupied ? g_app.padState[index].ringColor : 0;
-		Gdiplus::Bitmap* pad = RenderPad(static_cast<int>(index), cell, visual, occupantColor);
+		// Toypad LEDs on: the pads are bare outlines so the LED colour reads
+		// directly instead of staining the printed glass art.
+		Gdiplus::Bitmap* pad = RenderPad(static_cast<int>(index), cell, visual, occupantColor,
+			g_app.ledMirrorEnabled);
 		if (pad)
 			g.DrawImage(pad, static_cast<int>(cell.left) - kPadGlowMargin, static_cast<int>(cell.top) - kPadGlowMargin);
+	}
 
-		if (!occupied)
-			return; // Empty pad: bare glass tile only, nothing drawn on top of it.
+	// The loaded figure's portrait, drawn on top of the LED tint so a lit pad
+	// never hides who is standing on it. No name text is drawn here either;
+	// the portrait alone is the label.
+	void DrawPadOccupant(Gdiplus::Graphics& g, size_t index)
+	{
+		if (!g_app.padState[index].occupied)
+			return;
 
+		const RECT& cell = kPadCells[index];
 		const int cellWidth = cell.right - cell.left;
 		const int cellHeight = cell.bottom - cell.top;
 		const PadSlot& slot = g_app.padState[index];
@@ -3408,7 +3960,7 @@ case Screen::Settings:
 
 	// Capsule menu floating above the selected pad (PadAction) or centered
 	// (PlusPicker). The focused row is drawn in its capsule highlight.
-	void DrawPillMenu(Gdiplus::Graphics& g, HDC dc, int x, int y, size_t rows,
+	void DrawPillMenu(Gdiplus::Graphics& g, int x, int y, size_t rows,
 		const std::vector<std::wstring>& options, size_t focusedIndex)
 	{
 		Gdiplus::Bitmap* pill = RenderPill(static_cast<int>(rows));
@@ -3543,7 +4095,7 @@ case Screen::Settings:
 	// ring + name below), plus a trailing "+" glyph - the same visual
 	// language as the franchise roster grid, on a shared characters_tile
 	// panel. The franchise logo is drawn above this in the screen painter.
-	void DrawPlusPickerMenu(Gdiplus::Graphics& g, HDC dc)
+	void DrawPlusPickerMenu(Gdiplus::Graphics& g)
 	{
 		if (!g_app.plusGroup || g_app.plusGroup->builds.empty())
 			return;
@@ -3618,7 +4170,7 @@ case Screen::Settings:
 			static_cast<float>(kScrollBarW), static_cast<float>(thumbH));
 	}
 
-	void DrawFranchiseGrid(Gdiplus::Graphics& g, HDC dc)
+	void DrawFranchiseGrid(Gdiplus::Graphics& g)
 	{
 		const size_t totalRows = (kFranchiseCount + kFranchiseCols - 1) / kFranchiseCols;
 		for (size_t row = 0; row < kFranchiseVisibleRows; ++row)
@@ -3659,7 +4211,7 @@ case Screen::Settings:
 		g.FillPath(&brush, &path);
 	}
 
-	void DrawRosterCategorySeparator(Gdiplus::Graphics& g, HDC dc, const RosterMetrics& metrics)
+	void DrawRosterCategorySeparator(Gdiplus::Graphics& g, const RosterMetrics& metrics)
 	{
 		if (!IsRosterSeparatorVisible())
 			return;
@@ -3670,7 +4222,7 @@ case Screen::Settings:
 		DrawRoundedSeparator(g, x, y, kRosterSeparatorW, kRosterSeparatorH);
 	}
 
-	void DrawRosterGrid(Gdiplus::Graphics& g, HDC dc)
+	void DrawRosterGrid(Gdiplus::Graphics& g)
 	{
 		if (g_app.rosterSlots.empty())
 		{
@@ -3683,7 +4235,7 @@ case Screen::Settings:
 		const size_t characterRows = GetRosterCharacterRows();
 		const RosterMetrics metrics = GetRosterMetrics(g);
 		const int vehicleSectionOffset = GetRosterVehicleSectionOffset(g, metrics);
-		DrawRosterCategorySeparator(g, dc, metrics);
+		DrawRosterCategorySeparator(g, metrics);
 		for (size_t row = 0; row < visibleRows; ++row)
 		{
 			for (size_t col = 0; col < kRosterCols; ++col)
@@ -3749,19 +4301,29 @@ case Screen::Settings:
 		const int width = client.right - client.left;
 		const int height = client.bottom - client.top;
 
-		// Everything below is drawn into an off-screen buffer first, then
-		// presented in one BitBlt at the end. Drawing the background fill
-		// and then content directly on the window's own surface (the
-		// original approach) is visibly flickery on a layered window, since
-		// DWM can composite a half-drawn frame; building the whole frame
-		// off-screen and blitting it atomically avoids that.
+		// Everything below is drawn into an off-screen 32-bit top-down DIB
+		// and the finished frame is handed to UpdateLayeredWindow in one
+		// call. Drawing the background fill and then content directly on the
+		// window's own surface (the original approach) is visibly flickery
+		// on a layered window, since DWM can composite a half-drawn frame;
+		// building the whole frame off-screen and presenting it atomically
+		// avoids that.
 		//
-		// The buffer (and the Compacta HFONT) are created once and reused
-		// across frames; rebuilding them on every paint and font each time
-		// was measurable churn on the ~30-60fps animation path.
+		// The DIB has a real alpha channel, which is what makes soft glows
+		// work over a transparent background. The old buffer was an opaque
+		// compatible bitmap and "No Background" was faked with LWA_COLORKEY:
+		// only pixels exactly equal to one near-black key color vanished, so
+		// a glow's outer falloff - which blends *toward* that color without
+		// ever reaching it - stayed opaque and dark, drawing a thick black
+		// frame around every glowing element. With per-pixel alpha the
+		// falloff simply fades out over whatever is behind the window.
+		//
+		// The buffer is created once and reused across frames; rebuilding it
+		// on every paint was measurable churn on the ~30-60fps animation path.
 		static HDC s_bufferDC = nullptr;
 		static HBITMAP s_bufferBitmap = nullptr;
 		static HGDIOBJ s_bufferOldBitmap = nullptr;
+		static void* s_bufferBits = nullptr;
 		static int s_bufferW = 0;
 		static int s_bufferH = 0;
 		if (!s_bufferDC || s_bufferW != width || s_bufferH != height)
@@ -3772,28 +4334,43 @@ case Screen::Settings:
 				DeleteObject(s_bufferBitmap);
 				DeleteDC(s_bufferDC);
 			}
+			BITMAPINFO info{};
+			info.bmiHeader.biSize = sizeof(info.bmiHeader);
+			info.bmiHeader.biWidth = width;
+			info.bmiHeader.biHeight = -height; // top-down, so row 0 is the top row
+			info.bmiHeader.biPlanes = 1;
+			info.bmiHeader.biBitCount = 32;
+			info.bmiHeader.biCompression = BI_RGB;
+			s_bufferBits = nullptr;
 			s_bufferDC = CreateCompatibleDC(windowDC);
-			s_bufferBitmap = CreateCompatibleBitmap(windowDC, width, height);
+			s_bufferBitmap = CreateDIBSection(windowDC, &info, DIB_RGB_COLORS, &s_bufferBits, nullptr, 0);
 			s_bufferOldBitmap = SelectObject(s_bufferDC, s_bufferBitmap);
 			s_bufferW = width;
 			s_bufferH = height;
 		}
-		HDC dc = s_bufferDC;
+		if (!s_bufferBits)
+		{
+			EndPaint(window, &paint);
+			return;
+		}
 
-		Gdiplus::Graphics g(dc);
+		// Start every frame fully transparent; whatever the UI draws is all
+		// that ends up visible.
+		std::memset(s_bufferBits, 0, static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
+
+		// GDI+ writes premultiplied BGRA straight into the DIB's pixels,
+		// which is exactly the layout UpdateLayeredWindow expects. Every
+		// draw below goes through GDI+ for that reason - a plain GDI call
+		// here would leave alpha at 0 and punch a hole in the frame.
+		Gdiplus::Bitmap frame(width, height, width * 4, PixelFormat32bppPARGB,
+			static_cast<BYTE*>(s_bufferBits));
+		Gdiplus::Graphics g(&frame);
 		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
 		g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
 
 		Gdiplus::Bitmap* background = RenderBackground(width, height);
 		if (background)
 			g.DrawImage(background, 0, 0);
-
-		SetBkMode(dc, TRANSPARENT);
-		static HFONT s_uiFont = nullptr;
-		if (!s_uiFont)
-			s_uiFont = CreateFontW(-22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, g_uiFontFamilyName.c_str());
-		SelectObject(dc, s_uiFont);
 
 		// Persistent wordmark in the top-left of every screen — enlarged.
 		{
@@ -3812,16 +4389,26 @@ case Screen::Settings:
 		switch (g_app.screen)
 		{
 		case Screen::PadViewer:
+			DrawLedRegionGlows(g);
 			for (size_t index = 0; index < kPadCells.size(); ++index)
-				DrawPad(g, dc, index);
+				DrawPad(g, index);
+			// Tint the pad faces, then put the figures on top of it.
+			DrawLedRegionTint(g);
+			for (size_t index = 0; index < kPadCells.size(); ++index)
+				DrawPadOccupant(g, index);
 			break;
 		case Screen::PadAction:
+			DrawLedRegionGlows(g);
 			for (size_t index = 0; index < kPadCells.size(); ++index)
-				DrawPad(g, dc, index);
+				DrawPad(g, index);
+			// Tint the pad faces, then put the figures on top of it.
+			DrawLedRegionTint(g);
+			for (size_t index = 0; index < kPadCells.size(); ++index)
+				DrawPadOccupant(g, index);
 			DrawActionButtons(g);
 			break;
 		case Screen::FranchiseList:
-			DrawFranchiseGrid(g, dc);
+			DrawFranchiseGrid(g);
 			break;
 case Screen::RosterList:
 		{
@@ -3860,7 +4447,7 @@ case Screen::RosterList:
 			{
 				g.DrawImage(panel, panelX, panelY);
 			}
-			DrawRosterGrid(g, dc);
+			DrawRosterGrid(g);
 			break;
 		}
 		case Screen::PlusPicker:
@@ -3885,7 +4472,7 @@ case Screen::RosterList:
 					}
 				}
 			}
-			DrawPlusPickerMenu(g, dc);
+			DrawPlusPickerMenu(g);
 			break;
 		}
 		case Screen::Settings:
@@ -3908,6 +4495,7 @@ case Screen::RosterList:
 			rows.push_back({L"Background: " + DescribeBackgroundChoice(), 0});
 			rows.push_back({L"Character selection: " + DescribeStoryMode(), 0});
 			rows.push_back({L"Button labels: " + DescribeButtonStyle(), 0});
+			rows.push_back({L"Toypad LEDs: " + DescribeLedMirror(), 0});
 			for (const auto& action : kBindableActions)
 				rows.push_back({std::wstring(L"Button - ") + action.label + L": ",
 					g_app.*(action.button)});
@@ -3915,11 +4503,12 @@ case Screen::RosterList:
 			rows.push_back({L"Web remote: " + DescribeWebRemote(), 0});
 			rows.push_back({L"Reset all settings to defaults", 0});
 
-			// 33px pitch (down from the original 40) so the grown list plus
-			// the capture hint and status line below still fit the
-			// fixed-height overlay.
-			constexpr int kSettingsTop = 100;
-			constexpr int kSettingsPitch = 33;
+			// 31px pitch (down from 40, then 33) so the grown list plus the
+			// capture hint and status line below still fit the fixed-height
+			// overlay. Each new row costs one pitch step, and the last row
+			// must clear the "Settings" footer wordmark at the bottom.
+			constexpr int kSettingsTop = 92;
+			constexpr int kSettingsPitch = 31;
 			constexpr float kSettingsIconH = 30.0f;
 			for (size_t index = 0; index < rows.size(); ++index)
 			{
@@ -3927,10 +4516,8 @@ case Screen::RosterList:
 				const bool selected = index == g_app.settingsIndex;
 				if (selected)
 				{
-					RECT selection{18, y - 2, width - 18, y + 30};
-					HBRUSH brush = CreateSolidBrush(RGB(36, 99, 170));
-					FillRect(dc, &selection, brush);
-					DeleteObject(brush);
+					Gdiplus::SolidBrush selectionFill(Gdiplus::Color(255, 36, 99, 170));
+					g.FillRectangle(&selectionFill, 18, y - 2, width - 36, 32);
 				}
 				DrawTextLine(g, rows[index].text, 30, y, width - 60,
 					selected ? RGB(255, 255, 255) : RGB(228, 232, 238));
@@ -3960,8 +4547,6 @@ case Screen::RosterList:
 		// action bar so it stays readable on all pad screens.
 		if (g_app.screen == Screen::PadViewer || g_app.screen == Screen::PadAction)
 			DrawOccupantLabel(g, g_app.slotIndex);
-
-		SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
 
 		// "by harrysof" credit marker in the top-right of every screen, vertically
 		// centered on the same band as the wordmark so the two sit inline.
@@ -4037,7 +4622,13 @@ case Screen::RosterList:
 			g.DrawString(warning.c_str(), -1, &warningFont, plate, &warningFormat, &warningBrush);
 		}
 
-		BitBlt(windowDC, 0, 0, width, height, dc, 0, 0, SRCCOPY);
+		// Per-pixel alpha from the DIB, plus the panel-wide translucency that
+		// SetLayeredWindowAttributes used to apply, in a single present.
+		POINT source{0, 0};
+		SIZE size{width, height};
+		BLENDFUNCTION blend{AC_SRC_OVER, 0, kOverlayAlpha, AC_SRC_ALPHA};
+		UpdateLayeredWindow(window, nullptr, nullptr, &size, s_bufferDC, &source,
+			0, &blend, ULW_ALPHA);
 
 		EndPaint(window, &paint);
 	}
@@ -4582,6 +5173,38 @@ if (changed)
 		return "/img/" + std::to_string(resourceId);
 	}
 
+	// Case-insensitive scan for common virtual / VPN / tunnel-adapter markers in
+	// an adapter's FriendlyName / Description. IfType alone won't catch every
+	// kind (Hyper-V and Docker report as Ethernet), so this is the safety net
+	// that keeps the "real LAN" picker from latching onto a reachable-looking
+	// private IP that another device on the LAN can never actually reach.
+	bool HasVirtualAdapterMarker(const std::wstring& text)
+	{
+		static constexpr const wchar_t* kMarkers[] = {
+			L"vpn", L"virtual", L"hyper-v", L"hyperv", L"vmware", L"virtualbox",
+			L"tailscale", L"zerotier", L"wsl", L"loopback", L"loop", L"tap",
+			L"tun", L"docker", L"vethernet", L"hamachi", L"wireguard", L"openvpn",
+			L"nordvpn", L"surfshark", L"proton", L"tunnel", L"ppp", L"bluetooth",
+			L"isatap", L"teredo", L"6to4", L"wan miniport", L"mirrored",
+		};
+		std::wstring lower;
+		lower.reserve(text.size());
+		for (wchar_t c : text)
+			lower.push_back(static_cast<wchar_t>(towlower(c)));
+		for (const wchar_t* marker : kMarkers)
+		{
+			if (lower.find(marker) != std::wstring::npos)
+				return true;
+		}
+		return false;
+	}
+
+	// Picks the IPv4 address a phone/tablet on the same LAN should use to reach
+	// the web remote. Instead of returning the first non-loopback / non-APIPA
+	// adapter Windows happens to enumerate (which is often a VPN / WSL / Docker
+	// / Hyper-V virtual NIC), this ranks every candidate and prefers a real
+	// physical Ethernet or Wi-Fi adapter with a default gateway and a private
+	// RFC1918 address, heavily penalising known virtual-adapter names.
 	std::wstring GetLanAddress()
 	{
 		ULONG size = 0;
@@ -4597,29 +5220,58 @@ if (changed)
 				nullptr, adapters, &size) != NO_ERROR)
 			return {};
 
+		std::wstring best;
+		int bestScore = -1000000;
 		for (PIP_ADAPTER_ADDRESSES adapter = adapters; adapter; adapter = adapter->Next)
 		{
 			if (adapter->OperStatus != IfOperStatusUp)
 				continue;
 			if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
 				continue;
+
+			// Adapter-level properties, applied equally to each of its addresses.
+			int baseScore = 0;
+			switch (adapter->IfType)
+			{
+			case IF_TYPE_ETHERNET_CSMACD: baseScore += 100; break; // real wired LAN
+			case IF_TYPE_IEEE80211:       baseScore += 90;  break; // real Wi-Fi
+			default:                      baseScore += 10;  break; // PPP / tunnel / other
+			}
+			if (adapter->FirstGatewayAddress != nullptr)
+				baseScore += 20; // has a default route: it's the "real" connectivity
+			if ((adapter->FriendlyName && HasVirtualAdapterMarker(adapter->FriendlyName)) ||
+				(adapter->Description && HasVirtualAdapterMarker(adapter->Description)))
+				baseScore -= 60; // virtual NIC: reachable-looking but not on the real LAN
+
 			for (PIP_ADAPTER_UNICAST_ADDRESS unicast = adapter->FirstUnicastAddress;
 				unicast; unicast = unicast->Next)
 			{
 				const sockaddr_in* address = reinterpret_cast<const sockaddr_in*>(unicast->Address.lpSockaddr);
-				if (address->sin_family != AF_INET)
+				if (!address || address->sin_family != AF_INET)
 					continue;
 				const ULONG addr = ntohl(address->sin_addr.s_addr);
 				if ((addr >> 24) == 127) continue;      // loopback
 				if ((addr >> 16) == 0xA9FE) continue;   // 169.254.x.x APIPA / link-local
+				if (addr == 0 || addr == 0xFFFFFFFF) continue; // unspecified / broadcast
+
+				// Prefer the private ranges a LAN device can actually reach.
+				const uint8_t b1 = (addr >> 24) & 0xFF;
+				const uint8_t b2 = (addr >> 16) & 0xFF;
+				const bool rfc1918 = (b1 == 10) || (b1 == 192 && b2 == 168) ||
+					(b1 == 172 && b2 >= 16 && b2 <= 31);
+				const int score = baseScore + (rfc1918 ? 15 : 0);
+
 				char text[INET_ADDRSTRLEN] = {};
-				if (InetNtopA(AF_INET, &address->sin_addr, text, sizeof text))
+				if (!InetNtopA(AF_INET, &address->sin_addr, text, sizeof text))
+					continue;
+				if (score > bestScore)
 				{
-					return L"http://" + WideFromUtf8(text) + L":" + std::to_wstring(g_app.webPort) + L"/";
+					bestScore = score;
+					best = L"http://" + WideFromUtf8(text) + L":" + std::to_wstring(g_app.webPort) + L"/";
 				}
 			}
 		}
-		return {};
+		return best;
 	}
 
 	void SendHttpResponse(SOCKET socket, int status, const char* statusText,
@@ -5294,9 +5946,13 @@ if (changed)
 				{
 					if (g_app.padState[g_app.slotIndex].occupied)
 						ClearSlot(g_app.slotIndex, true);
-					else
-						g_app.status = L"There is nothing tracked on that pad to clear.";
+				else
+					g_app.status = L"There is nothing tracked on that pad to clear.";
 				}
+				break;
+			case 'G':
+				if (g_app.screen == Screen::PadViewer)
+					ToggleLedDemo();
 				break;
 			}
 			InvalidateRect(window, nullptr, FALSE);
@@ -5387,6 +6043,14 @@ if (changed)
 			if (wParam)
 				HandleWebJob(*reinterpret_cast<WebJob*>(wParam));
 			return 0;
+		case kLedMessage:
+			if (wParam)
+			{
+				LedPollFrame* frame = reinterpret_cast<LedPollFrame*>(wParam);
+				ApplyLedFrame(*frame);
+				delete frame;
+			}
+			return 0;
 		case WM_COMMAND:
 			switch (LOWORD(wParam))
 			{
@@ -5402,8 +6066,15 @@ if (changed)
 			case kMenuIdWebAddress:
 				if (g_app.webEnabled)
 				{
-					if (g_app.webUrl.empty()) // server running in case URL lookup lost the network
-						g_app.webUrl = GetLanAddress();
+					// Re-detect on every copy rather than trusting the address
+					// cached at startup, so a VPN/Docker interface that wasn't
+					// up then (or that took over since) doesn't hand the user a
+					// dead link.
+					const std::wstring fresh = GetLanAddress();
+					if (!fresh.empty())
+						g_app.webUrl = fresh;
+					else if (g_app.webUrl.empty())
+						g_app.webUrl = L"http://<this-pc-lan-ip>:" + std::to_wstring(g_app.webPort) + L"/";
 					if (!g_app.webUrl.empty())
 					{
 						CopyTextToClipboard(g_app.webUrl);
@@ -5427,7 +6098,11 @@ if (changed)
 			return 0;
 		case WM_TIMER:
 			if (wParam == kControllerTimer)
+			{
 				PollController(window);
+				if (AdvanceLedAnimation() && g_app.overlayVisible)
+					InvalidateRect(window, nullptr, FALSE);
+			}
 			return 0;
 		case WM_ACTIVATE:
 			UpdateInputOwnership(window);
@@ -5441,6 +6116,7 @@ if (changed)
 			UnregisterHotKey(window, kToggleHotkeyId);
 			RemoveTrayIcon(window);
 			StopWebServer();
+			StopLedPoll();
 			if (g_inputOwnershipEvent)
 			{
 				ResetEvent(g_inputOwnershipEvent);
@@ -5587,6 +6263,12 @@ if (!window)
 	AddTrayIcon(window);
 	RegisterToggleHotkeyIfNeeded(window);
 	SetTimer(window, kControllerTimer, 8, nullptr);
+
+	// Start the LED mirror poll: it reports the running game's pad glows so the
+	// overlay lights up like a physical toypad. It only talks when Cemu is up,
+	// and not at all when the Settings screen's "Toypad LEDs" row is Off.
+	if (g_app.ledMirrorEnabled)
+		StartLedPoll(window);
 
 	// Start the web remote if enabled in settings; surface the phone address
 	// in the status line and the tray copy menu.
