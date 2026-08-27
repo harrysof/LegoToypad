@@ -29,6 +29,9 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
 - **Rounded-corner overlay window**: hovers above the emulator, drawn with GDI+
   into a 32-bit alpha buffer and presented per-pixel, so glows fade out cleanly
   over the game instead of leaving hard edges.
+- **Fixed or draggable**: the overlay is centred over the game by default, or
+  you can switch it to draggable in Settings and park it wherever suits — it
+  remembers that spot every time you toggle it back on.
 - **Sits in the system tray**: stays hidden until the toggle shortcut shows it,
   launching with a one-time toast notification.
 - **Web remote**: a phone-friendly HTML UI is embedded in the exe and served
@@ -46,7 +49,7 @@ exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
 - **No Background**: make the overlay's backdrop genuinely transparent so the
   game stays visible between the UI elements.
 - **Configurable everything**: toggle shortcut, confirm-button style, background
-  selection, story mode, button-icon style, Toypad LEDs and a rebindable button
+  selection, story mode, button-icon style, Toypad LEDs, window placement and a rebindable button
   for every picker action all live in the in-app Settings screen — with a one-row reset
   back to the defaults.
 
@@ -129,20 +132,28 @@ Press **Y / S** on the pad grid to open Settings:
    listener — and the pads go back to their printed artwork. On relights
    immediately from the game's current state. Needs a listener build that
    answers `GET_LED`; see **Listener protocol** below.
-7. **Button - …** — one row per action (Confirm, Back, Settings, Move active
+7. **Window** — **Fixed (centred)** (default) keeps the overlay exactly where
+   it is today: centred on whichever monitor the game is on, every time it is
+   shown. **Draggable** lets you pick the window up with the left mouse button
+   anywhere that isn't a clickable control and drop it where you like — the
+   cursor turns into a move cursor over the draggable area — and it comes back
+   there every time you toggle the overlay on, including after a restart.
+   Switching back to Fixed forgets the spot and re-centres immediately.
+8. **Button - …** — one row per action (Confirm, Back, Settings, Move active
    pad, Quick load, Quick clear). Select a row, release every controller
    button, then press the button you want — including **LT / RT**, which the
    app reads as buttons even though the controller reports them as axes. The
    D-pad stays reserved for menu navigation, and a button already used by
    another action or by the overlay toggle is rejected with a message on the
    Settings screen. **Back+Start or Esc cancels.**
-8. **Clear all pad** — empty every slot at once (useful if the emulator reset
+9. **Clear all pad** — empty every slot at once (useful if the emulator reset
    its Toypad state out from under the app, e.g. after an emulator restart).
-9. **Web remote** — turn the phone UI on or off (see below).
-10. **Reset all settings to defaults** — puts every row above back to its
+10. **Web remote** — turn the phone UI on or off (see below).
+11. **Reset all settings to defaults** — puts every row above back to its
    out-of-the-box value: controller **Back** toggle, A-confirm, first
    background, **All series** character selection, Auto button labels, Toypad
-   LEDs on and the default bindings. The listener and web-remote *ports* are left alone, since
+   LEDs on, a fixed centred window (the remembered drag position is dropped)
+   and the default bindings. The listener and web-remote *ports* are left alone, since
    those live only in `LegoToypad.ini`.
 
 While a button is being captured, the line under the list tells you what to
@@ -311,6 +322,9 @@ you can tweak by hand or pre-configure a deployment.
 | | | The triggers extend the XInput mask: **LT=65536**, **RT=131072**. They work anywhere a button value does, including `[Shortcut] ControllerMask` |
 | `[Input]` | `ToypadLeds` | `1` = mirror the game's Toypad LEDs onto the pads / `0` = off, no LED polling at all (default `1`) |
 | `[Input]` | `ButtonStyle` | `Auto` (follow the connected pad) / `Xbox` / `DualShock4` / `Switch`. Icons only — every pad works either way |
+| `[Window]` | `Draggable` | `0` = overlay is fixed and re-centres on the game's monitor every time it is shown, `1` = drag it with the mouse and it stays put (default `0`) |
+| `[Window]` | `RememberedPosition` | `1` = `PositionX`/`PositionY` hold a real dragged spot, `0` = never moved, so it is still centred (default `0`) |
+| `[Window]` | `PositionX` / `PositionY` | Screen coordinates of the window's top-left corner, written when you drop it. Negative values are fine (a monitor left of or above the primary one). Ignored if the spot no longer lands on any connected monitor, and nudged back on-screen if too little of the window would be reachable there |
 | `[Web]` | `Enabled` | `1` = serve the phone UI / `0` = no web server at all (default `1`) |
 | `[Web]` | `Port` | Port the HTTP server binds (default `8765`) |
 

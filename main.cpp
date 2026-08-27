@@ -310,6 +310,20 @@ bool swapConfirmBackButtons = false;
 		// stops the poll thread entirely, so nothing talks to the listener
 		// and the pads stay their plain colours.
 		bool ledMirrorEnabled = true;
+		// Window placement. Fixed re-centres the overlay on the active
+		// monitor every time it is shown; draggable lets the mouse pick it
+		// up anywhere that isn't a clickable control and remembers where it
+		// was dropped, across hide/show and across restarts.
+		bool windowDraggable = false;
+		bool hasSavedWindowPos = false;
+		int savedWindowX = 0;
+		int savedWindowY = 0;
+		// Live drag state; only meaningful while the left button is held
+		// down on a draggable overlay. Both points are screen coordinates,
+		// so the delta stays right even as the window moves under the mouse.
+		bool draggingWindow = false;
+		POINT dragStartCursor{};
+		POINT dragStartWindow{};
 		// Live controller facts, refreshed by every controller poll: what
 		// Auto resolves to, and whether anything is plugged in at all.
 		ButtonStyle detectedButtonStyle = ButtonStyle::Xbox;
@@ -373,9 +387,9 @@ bool swapConfirmBackButtons = false;
 	}};
 
 	// Settings rows: shortcut, confirm style, background, story mode,
-	// button labels, one rebind row per kBindableActions entry, clear all
-	// pads, web remote, reset to defaults.
-	constexpr size_t kSettingsBindingFirst = 6;
+	// button labels, Toypad LEDs, window placement, one rebind row per
+	// kBindableActions entry, clear all pads, web remote, reset to defaults.
+	constexpr size_t kSettingsBindingFirst = 7;
 	constexpr size_t kSettingsItemCount = kSettingsBindingFirst + kBindableActions.size() + 3;
 
 	// Auto resolves to the connected pad's own style; a pinned choice wins
@@ -464,6 +478,7 @@ void UpdateInputOwnership(HWND window);
 	void ToggleWebRemote();
 	void ToggleLedMirror();
 	void SetLedMirrorEnabled(bool enabled);
+	void PositionOverlayWindow(HWND window);
 	std::wstring DescribeLedMirror();
 	std::wstring DescribeWebRemote();
 	std::wstring GetLanAddress();
@@ -1688,6 +1703,20 @@ void UpdateInputOwnership(HWND window);
 			"; either way, and the values above stay raw XInput numbers.\n"
 			"ButtonStyle=Auto\n"
 			"\n"
+			"; Written by the app when you change the Window row in Settings.\n"
+			"[Window]\n"
+			"; Draggable = 0 keeps the overlay fixed: it is centred on the monitor\n"
+			"; the game is on every time it is shown. Draggable = 1 lets you drag it\n"
+			"; anywhere with the left mouse button and remembers where you dropped it.\n"
+			"Draggable=0\n"
+			"; RememberedPosition = 1 means PositionX/Y below hold a real dragged\n"
+			"; spot; 0 means the overlay has never been moved and is still centred.\n"
+			"; The remembered spot is ignored (and the overlay re-centres) if it no\n"
+			"; longer lands on any connected monitor.\n"
+			"RememberedPosition=0\n"
+			"PositionX=0\n"
+			"PositionY=0\n"
+			"\n"
 			"[Web]\n"
 			"; Web remote serves the same Toypad UI to a phone browser on your local\n"
 			"; network so you never need the desktop overlay. Point the phone at the\n"
@@ -2002,6 +2031,75 @@ void UpdateInputOwnership(HWND window);
 			GetPrivateProfileIntW(L"Shortcut", L"KeyModifiers", 0, iniPath.c_str()));
 		g_app.shortcutKeyCode = static_cast<UINT>(
 			GetPrivateProfileIntW(L"Shortcut", L"KeyCode", 0, iniPath.c_str()));
+	}
+
+	// ---------------------------------------------------------------------
+	// Window placement settings
+	// ---------------------------------------------------------------------
+
+	void SaveWindowSettingsToIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		WritePrivateProfileStringW(L"Window", L"Draggable",
+			g_app.windowDraggable ? L"1" : L"0", iniPath.c_str());
+		// A window that has never been dragged has no saved spot, and the
+		// difference matters: an unset X/Y must fall back to centring rather
+		// than pin the overlay to the top-left corner of the desktop.
+		WritePrivateProfileStringW(L"Window", L"RememberedPosition",
+			g_app.hasSavedWindowPos ? L"1" : L"0", iniPath.c_str());
+		WritePrivateProfileStringW(L"Window", L"PositionX",
+			std::to_wstring(g_app.savedWindowX).c_str(), iniPath.c_str());
+		WritePrivateProfileStringW(L"Window", L"PositionY",
+			std::to_wstring(g_app.savedWindowY).c_str(), iniPath.c_str());
+	}
+
+	void LoadWindowSettingsFromIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		g_app.windowDraggable =
+			GetPrivateProfileIntW(L"Window", L"Draggable", 0, iniPath.c_str()) != 0;
+		g_app.hasSavedWindowPos =
+			GetPrivateProfileIntW(L"Window", L"RememberedPosition", 0, iniPath.c_str()) != 0;
+		// GetPrivateProfileIntW is unsigned and refuses negatives, so the
+		// coordinates are read as text: a window parked on a monitor left of
+		// or above the primary one has a negative origin, and that is a
+		// perfectly ordinary place to have left it.
+		std::array<wchar_t, 32> buffer{};
+		GetPrivateProfileStringW(L"Window", L"PositionX", L"0", buffer.data(),
+			static_cast<DWORD>(buffer.size()), iniPath.c_str());
+		g_app.savedWindowX = _wtoi(buffer.data());
+		GetPrivateProfileStringW(L"Window", L"PositionY", L"0", buffer.data(),
+			static_cast<DWORD>(buffer.size()), iniPath.c_str());
+		g_app.savedWindowY = _wtoi(buffer.data());
+	}
+
+	std::wstring DescribeWindowPlacement()
+	{
+		if (!g_app.windowDraggable)
+			return L"Fixed (centred)";
+		return g_app.hasSavedWindowPos ? L"Draggable (position remembered)" : L"Draggable";
+	}
+
+	void ToggleWindowDraggable()
+	{
+		g_app.windowDraggable = !g_app.windowDraggable;
+		if (!g_app.windowDraggable)
+		{
+			// Going back to Fixed forgets the dragged spot and re-centres
+			// right away, so the row's new value is something you can see
+			// rather than something that only takes effect on the next show.
+			if (g_app.draggingWindow)
+			{
+				g_app.draggingWindow = false;
+				if (GetCapture() == g_mainWindow)
+					ReleaseCapture();
+			}
+			g_app.hasSavedWindowPos = false;
+			if (g_mainWindow && g_app.overlayVisible)
+				PositionOverlayWindow(g_mainWindow);
+		}
+		SaveWindowSettingsToIni();
+		g_app.status = L"Window: " + DescribeWindowPlacement();
 	}
 
 	// ---------------------------------------------------------------------
@@ -2884,6 +2982,8 @@ case Screen::Settings:
 				CycleButtonStyle();
 			else if (g_app.settingsIndex == 5)
 				ToggleLedMirror();
+			else if (g_app.settingsIndex == 6)
+				ToggleWindowDraggable();
 			else if (g_app.settingsIndex >= kSettingsBindingFirst &&
 				g_app.settingsIndex < kSettingsBindingFirst + kBindableActions.size())
 				BeginBindingCapture(g_app.settingsIndex - kSettingsBindingFirst);
@@ -3018,8 +3118,45 @@ case Screen::Settings:
 
 		const int monitorWidth = info.rcMonitor.right - info.rcMonitor.left;
 		const int monitorHeight = info.rcMonitor.bottom - info.rcMonitor.top;
-		const int x = info.rcMonitor.left + (monitorWidth - kOverlayWidth) / 2;
-		const int y = info.rcMonitor.top + (monitorHeight - kOverlayHeight) / 2;
+		int x = info.rcMonitor.left + (monitorWidth - kOverlayWidth) / 2;
+		int y = info.rcMonitor.top + (monitorHeight - kOverlayHeight) / 2;
+
+		// A draggable overlay comes back exactly where it was dropped, but
+		// only if enough of it would still be reachable there. A monitor
+		// that has been unplugged since, a resolution change, or a drag that
+		// pushed it nearly off the edge would otherwise leave it somewhere
+		// the mouse can't grab it again - and the Settings row that turns
+		// dragging back off lives inside that same window. So the remembered
+		// spot is nudged back onto its monitor when too little of it shows,
+		// and dropped entirely (falling through to centred) when it lands on
+		// no monitor at all.
+		if (g_app.windowDraggable && g_app.hasSavedWindowPos)
+		{
+			const RECT remembered{g_app.savedWindowX, g_app.savedWindowY,
+				g_app.savedWindowX + kOverlayWidth, g_app.savedWindowY + kOverlayHeight};
+			if (HMONITOR savedMonitor = MonitorFromRect(&remembered, MONITOR_DEFAULTTONULL))
+			{
+				MONITORINFO savedInfo{};
+				savedInfo.cbSize = sizeof(savedInfo);
+				if (GetMonitorInfoW(savedMonitor, &savedInfo))
+				{
+					// Grab-handle margin: this much of the window has to stay
+					// on that monitor in both axes.
+					constexpr int kMinVisible = 160;
+					x = std::clamp(g_app.savedWindowX,
+						static_cast<int>(savedInfo.rcMonitor.left) - (kOverlayWidth - kMinVisible),
+						static_cast<int>(savedInfo.rcMonitor.right) - kMinVisible);
+					y = std::clamp(g_app.savedWindowY,
+						static_cast<int>(savedInfo.rcMonitor.top) - (kOverlayHeight - kMinVisible),
+						static_cast<int>(savedInfo.rcMonitor.bottom) - kMinVisible);
+				}
+				else
+				{
+					x = g_app.savedWindowX;
+					y = g_app.savedWindowY;
+				}
+			}
+		}
 		SetWindowPos(window, HWND_TOPMOST, x, y, kOverlayWidth, kOverlayHeight, SWP_NOACTIVATE);
 	}
 
@@ -3171,6 +3308,23 @@ case Screen::Settings:
 			SetLedMirrorEnabled(defaults.ledMirrorEnabled); // starts/stops the poll
 		for (const auto& action : kBindableActions)
 			g_app.*(action.button) = defaults.*(action.button);
+
+		// Back to a fixed, centred window, and the remembered spot goes with
+		// it - a later switch back to draggable should start from centre
+		// rather than from wherever it happened to sit before the reset.
+		if (g_app.draggingWindow)
+		{
+			g_app.draggingWindow = false;
+			if (GetCapture() == g_mainWindow)
+				ReleaseCapture();
+		}
+		g_app.windowDraggable = defaults.windowDraggable;
+		g_app.hasSavedWindowPos = defaults.hasSavedWindowPos;
+		g_app.savedWindowX = defaults.savedWindowX;
+		g_app.savedWindowY = defaults.savedWindowY;
+		SaveWindowSettingsToIni();
+		if (g_mainWindow && g_app.overlayVisible)
+			PositionOverlayWindow(g_mainWindow);
 
 		SaveShortcutToIni();
 		SaveInputSettingsToIni();
@@ -4496,6 +4650,7 @@ case Screen::RosterList:
 			rows.push_back({L"Character selection: " + DescribeStoryMode(), 0});
 			rows.push_back({L"Button labels: " + DescribeButtonStyle(), 0});
 			rows.push_back({L"Toypad LEDs: " + DescribeLedMirror(), 0});
+			rows.push_back({L"Window: " + DescribeWindowPlacement(), 0});
 			for (const auto& action : kBindableActions)
 				rows.push_back({std::wstring(L"Button - ") + action.label + L": ",
 					g_app.*(action.button)});
@@ -4503,13 +4658,13 @@ case Screen::RosterList:
 			rows.push_back({L"Web remote: " + DescribeWebRemote(), 0});
 			rows.push_back({L"Reset all settings to defaults", 0});
 
-			// 31px pitch (down from 40, then 33) so the grown list plus the
-			// capture hint and status line below still fit the fixed-height
-			// overlay. Each new row costs one pitch step, and the last row
-			// must clear the "Settings" footer wordmark at the bottom.
+			// 29px pitch (down from 40, then 33, then 31) so the grown list
+			// plus the capture hint and status line below still fit the
+			// fixed-height overlay. Each new row costs one pitch step, and
+			// the hint under the last row must stay above the bottom edge.
 			constexpr int kSettingsTop = 92;
-			constexpr int kSettingsPitch = 31;
-			constexpr float kSettingsIconH = 30.0f;
+			constexpr int kSettingsPitch = 29;
+			constexpr float kSettingsIconH = 28.0f;
 			for (size_t index = 0; index < rows.size(); ++index)
 			{
 				const int y = kSettingsTop + static_cast<int>(index) * kSettingsPitch;
@@ -4517,7 +4672,7 @@ case Screen::RosterList:
 				if (selected)
 				{
 					Gdiplus::SolidBrush selectionFill(Gdiplus::Color(255, 36, 99, 170));
-					g.FillRectangle(&selectionFill, 18, y - 2, width - 36, 32);
+					g.FillRectangle(&selectionFill, 18, y - 1, width - 36, kSettingsPitch);
 				}
 				DrawTextLine(g, rows[index].text, 30, y, width - 60,
 					selected ? RGB(255, 255, 255) : RGB(228, 232, 238));
@@ -4525,7 +4680,7 @@ case Screen::RosterList:
 				{
 					const float iconX = 30.0f + MeasureTextWidth(g, rows[index].text, 22.0f);
 					DrawPadButtonMask(g, rows[index].icons, iconX,
-						y + (30.0f - kSettingsIconH) / 2.0f, kSettingsIconH, true);
+						y + (kSettingsPitch - kSettingsIconH) / 2.0f, kSettingsIconH, true);
 				}
 			}
 
@@ -5959,6 +6114,19 @@ if (changed)
 			return 0;
 		case WM_MOUSEMOVE:
 		{
+			if (g_app.draggingWindow)
+			{
+				// Screen coordinates on both ends: the client-relative
+				// lParam would chase its own tail once the window starts
+				// moving under the cursor.
+				POINT cursor{};
+				GetCursorPos(&cursor);
+				SetWindowPos(window, HWND_TOPMOST,
+					g_app.dragStartWindow.x + (cursor.x - g_app.dragStartCursor.x),
+					g_app.dragStartWindow.y + (cursor.y - g_app.dragStartCursor.y),
+					0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+				return 0;
+			}
 			const POINT point{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))};
 			const int hoveredAction = ActionButtonIndexAt(point);
 			if (hoveredAction != g_app.hoveredPadActionIndex)
@@ -5970,6 +6138,36 @@ if (changed)
 			TrackMouseEvent(&tracking);
 			return 0;
 		}
+		case WM_CAPTURECHANGED:
+			// Something took the mouse away mid-drag (Alt-Tab, a shell
+			// gesture). Keep wherever it ended up rather than snapping back.
+			if (g_app.draggingWindow)
+			{
+				g_app.draggingWindow = false;
+				RECT frame{};
+				GetWindowRect(window, &frame);
+				g_app.savedWindowX = frame.left;
+				g_app.savedWindowY = frame.top;
+				g_app.hasSavedWindowPos = true;
+				SaveWindowSettingsToIni();
+			}
+			return 0;
+		case WM_SETCURSOR:
+			// A move cursor over the draggable background is the only hint
+			// that the window can be picked up - there is no title bar to
+			// give it away. Controls keep the normal arrow.
+			if (LOWORD(lParam) == HTCLIENT && g_app.windowDraggable)
+			{
+				POINT cursor{};
+				GetCursorPos(&cursor);
+				ScreenToClient(window, &cursor);
+				if (g_app.draggingWindow || ActionButtonIndexAt(cursor) < 0)
+				{
+					SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+					return TRUE;
+				}
+			}
+			return DefWindowProcW(window, message, wParam, lParam);
 		case WM_MOUSELEAVE:
 			if (g_app.hoveredPadActionIndex != -1 || g_app.pressedPadActionIndex != -1)
 			{
@@ -5989,10 +6187,37 @@ if (changed)
 				SetCapture(window);
 				InvalidateRect(window, nullptr, FALSE);
 			}
+			else if (g_app.windowDraggable)
+			{
+				// The overlay is borderless, so anything that isn't a
+				// clickable control doubles as the title bar. Dragged by
+				// hand rather than through WM_NCLBUTTONDOWN/HTCAPTION so the
+				// controller poll and LED mirror keep running instead of
+				// stalling inside the system's modal move loop.
+				RECT frame{};
+				GetWindowRect(window, &frame);
+				GetCursorPos(&g_app.dragStartCursor);
+				g_app.dragStartWindow = POINT{frame.left, frame.top};
+				g_app.draggingWindow = true;
+				SetCapture(window);
+			}
 			return 0;
 		}
 		case WM_LBUTTONUP:
 		{
+			if (g_app.draggingWindow)
+			{
+				g_app.draggingWindow = false;
+				if (GetCapture() == window)
+					ReleaseCapture();
+				RECT frame{};
+				GetWindowRect(window, &frame);
+				g_app.savedWindowX = frame.left;
+				g_app.savedWindowY = frame.top;
+				g_app.hasSavedWindowPos = true;
+				SaveWindowSettingsToIni();
+				return 0;
+			}
 			const POINT point{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))};
 			const int actionIndex = ActionButtonIndexAt(point);
 			if (g_app.pressedPadActionIndex >= 0)
@@ -6213,6 +6438,7 @@ EnsureDefaultIniExists();
 	g_app.port = ReadPort();
 	LoadShortcutFromIni();
 	LoadInputSettingsFromIni();
+	LoadWindowSettingsFromIni();
 	LoadWebSettingsFromIni();
 
 	size_t embeddedTags = 0;
