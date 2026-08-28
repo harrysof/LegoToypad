@@ -14,6 +14,8 @@ Every asset — figure tags, portraits, world logos, the background, the wordmar
 the app icon — is compiled into `LegoToypad.exe` itself as a Win32 resource. The
 exe is fully self-contained; there are no loose `.bin`/`.png` files next to it.
 
+Thanks [LEGO Dimensions Discord](https://discord.gg/PuXpBMFE4P) for support!
+
 ## Features
 
 - **Whole-game tag library built in**: all 30 franchises, 78 characters and
