@@ -247,14 +247,19 @@ constexpr int kOverlayWidth = 900;
 	struct LedRegion
 	{
 		LedMode mode = LedMode::Off;
-		uint8_t r = 0, g = 0, b = 0;
+		uint8_t r = 0, g = 0, b = 0; // Fade: the target colour being faded to
+		uint8_t fromR = 0, fromG = 0, fromB = 0; // Fade: the colour being faded from
 		int onTicks = 0;    // Flash: lit duration, in toypad ticks
 		int offTicks = 0;   // Flash: dark duration, in toypad ticks
 		int count = 0;      // Flash/Fade: cycle count, 0 = repeat until next command
 		int speedTicks = 0; // Fade: ticks per fade step
 		DWORD cycleStart = 0;
-		float intensity = 0.0f;      // 0..1, computed by the animation tick
-		float startIntensity = 0.0f; // Brightness the current fade ramps from
+		float intensity = 0.0f; // 0..1 overall alpha, computed by the animation tick
+		// The colour actually drawn this frame. Equals r/g/b for every mode
+		// except Fade, where the real toypad alternates between fromR/G/B and
+		// r/g/b rather than ramping one colour's brightness - see
+		// ComputeLedFrame.
+		uint8_t curR = 0, curG = 0, curB = 0;
 	};
 
 	// One flat slot in the roster grid: either a character portrait, a
@@ -3576,39 +3581,67 @@ case Screen::Settings:
 
 	// Entry point for LED state: mirrors one pad region's glow. This is the
 	// seam the future HID parser (and the mock demo) drives.
+	//
+	// fromR/G/B is the colour the real toypad fades *from* - the wire's
+	// GET_LED snapshot carries this as the pad's pre-command colour (see
+	// LedPollFrame below). It is ignored outside of LedMode::Fade.
 	void ApplyLedCommand(uint8_t pad, LedMode mode, uint8_t r, uint8_t g, uint8_t b,
-		int onTicks = 0, int offTicks = 0, int count = 0, int speedTicks = 0)
+		int onTicks = 0, int offTicks = 0, int count = 0, int speedTicks = 0,
+		uint8_t fromR = 0, uint8_t fromG = 0, uint8_t fromB = 0)
 	{
 		const int region = LedRegionForPad(pad);
 		if (region < 0)
 			return;
 		LedRegion& led = g_app.ledRegions[static_cast<size_t>(region)];
-		// A fade ramps from whatever the pad is showing now, so a colour change
-		// mid-glow transitions instead of blacking out and climbing back up.
-		led.startIntensity = (led.mode == LedMode::Off) ? 0.0f : led.intensity;
 		led.mode = mode;
 		led.r = r; led.g = g; led.b = b;
+		// Stored verbatim, never second-guessed: only ComputeLedFrame's Fade
+		// branch reads these, so there is nothing to normalise for the other
+		// modes - and rewriting them here once desynced this state from the
+		// wire snapshot it came from.
+		led.fromR = fromR; led.fromG = fromG; led.fromB = fromB;
 		led.onTicks = onTicks; led.offTicks = offTicks;
 		led.count = count; led.speedTicks = speedTicks;
 		led.cycleStart = GetTickCount();
-		led.intensity = (mode == LedMode::Off) ? 0.0f
-			: (mode == LedMode::Fade) ? led.startIntensity
-			: 1.0f;
 	}
 
-	// Computes a region's current glow brightness from the clock, converting the
-	// wire's tick durations to milliseconds. Finite flashes expire dark once
-	// their cycles run out; finite fades settle *lit* on their target colour,
-	// which is what the hardware does - a fade is a transition, not a pulse.
-	// Settling matters beyond looks: the emulator suppresses a repeated
-	// identical command, so a region that extinguished itself would never be
-	// told to light up again.
-	float ComputeLedIntensity(LedRegion& led, DWORD now)
+	// Computes a region's current on-screen appearance (intensity + colour)
+	// from the clock, converting the wire's tick durations to milliseconds,
+	// and writes the result into led.intensity / led.curR,G,B.
+	//
+	// Flash blinks led.r/g/b on and off against dark, and finite flashes
+	// expire dark once their cycles run out - that part matches the real
+	// toypad, which is documented to do exactly this.
+	//
+	// Fade is different from what a "fade" name suggests: the real toypad
+	// does NOT ramp one colour's brightness up or down. It cross-fades
+	// between the pad's pre-command colour (fromR/G/B) and the new target
+	// (r/g/b), alternating direction every `speedTicks` step: step 0 goes
+	// from->to, step 1 to->from, step 2 from->to, and so on. `count` is the
+	// number of steps to run (0 = repeat forever); this is also why the
+	// protocol's documented behaviour is "odd count lands on the new colour,
+	// even count lands back on the old one" - see TOYPAD_LED_PROTOCOL.md.
+	// A fade is therefore always fully lit (intensity 1) - only its colour
+	// moves, it never dims to black the way Flash does.
+	//
+	// Settling a finished fade to LedMode::Solid (rather than leaving it in
+	// Fade forever at t=1) matters beyond looks: the emulator suppresses a
+	// repeated identical command, so a region that never reports itself
+	// "done" would never be told to light up again by the next command.
+	void ComputeLedFrame(LedRegion& led, DWORD now)
 	{
+		led.curR = led.r; led.curG = led.g; led.curB = led.b;
+
 		if (led.mode == LedMode::Off)
-			return 0.0f;
+		{
+			led.intensity = 0.0f;
+			return;
+		}
 		if (led.mode == LedMode::Solid)
-			return 1.0f;
+		{
+			led.intensity = 1.0f;
+			return;
+		}
 
 		const int elapsed = static_cast<int>(now - led.cycleStart);
 
@@ -3616,34 +3649,62 @@ case Screen::Settings:
 		{
 			const int period = (led.onTicks + led.offTicks) * kLedTickMs;
 			if (period <= 0)
-				return 1.0f; // Degenerate flash: treat as steady rather than strobing.
+			{
+				led.intensity = 1.0f; // Degenerate flash: treat as steady rather than strobing.
+				return;
+			}
 			if (led.count > 0 && elapsed >= period * led.count)
 			{
 				led.mode = LedMode::Off;
-				return 0.0f;
+				led.intensity = 0.0f;
+				return;
 			}
 			const DWORD phase = static_cast<DWORD>(elapsed) % static_cast<DWORD>(period);
-			return phase < static_cast<DWORD>(led.onTicks * kLedTickMs) ? 1.0f : 0.0f;
+			led.intensity = phase < static_cast<DWORD>(led.onTicks * kLedTickMs) ? 1.0f : 0.0f;
+			return;
 		}
 
-		// Fade. count == 0 means "keep going until the next command", which the
-		// pad shows as continuous breathing; a finite count ramps to full over
-		// its run and then holds as a steady glow.
+		// Fade.
+		led.intensity = 1.0f;
 		const int step = (led.speedTicks > 0 ? led.speedTicks : 25) * kLedTickMs;
-		if (led.count <= 0)
+		int stepIndex = elapsed / step;
+		float localT = static_cast<float>(elapsed % step) / static_cast<float>(step);
+		if (led.count > 0 && stepIndex >= led.count)
 		{
-			const double t = (static_cast<DWORD>(elapsed) % static_cast<DWORD>(step)) / static_cast<double>(step);
-			return static_cast<float>(0.5 - 0.5 * std::cos(t * 6.28318530717958647692));
+			// Settle exactly on the endpoint the real hardware would land on:
+			// the last step run was (count - 1), so its parity decides
+			// whether that's the "to" or "from" colour.
+			stepIndex = led.count - 1;
+			localT = 1.0f;
 		}
+		// Ease each leg (matches the smoothed "breathing" feel of the
+		// previous single-colour implementation) instead of a hard linear
+		// ramp between the two colours.
+		const float eased = static_cast<float>(0.5 - 0.5 * std::cos(localT * 3.14159265358979323846));
+		// Quantise the blend fraction to the same discrete levels used for
+		// Flash/Solid glow caching (kLedIntensityLevels) so a long or
+		// infinite fade produces a bounded set of colours - and therefore a
+		// bounded glow-bitmap cache - instead of one unique RGB per frame.
+		const float quantised = std::round(eased * (kLedIntensityLevels - 1)) / static_cast<float>(kLedIntensityLevels - 1);
+		const bool forward = (stepIndex % 2) == 0; // even step: from -> to
+		const uint8_t startR = forward ? led.fromR : led.r;
+		const uint8_t startG = forward ? led.fromG : led.g;
+		const uint8_t startB = forward ? led.fromB : led.b;
+		const uint8_t endR = forward ? led.r : led.fromR;
+		const uint8_t endG = forward ? led.g : led.fromG;
+		const uint8_t endB = forward ? led.b : led.fromB;
+		led.curR = static_cast<uint8_t>(startR + (endR - startR) * quantised + 0.5f);
+		led.curG = static_cast<uint8_t>(startG + (endG - startG) * quantised + 0.5f);
+		led.curB = static_cast<uint8_t>(startB + (endB - startB) * quantised + 0.5f);
 
-		const int duration = step * led.count;
-		if (elapsed >= duration)
+		if (led.count > 0 && stepIndex == led.count - 1 && localT >= 1.0f)
 		{
+			// Landed for good: fold the settled colour into r/g/b so
+			// LedMode::Solid keeps drawing it correctly afterwards, even
+			// when the count was even and the settled colour is fromR/G/B.
+			led.r = led.curR; led.g = led.curG; led.b = led.curB;
 			led.mode = LedMode::Solid;
-			return 1.0f;
 		}
-		const float t = static_cast<float>(elapsed) / static_cast<float>(duration);
-		return led.startIntensity + (1.0f - led.startIntensity) * t;
 	}
 
 	// Advances the animation clock and reports whether any region is still
@@ -3656,7 +3717,7 @@ case Screen::Settings:
 		{
 			if (led.mode == LedMode::Flash || led.mode == LedMode::Fade)
 				animating = true;
-			led.intensity = ComputeLedIntensity(led, now);
+			ComputeLedFrame(led, now);
 		}
 		return animating;
 	}
@@ -3713,7 +3774,7 @@ case Screen::Settings:
 			const int level = std::clamp(
 				static_cast<int>(led.intensity * (kLedIntensityLevels - 1) + 0.5f),
 				1, kLedIntensityLevels - 1);
-			Gdiplus::Bitmap* halo = RenderLedHalo(region, led.r, led.g, led.b, level);
+			Gdiplus::Bitmap* halo = RenderLedHalo(region, led.curR, led.curG, led.curB, level);
 			if (!halo)
 				continue;
 			const RECT bbox = LedRegionBounds(region);
@@ -3725,8 +3786,9 @@ case Screen::Settings:
 	// Tints the actual pad surfaces with the LED colour, drawn on top of the
 	// pad art so the glow is unmistakable (the soft halo in DrawLedRegionGlows
 	// is behind the pads and would otherwise be hidden by the art). Alpha is
-	// scaled by the region's live intensity so solid pads stay lit and flash /
-	// fade pulses clearly.
+	// scaled by the region's live intensity so solid pads stay lit and flash
+	// blinks read clearly; a fade is always fully lit and instead moves
+	// between curR/G/B's two endpoint colours (see ComputeLedFrame).
 	void DrawLedRegionTint(Gdiplus::Graphics& g)
 	{
 		for (int region = 0; region < 3; ++region)
@@ -3738,10 +3800,10 @@ case Screen::Settings:
 			AppendLedRegionShape(path, region, 0.0f, 0.0f); // window coordinates
 			// 210 rather than the old 140: with the LEDs on the pads are drawn
 			// as empty boxes, so this fill is the LED itself, not a stain on
-			// top of artwork. Scaling by intensity keeps the whole fade ramp
-			// legible from a bare glimmer up to full brightness.
+			// top of artwork. Scaling by intensity keeps a flash's dark phase
+			// legible as actually dark.
 			const BYTE alpha = static_cast<BYTE>(std::clamp(210.0f * led.intensity, 0.0f, 255.0f));
-			Gdiplus::SolidBrush brush(Gdiplus::Color(alpha, led.r, led.g, led.b));
+			Gdiplus::SolidBrush brush(Gdiplus::Color(alpha, led.curR, led.curG, led.curB));
 			g.FillPath(&brush, &path);
 		}
 	}
@@ -3760,10 +3822,12 @@ case Screen::Settings:
 		if (demoOn)
 		{
 			// Durations are toypad ticks (kLedTickMs each), matching the wire:
-			// 8 ticks ~ 320ms of flash, 35 ticks ~ 1.4s per breath.
-			ApplyLedCommand(1, LedMode::Solid, 40, 120, 255);           // center: solid blue
-			ApplyLedCommand(2, LedMode::Flash, 0, 220, 90, 8, 8);       // left: flashing green
-			ApplyLedCommand(3, LedMode::Fade, 230, 40, 40, 0, 0, 0, 35); // right: breathing red
+			// 8 ticks ~ 320ms of flash, 35 ticks ~ 1.4s per fade leg.
+			ApplyLedCommand(1, LedMode::Solid, 40, 120, 255);     // center: solid blue
+			ApplyLedCommand(2, LedMode::Flash, 0, 220, 90, 8, 8); // left: flashing green
+			// right: cross-fading red <-> blue forever (count 0), demonstrating
+			// the real toypad's two-colour fade rather than a single-hue pulse.
+			ApplyLedCommand(3, LedMode::Fade, 230, 40, 40, 0, 0, 0, 35, 40, 40, 230);
 			g_app.status = L"LED demo ON - press G to stop.";
 		}
 		else
@@ -3777,17 +3841,24 @@ case Screen::Settings:
 
 	// ---------------------------------------------------------------------
 	// LED polling transport to the emulator's Toypad listener. A 5-byte GET_LED
-	// request elicits a fixed 30-byte LED snapshot, so the running game's
-	// keystone-puzzle pad glows can be mirrored without any push channel.
-	// The poll runs on its own thread and is serialised with LOAD/REMOVE/MOVE
-	// via g_socketMutex (the listener serves one connection at a time); parsed
+	// request elicits a fixed LED snapshot, so the running game's keystone-
+	// puzzle pad glows can be mirrored without any push channel. The poll runs
+	// on its own thread and is serialised with LOAD/REMOVE/MOVE via
+	// g_socketMutex (the listener serves one connection at a time); parsed
 	// snapshots are marshalled back to the UI thread via kLedMessage so the
 	// glow never races the renderer.
+	//
+	// Wire format v2 (see TOYPAD_LED_PROTOCOL.md): { 'L', serial, version,
+	// region count, then 3 regions x 12 bytes (pad, mode, r, g, b, fromR,
+	// fromG, fromB, onMs, offMs, count, speedMs) } = 40 bytes. fromR/G/B is
+	// the colour the pad was showing before this command, which real toypad
+	// hardware fades *from* - see ComputeLedFrame for why that matters.
 	// ---------------------------------------------------------------------
 	constexpr UINT kLedMessage = WM_APP + 3;
 	constexpr uint8_t kGetLedCommand = 0x04;
 	constexpr uint8_t kLedPollHeaderSize = 5;
-	constexpr uint8_t kLedResponseSize = 3 + 3 * 9;
+	constexpr uint8_t kLedProtocolVersion = 2;
+	constexpr uint8_t kLedResponseSize = 4 + 3 * 12;
 	constexpr int kLedPollIntervalMs = 33;
 
 	std::atomic<bool> g_ledPollRunning{false};
@@ -3802,11 +3873,35 @@ case Screen::Settings:
 		std::array<uint8_t, 3> r{};
 		std::array<uint8_t, 3> g{};
 		std::array<uint8_t, 3> b{};
+		std::array<uint8_t, 3> fromR{};
+		std::array<uint8_t, 3> fromG{};
+		std::array<uint8_t, 3> fromB{};
 		std::array<uint8_t, 3> onTicks{};
 		std::array<uint8_t, 3> offTicks{};
 		std::array<uint8_t, 3> count{};
 		std::array<uint8_t, 3> speedTicks{};
 	};
+
+	// The last wire snapshot actually applied to each region, kept verbatim so
+	// change-detection compares wire-against-wire.
+	//
+	// It deliberately does NOT compare against the live LedRegion: the
+	// animation mutates that state as it runs (a finished fade settles to
+	// Solid, a finished flash settles to Off, and a settled fade folds its
+	// final colour into r/g/b), while the emulator keeps reporting the
+	// original command forever - it stores commands, not animation progress.
+	// Comparing the two therefore mismatches permanently once anything
+	// completes, and because the serial is global, the next command to *any*
+	// pad would re-apply and restart every already-finished animation.
+	struct LedWireState
+	{
+		bool applied = false;
+		uint8_t mode = 0;
+		uint8_t r = 0, g = 0, b = 0;
+		uint8_t fromR = 0, fromG = 0, fromB = 0;
+		uint8_t onTicks = 0, offTicks = 0, count = 0, speedTicks = 0;
+	};
+	std::array<LedWireState, 3> g_lastAppliedLed{};
 
 	// Applies one polled snapshot, re-issuing a command only when a region's
 	// state actually changed (so an unchanged flash isn't restarted every poll).
@@ -3826,14 +3921,20 @@ case Screen::Settings:
 			const int region = LedRegionForPad(frame.pad[i]);
 			if (region < 0)
 				continue;
-			const LedRegion& current = g_app.ledRegions[static_cast<size_t>(region)];
+			LedWireState& last = g_lastAppliedLed[static_cast<size_t>(region)];
 			const auto mode = static_cast<LedMode>(frame.mode[i]);
-			if (current.mode == mode && current.r == frame.r[i] && current.g == frame.g[i] &&
-				current.b == frame.b[i] && current.onTicks == frame.onTicks[i] && current.offTicks == frame.offTicks[i] &&
-				current.count == frame.count[i] && current.speedTicks == frame.speedTicks[i])
+			if (last.applied && last.mode == frame.mode[i] && last.r == frame.r[i] &&
+				last.g == frame.g[i] && last.b == frame.b[i] && last.fromR == frame.fromR[i] &&
+				last.fromG == frame.fromG[i] && last.fromB == frame.fromB[i] &&
+				last.onTicks == frame.onTicks[i] && last.offTicks == frame.offTicks[i] &&
+				last.count == frame.count[i] && last.speedTicks == frame.speedTicks[i])
 				continue;
 			ApplyLedCommand(frame.pad[i], mode, frame.r[i], frame.g[i], frame.b[i],
-				frame.onTicks[i], frame.offTicks[i], frame.count[i], frame.speedTicks[i]);
+				frame.onTicks[i], frame.offTicks[i], frame.count[i], frame.speedTicks[i],
+				frame.fromR[i], frame.fromG[i], frame.fromB[i]);
+			last = LedWireState{true, frame.mode[i], frame.r[i], frame.g[i], frame.b[i],
+				frame.fromR[i], frame.fromG[i], frame.fromB[i],
+				frame.onTicks[i], frame.offTicks[i], frame.count[i], frame.speedTicks[i]};
 			changed = true;
 		}
 		// Diagnostic: report the LED serial so it's obvious whether the poll is
@@ -3887,22 +3988,28 @@ case Screen::Settings:
 							}
 						}
 						closesocket(clientSocket);
-						if (ok && response[0] == 0x4C && response[2] == 0x03)
+						// The version byte guards against a stale build on either end
+						// silently misreading a different-sized snapshot (v1 was 30
+						// bytes with no fromR/G/B; see TOYPAD_LED_PROTOCOL.md).
+						if (ok && response[0] == 0x4C && response[2] == kLedProtocolVersion && response[3] == 0x03)
 						{
 							LedPollFrame* frame = new LedPollFrame();
 							frame->serial = response[1];
 							for (size_t i = 0; i < 3; ++i)
 							{
-								const size_t off = 3 + i * 9;
+								const size_t off = 4 + i * 12;
 								frame->pad[i] = response[off + 0];
 								frame->mode[i] = response[off + 1];
 								frame->r[i] = response[off + 2];
 								frame->g[i] = response[off + 3];
 								frame->b[i] = response[off + 4];
-								frame->onTicks[i] = response[off + 5];
-								frame->offTicks[i] = response[off + 6];
-								frame->count[i] = response[off + 7];
-								frame->speedTicks[i] = response[off + 8];
+								frame->fromR[i] = response[off + 5];
+								frame->fromG[i] = response[off + 6];
+								frame->fromB[i] = response[off + 7];
+								frame->onTicks[i] = response[off + 8];
+								frame->offTicks[i] = response[off + 9];
+								frame->count[i] = response[off + 10];
+								frame->speedTicks[i] = response[off + 11];
 							}
 							if (!PostMessageW(window, kLedMessage, reinterpret_cast<WPARAM>(frame), 0))
 								delete frame;
@@ -3948,6 +4055,11 @@ case Screen::Settings:
 		if (enabled)
 		{
 			g_lastLedSerial = 0xFF;
+			// The regions were darkened when the mirror went off, so forget
+			// what was last applied - otherwise an unchanged snapshot would
+			// be suppressed as a no-op and the pads would stay dark.
+			for (auto& last : g_lastAppliedLed)
+				last.applied = false;
 			StartLedPoll(g_mainWindow);
 		}
 		else
@@ -3957,7 +4069,6 @@ case Screen::Settings:
 			{
 				led.mode = LedMode::Off;
 				led.intensity = 0.0f;
-				led.startIntensity = 0.0f;
 			}
 		}
 		if (g_mainWindow)
