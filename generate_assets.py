@@ -419,31 +419,86 @@ def generate(root: Path, out_dir: Path) -> int:
                         % (what, " or ".join(sorted(expected_stems))))
         return None
 
-    pad_bg_spec = [
-        ("ASSET_PAD_BG_LEFT_UPPER", "left_upper"),
-        ("ASSET_PAD_BG_CENTER", "center"),
-        ("ASSET_PAD_BG_RIGHT_UPPER", "right_upper"),
-        ("ASSET_PAD_BG_LEFT_LOWER_LEFT", "left_lower_left"),
-        ("ASSET_PAD_BG_LEFT_LOWER_RIGHT", "left_lower_right"),
-        ("ASSET_PAD_BG_RIGHT_LOWER_LEFT", "right_lower_left"),
-        ("ASSET_PAD_BG_RIGHT_LOWER_RIGHT", "right_lower_right"),
+    # Pad art lives in Assets/Pads/<skin>/, one folder per selectable skin and
+    # seven PNGs inside it (one per toypad slot, named after the slot). The
+    # folder called "default" is the built-in look and always sorts first; any
+    # other folder is an extra skin the Settings screen can switch to on the
+    # fly. A folder missing one of the seven files is skipped with a warning
+    # rather than producing a skin with holes in it.
+    PAD_SLOT_STEMS = [
+        ("LEFT_UPPER", "left_upper"),
+        ("CENTER", "center"),
+        ("RIGHT_UPPER", "right_upper"),
+        ("LEFT_LOWER_LEFT", "left_lower_left"),
+        ("LEFT_LOWER_RIGHT", "left_lower_right"),
+        ("RIGHT_LOWER_LEFT", "right_lower_left"),
+        ("RIGHT_LOWER_RIGHT", "right_lower_right"),
     ]
-    pad_bg_syms = []
-    for asset_name, stem in pad_bg_spec:
-        file = pick_named({stem}, "pad background")
-        sym = symbols.allocate(asset_name, file) if file else None
-        if file:
-            ascii_ok([str(file)], warnings)
-        pad_bg_syms.append(sym)
+
+    def pad_skin_label(folder_name):
+        if folder_name.casefold() == "default":
+            return "Default"
+        pretty = re.sub(r"[_\-]+", " ", folder_name).strip()
+        return pretty[:1].upper() + pretty[1:] if pretty else folder_name
+
+    pads_root = discover_case_insensitive(assets_root, "Pads")
+    pad_skins = []
+    if pads_root:
+        # SKIPPED_ASSET_DIRS is deliberately NOT applied here: it exists to
+        # keep the unrelated top-level Assets/Old folder (a dump of
+        # superseded UI art) out of the generic asset scanner, not to judge
+        # skin folders by name. A folder under Assets/Pads is a skin - even
+        # one named "Old" - purely by whether it has the seven pad images;
+        # excluding it by name once made "Assets/Pads/Old" silently invisible.
+        skin_dirs = [d for d in sorted(pads_root.iterdir(), key=lambda p: p.name.casefold())
+                     if d.is_dir()]
+        # "default" first, everything else alphabetically after it.
+        skin_dirs.sort(key=lambda d: (0 if d.name.casefold() == "default" else 1, d.name.casefold()))
+        for skin_dir in skin_dirs:
+            by_stem = {p.stem.casefold(): p for p in image_files(skin_dir)}
+            row = []
+            missing = []
+            for slot_name, stem in PAD_SLOT_STEMS:
+                file = by_stem.get(stem)
+                if file is None:
+                    missing.append(stem)
+                    row.append(None)
+                    continue
+                ascii_ok([str(file)], warnings)
+                row.append(symbols.allocate(
+                    "ASSET_PAD_BG_%s_%s" % (sanitize(skin_dir.name), slot_name), file))
+            if missing:
+                warnings.append("pad skin '%s' is missing %s; skipped"
+                                % (skin_dir.name, ", ".join(m + ".png" for m in missing)))
+                continue
+            pad_skins.append({"label": pad_skin_label(skin_dir.name), "symbols": row})
+    if not pad_skins:
+        warnings.append("no complete pad skin found under Assets/Pads/<skin>/ "
+                        "(expected %s)" % ", ".join(s + ".png" for _, s in PAD_SLOT_STEMS))
+    # kPadBackgroundResourceIds stays the first (default) skin, so anything
+    # that wants the built-in art without going through the skin table still
+    # has it.
+    pad_bg_syms = pad_skins[0]["symbols"] if pad_skins else [None] * 7
 
     world_tile = pick_named({"world_tile"}, "world tile background")
     characters_tile = pick_named({"characters_tile"}, "characters tile background")
+    # Optional: falls back to characters_tile at runtime (see
+    # kSettingsTileResourceId in main.cpp) if this file isn't present, so an
+    # older Assets tree without it still builds.
+    settings_tile = None
+    for candidate in assets_files:
+        if candidate.stem.casefold() == "settings_tile":
+            settings_tile = candidate
+            break
     world_tile_sym = symbols.allocate("ASSET_WORLD_TILE", world_tile) if world_tile else None
     characters_tile_sym = symbols.allocate("ASSET_CHARACTERS_TILE", characters_tile) if characters_tile else None
+    settings_tile_sym = symbols.allocate("ASSET_SETTINGS_TILE", settings_tile) if settings_tile else None
     if world_tile:
         ascii_ok([str(world_tile)], warnings)
     if characters_tile:
         ascii_ok([str(characters_tile)], warnings)
+    if settings_tile:
+        ascii_ok([str(settings_tile)], warnings)
 
     # ---- action button assets ---------------------------------------------
     textfield_bar   = None
@@ -470,6 +525,37 @@ def generate(root: Path, out_dir: Path) -> int:
             ascii_ok([str(asset)], warnings)
         else:
             warnings.append("missing action-bar asset: %s" % name)
+
+    # ---- custom-bin icon ---------------------------------------------------
+    # Portrait art stamped on every captured custom tag (Assets/custombins).
+    custom_bin_icon = pick_named({"custom_bin", "custombin"}, "custom bin icon")
+    custom_bin_icon_sym = symbols.allocate("ASSET_CUSTOM_BIN_ICON", custom_bin_icon) if custom_bin_icon else None
+    if custom_bin_icon:
+        ascii_ok([str(custom_bin_icon)], warnings)
+
+    # ---- UI sound effects --------------------------------------------------
+    # Assets/SFX/Navigate.wav and Select.wav, embedded verbatim and played
+    # from memory with PlaySound(SND_MEMORY). Missing files just mean that
+    # sound never plays; the Settings toggle still works.
+    sfx_files = asset_files(assets_root, (".wav",))
+    sfx_by_stem = {p.stem.casefold(): p for p in sfx_files}
+
+    def pick_sfx(stem, what):
+        file = sfx_by_stem.get(stem)
+        if file is None:
+            warnings.append("missing %s sound (expected Assets/SFX/%s.wav)" % (what, stem))
+            return None
+        ascii_ok([str(file)], warnings)
+        return file
+
+    sfx_navigate = pick_sfx("navigate", "navigation")
+    sfx_select = pick_sfx("select", "select")
+    sfx_move = pick_sfx("move", "move")
+    sfx_remove = pick_sfx("remove", "remove")
+    sfx_navigate_sym = symbols.allocate("ASSET_SFX_NAVIGATE", sfx_navigate) if sfx_navigate else None
+    sfx_select_sym = symbols.allocate("ASSET_SFX_SELECT", sfx_select) if sfx_select else None
+    sfx_move_sym = symbols.allocate("ASSET_SFX_MOVE", sfx_move) if sfx_move else None
+    sfx_remove_sym = symbols.allocate("ASSET_SFX_REMOVE", sfx_remove) if sfx_remove else None
 
     # ---- controller button icons ------------------------------------------
     # Assets/ControllerIcons/<Style>/<Button>.png: one folder per pad style,
@@ -509,9 +595,18 @@ def generate(root: Path, out_dir: Path) -> int:
     font_rc_path = None
     font_candidates = asset_files(assets_root, (".ttf", ".otf", ".woff", ".woff2"))
     if font_candidates:
+        # A raw .ttf/.otf outranks a web format: it is what GDI and GDI+ load
+        # directly, and it needs no build-time decompression step (which in
+        # turn needs fonttools + brotli installed). Within a group the order
+        # is the stable alphabetical one asset_files already produced, so the
+        # choice never depends on directory iteration order.
+        def font_rank(path):
+            return 0 if path.suffix.lower() in (".ttf", ".otf") else 1
+
+        font_candidates.sort(key=font_rank)
         ui_font = font_candidates[0]
         if len(font_candidates) > 1:
-            warnings.append("multiple fonts in Assets, using %s" % font_candidates[0].name)
+            warnings.append("multiple fonts in Assets, using %s" % ui_font.name)
 
     if ui_font and ui_font.suffix.lower() in (".woff", ".woff2"):
         try:
@@ -692,6 +787,12 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("    int resourceId;")
     header.append("};")
     header.append("")
+    header.append("struct PadSkin")
+    header.append("{")
+    header.append("    std::wstring name;")
+    header.append("    int slotResourceIds[7];  // kPadCells order")
+    header.append("};")
+    header.append("")
     header.append("struct WebFile")
     header.append("{")
     header.append("    const char* name;")
@@ -711,7 +812,15 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kUIFontWebResourceId;")
     header.append("extern const int kWorldTileResourceId;")
     header.append("extern const int kCharactersTileResourceId;")
+    header.append("extern const int kSettingsTileResourceId;")
     header.append("extern const int kPadBackgroundResourceIds[7];")
+    header.append("extern const PadSkin kPadSkins[];")
+    header.append("extern const size_t kPadSkinCount;")
+    header.append("extern const int kCustomBinIconResourceId;")
+    header.append("extern const int kSfxNavigateResourceId;")
+    header.append("extern const int kSfxSelectResourceId;")
+    header.append("extern const int kSfxMoveResourceId;")
+    header.append("extern const int kSfxRemoveResourceId;")
     header.append("extern const int kTextfieldBarResourceId;")
     header.append("extern const int kLoadButtonResourceId;")
     header.append("extern const int kClearButtonResourceId;")
@@ -751,8 +860,14 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kUIFontWebResourceId = %s;" % (ui_font_web_sym["name"] if ui_font_web_sym else "0"))
     cpp.append("const int kWorldTileResourceId = %s;" % (world_tile_sym["name"] if world_tile_sym else "0"))
     cpp.append("const int kCharactersTileResourceId = %s;" % (characters_tile_sym["name"] if characters_tile_sym else "0"))
+    cpp.append("const int kSettingsTileResourceId = %s;" % (settings_tile_sym["name"] if settings_tile_sym else "0"))
     cpp.append("const int kPadBackgroundResourceIds[7] = { %s };"
                % ", ".join(sym["name"] if sym else "0" for sym in pad_bg_syms))
+    cpp.append("const int kCustomBinIconResourceId = %s;" % (custom_bin_icon_sym["name"] if custom_bin_icon_sym else "0"))
+    cpp.append("const int kSfxNavigateResourceId = %s;" % (sfx_navigate_sym["name"] if sfx_navigate_sym else "0"))
+    cpp.append("const int kSfxSelectResourceId = %s;" % (sfx_select_sym["name"] if sfx_select_sym else "0"))
+    cpp.append("const int kSfxMoveResourceId = %s;" % (sfx_move_sym["name"] if sfx_move_sym else "0"))
+    cpp.append("const int kSfxRemoveResourceId = %s;" % (sfx_remove_sym["name"] if sfx_remove_sym else "0"))
     cpp.append("const int kTextfieldBarResourceId = %s;" % (textfield_bar_sym["name"] if textfield_bar_sym else "0"))
     cpp.append("const int kLoadButtonResourceId = %s;" % (load_button_sym["name"] if load_button_sym else "0"))
     cpp.append("const int kClearButtonResourceId = %s;" % (clear_button_sym["name"] if clear_button_sym else "0"))
@@ -770,6 +885,16 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("};")
     cpp.append("const size_t kControllerIconStyleCount = %d;" % len(controller_icon_styles))
     cpp.append("const size_t kControllerIconButtonCount = %d;" % len(controller_icon_buttons))
+    cpp.append("")
+    cpp.append("const PadSkin kPadSkins[] = {")
+    # An empty initializer list is not valid C++, so a build with no complete
+    # skin folder still emits one (empty) entry and the app falls back to
+    # drawing bare pad outlines.
+    for skin in (pad_skins or [{"label": "Default", "symbols": [None] * 7}]):
+        cpp.append("    { %s, { %s } }," % (wstr(skin["label"]),
+                   ", ".join(sym["name"] if sym else "0" for sym in skin["symbols"])))
+    cpp.append("};")
+    cpp.append("const size_t kPadSkinCount = sizeof(kPadSkins) / sizeof(kPadSkins[0]);")
     cpp.append("")
     cpp.append("const BackgroundChoice kBackgroundChoices[] = {")
     for item in background_choice_syms:

@@ -24,10 +24,29 @@ Thanks [LEGO Dimensions Discord](https://discord.gg/PuXpBMFE4P) for support!
   required. Keyboard and mouse work too.
 - **True Toypad geometry**: 7 glossy pad slots matching the real 3/1/3 Toypad
   layout, with Load, Move and Clear actions per slot.
+- **Custom tags**: every world's roster ends with a **+** tile that captures
+  whatever the game just wrote to the **Center pad** (the only one the real
+  Toypad hardware can write through), saves it as your own `.bin`, and lets you
+  name it on the spot. A capture that looks like one of that world's vehicles is
+  offered as *"Batmobile Custom 1"* automatically. Your tags are drawn as
+  solid-colour discs so they never blend in with the built-in library's colour
+  rings.
 - **Live Toypad LEDs**: the pads glow exactly as the game lights them — solid,
   flashing or fading, per LED region — mirrored from the emulator in real time.
   While the LEDs are on the pads render as bare outlines so the colour reads
-  true and every step of a fade is visible.
+  true and every step of a fade is visible. **Off by default** — turn it on in
+  Settings.
+- **Everything moves**: the overlay fades in when you summon it and out when you
+  dismiss it, screens cross-fade and settle into place as you navigate, and the
+  selected pad or world tile carries a soft glow instead of a hairline outline —
+  springing up about 5% and settling back as the selection lands on it. The
+  animation is one-shot: between keypresses the picker is completely idle and
+  repaints nothing.
+- **Sound**: a blip when the highlight moves and a different one when you
+  confirm, both switchable off in Settings.
+- **Swappable pad art**: the seven pad images come from a folder under
+  `Assets/Pads`. Drop in another folder with the same seven filenames and it
+  becomes a skin you can switch to from Settings without restarting.
 - **Rounded-corner overlay window**: hovers above the emulator, drawn with GDI+
   into a 32-bit alpha buffer and presented per-pixel, so glows fade out cleanly
   over the game instead of leaving hard edges.
@@ -48,12 +67,14 @@ Thanks [LEGO Dimensions Discord](https://discord.gg/PuXpBMFE4P) for support!
   and bindings are shown as that pad's own button icons — following whichever
   pad is plugged in, or a style you pin yourself. No controller connected is
   called out on screen instead of leaving you guessing.
-- **No Background**: make the overlay's backdrop genuinely transparent so the
-  game stays visible between the UI elements.
-- **Configurable everything**: toggle shortcut, confirm-button style, background
-  selection, story mode, button-icon style, Toypad LEDs, window placement and a rebindable button
-  for every picker action all live in the in-app Settings screen — with a one-row reset
-  back to the defaults.
+- **Clear background**: the second background choice makes the overlay's
+  backdrop genuinely transparent so the game stays visible between the UI
+  elements — and a separate transparency setting dims the whole panel on top of
+  that.
+- **Configurable everything**: the in-app Settings screen is grouped into
+  categories — Appearance, Audio, Library, Controls, Button bindings and
+  System — and laid out like the world grid, with a scrolling viewport and a
+  one-row reset back to the defaults.
 
 ## Screenshots
 
@@ -78,7 +99,9 @@ Thanks [LEGO Dimensions Discord](https://discord.gg/PuXpBMFE4P) for support!
 5. Or pick a pad and confirm to get its action menu:
    - **Load** — opens the franchise grid. Pick a world, then a character or
      vehicle. Multi-build vehicles open a build picker (Build 1/2/3) before
-     loading. The tag is sent to the emulator instantly.
+     loading. The tag is sent to the emulator instantly. The **+** disc at the
+     end of the character row captures a tag the game writes and keeps it as
+     your own — see **Custom tags**.
    - **Move** — pick where the selected tag should go; both slots update in the
      emulator.
    - **Clear** — removes the tag from that pad slot.
@@ -111,58 +134,103 @@ the same pad.
 
 ## Settings
 
-Press **Y / S** on the pad grid to open Settings:
+Press **Y / S** on the pad grid to open Settings. The list is grouped into
+categories and scrolls with the selection, on the same translucent panel the
+world and roster grids use. Category headings are centred; a row's value is
+drawn in its own colour, with **On** green and **Off** red, so the state of
+every switch reads at a glance.
 
-1. **Toggle shortcut** — rebind the show/hide overlay trigger (controller combo
-   or keyboard shortcut, see below).
-2. **Confirm button** — swap A/B confirm style: **A (RPCS3)** or **B (Cemu)**.
-3. **Background** — cycle through the bundled background images, plus a final
-   **No Background** choice that makes the backdrop fully transparent so the
-   game shows through between the UI elements (drop more `background*.png`
-   files into `Assets/Wallpapers` and rebuild to add your own).
-4. **Character selection** — **All series** (pick a world, then a figure) or
-   **Story (starter pack only)**, which skips the series grid and shows just
-   Batman, Gandalf The Grey, Wyldstyle and the Batmobile.
-5. **Button labels** — **Auto** (default) shows the buttons as whatever pad is
-   connected prints them; **Xbox**, **DualShock 4** and **Switch** pin one
-   style. Bindings are drawn as the pad's own button icons. This is
-   presentation only — every pad works either way. With several pads connected
-   at once, Auto prefers Xbox, then DualShock 4, then Switch. (A DualSense uses
-   the DualShock 4 icons.)
-6. **Toypad LEDs** — mirror the running game's Toypad lights onto the pads
-   (default **On**). Off stops the poll thread entirely — nothing is sent to the
-   listener — and the pads go back to their printed artwork. On relights
-   immediately from the game's current state. Needs a listener build that
-   answers `GET_LED`; see **Listener protocol** below.
-7. **Window** — **Fixed (centred)** (default) keeps the overlay exactly where
-   it is today: centred on whichever monitor the game is on, every time it is
-   shown. **Draggable** lets you pick the window up with the left mouse button
-   anywhere that isn't a clickable control and drop it where you like — the
-   cursor turns into a move cursor over the draggable area — and it comes back
-   there every time you toggle the overlay on, including after a restart.
-   Switching back to Fixed forgets the spot and re-centres immediately.
-8. **Button - …** — one row per action (Confirm, Back, Settings, Move active
-   pad, Quick load, Quick clear). Select a row, release every controller
-   button, then press the button you want — including **LT / RT**, which the
-   app reads as buttons even though the controller reports them as axes. The
-   D-pad stays reserved for menu navigation, and a button already used by
-   another action or by the overlay toggle is rejected with a message on the
-   Settings screen. **Back+Start or Esc cancels.**
-9. **Clear all pad** — empty every slot at once (useful if the emulator reset
-   its Toypad state out from under the app, e.g. after an emulator restart).
-10. **Web remote** — turn the phone UI on or off (see below).
-11. **Reset all settings to defaults** — puts every row above back to its
-   out-of-the-box value: controller **Back** toggle, A-confirm, first
-   background, **All series** character selection, Auto button labels, Toypad
-   LEDs on, a fixed centred window (the remembered drag position is dropped)
-   and the default bindings. The listener and web-remote *ports* are left alone, since
-   those live only in `LegoToypad.ini`.
+Up / Down moves between rows. **Left / Right changes the focused row's value**,
+walking a list of choices either way, and **A / Enter** does the same thing
+forwards — plus it is what triggers the rows that are actions rather than
+values: the two button-capture rows, *Clear all pads* and *Reset all settings to
+defaults*. Those four never fire from Left/Right, so you cannot wipe your
+settings by brushing the stick sideways. Values do not auto-repeat while a
+direction is held either: one deliberate press, one change.
+
+### Appearance
+
+- **Background** — cycles the bundled wallpapers. The **second** choice is
+  **Clear**, which makes the backdrop fully transparent so the game shows
+  through between the UI elements. (Drop more `background*.png` files into
+  `Assets/Wallpapers` and rebuild to add your own.)
+- **Pad skin** — which folder under `Assets/Pads` supplies the seven pad
+  images. `Default` is the built-in art; any other folder holding the same
+  seven filenames is another skin, and switching takes effect immediately. See
+  **Pad skins** below.
+- **Window transparency** — how solid the whole panel is: 100 / 92 / 85 / 75 /
+  65 / 55 / 45 %. This is on top of the background choice, so *Clear* plus a low
+  percentage gives you a barely-there HUD.
+- **Window** — **Fixed (centred)** (default) keeps the overlay centred on
+  whichever monitor the game is on, every time it is shown. **Draggable** lets
+  you pick the window up with the left mouse button anywhere that isn't a
+  clickable control and drop it where you like — the cursor turns into a move
+  cursor over the draggable area — and it comes back there every time you toggle
+  the overlay on, including after a restart. Switching back to Fixed forgets the
+  spot and re-centres immediately.
+- **Toypad LEDs** — mirror the running game's Toypad lights onto the pads.
+  **Off by default**: mirroring redraws the pads as bare colour boxes and polls
+  the listener ~30 times a second, which is not what a first run should look
+  like or cost. On relights immediately from the game's current state; off stops
+  the poll thread entirely and the pads go back to their printed artwork. Needs
+  a listener build that answers `GET_LED`; see **Listener protocol** below.
+
+### Audio
+
+- **Sound effects** — the navigation and confirm blips
+  (`Assets/SFX/Navigate.wav` and `Select.wav`). On by default.
+- **Sound volume** — 100 / 85 / 70 / 55 / 40 %. `PlaySound` has no volume
+  control of its own, so the level is baked into a cached copy of the samples;
+  changing it plays the blip at the new level so you can hear the choice.
+
+### Library
+
+- **Character selection** — **All series** (pick a world, then a figure) or
+  **Story (starter pack only)**, which skips the series grid and shows just
+  Batman, Gandalf The Grey, Wyldstyle and the Batmobile.
+
+### Controls
+
+- **Toggle shortcut** — rebind the show/hide overlay trigger (controller combo
+  or keyboard shortcut, see below).
+- **Confirm button** — swap A/B confirm style: **A (RPCS3)** or **B (Cemu)**.
+- **Button labels** — **Auto** (default) shows the buttons as whatever pad is
+  connected prints them; **Xbox**, **DualShock 4** and **Switch** pin one
+  style. Bindings are drawn as the pad's own button icons. This is
+  presentation only — every pad works either way. With several pads connected
+  at once, Auto prefers Xbox, then DualShock 4, then Switch. (A DualSense uses
+  the DualShock 4 icons.)
+
+### Button bindings
+
+- **Button - …** — one row per action (Confirm, Back, Settings, Move active
+  pad, Quick load, Quick clear). Select a row, release every controller
+  button, then press the button you want — including **LT / RT**, which the
+  app reads as buttons even though the controller reports them as axes. The
+  D-pad stays reserved for menu navigation, and a button already used by
+  another action or by the overlay toggle is rejected with a message on the
+  Settings screen. **Back+Start or Esc cancels.**
+
+### System
+
+- **Clear all pads** — empty every slot at once (useful if the emulator reset
+  its Toypad state out from under the app, e.g. after an emulator restart).
+- **Web remote** — turn the phone UI on or off (see below).
+- **Reset all settings to defaults** — puts every row above back to its
+  out-of-the-box value: controller **Back** toggle, A-confirm, first
+  background, default pad skin, 92 % opacity, a fixed centred window (the
+  remembered drag position is dropped), Toypad LEDs off, sound effects on,
+  **All series** character selection, Auto button labels and the default
+  bindings. The listener and web-remote *ports* are left alone, since those live
+  only in `LegoToypad.ini`.
 
 While a button is being captured, the line under the list tells you what to
 press and why a press was refused ("that button is already used by Back"), so
 rebinding never fails silently.
 
 ## Toypad LEDs
+
+**Off by default** — turn it on with **Settings → Toypad LEDs**.
 
 LEGO Dimensions drives the physical Toypad's three LED regions (left, centre and
 right) constantly — not just during keystone puzzles — and the overlay mirrors
@@ -190,6 +258,78 @@ green left, breathing red right) to check the rendering without a game running.
 The status line also reports `LED: serial=N`, which advances whenever the game
 changes a region — handy for telling "the game isn't sending anything" apart
 from "the mirror is broken".
+
+## Custom tags
+
+Every built-in tag was dumped ahead of time and compiled into the exe. A
+**custom tag** is the opposite: it is made while the game is running, out of the
+bytes the game itself wrote to a pad.
+
+Pick a pad → **Load** → a world. At the end of that world's character row there
+is an empty **+** disc with a dashed rim. Select it and the picker starts
+watching the **Center pad** — always the centre one, whatever pad you picked to
+get there. That is a hardware fact, not a picker setting: the real Toypad can
+only *write* a tag through its centre portal, which is why the game always asks
+you to place a blank tag there when creating something new. The pad you
+originally picked only matters afterwards, for where you load the finished tag.
+
+1. Build or rebuild the toy in the game with a blank tag on the **Center pad**.
+   The moment it writes different bytes there, those bytes are your tag. (If the
+   game already wrote it before you opened the screen, press **A** to keep
+   whatever is on the Center pad right now.)
+2. Name it. The default name is chosen for you: if the bytes are a near match
+   for one of that world's vehicles or characters — at least 160 of the 180
+   bytes identical — it becomes *"Batmobile Custom 1"*, *"Batmobile Custom 2"*
+   and so on; otherwise *"Custom Tag 1"*. Retype it on the on-screen keyboard
+   with the D-pad, or just type on a real keyboard — both work at once — then
+   pick **Done**.
+3. It lands in that world's roster from then on, and loads onto any pad exactly
+   like a built-in figure.
+
+Custom tags are stored next to the exe as:
+
+```
+CustomBins/<World>/<Your name>.bin
+```
+
+They are plain 180-byte tag dumps, so you can back them up, copy them between
+machines, or drop one in by hand — anything in that folder that is exactly 180
+bytes long shows up on the next launch.
+
+Your tags are drawn as a **filled disc** in their own colour with the
+`custom_bin.png` art inside, where every built-in entry is a colour *ring*
+around a photo — so you can always tell at a glance which tags are yours.
+
+> Capturing needs a listener build that answers the `GET_TAG` command (see
+> **Listener protocol**). Against an older listener the capture screen says so
+> instead of waiting forever.
+
+## Pad skins
+
+The seven pad images live in `Assets/Pads/<skin>/`, one folder per skin:
+
+```
+Assets/Pads/default/left_upper.png
+Assets/Pads/default/center.png
+Assets/Pads/default/right_upper.png
+Assets/Pads/default/left_lower_left.png
+Assets/Pads/default/left_lower_right.png
+Assets/Pads/default/right_lower_left.png
+Assets/Pads/default/right_lower_right.png
+```
+
+Add a folder with any name holding those same seven filenames and it becomes
+another choice under **Settings → Pad skin**, switchable on the fly with no
+restart. Two ways in:
+
+- **At build time** — put the folder in the repo's `Assets/Pads` before
+  building, and it is compiled into the exe like every other asset.
+- **After install** — put the folder in `Assets/Pads` *next to `LegoToypad.exe`*
+  and it is picked up from disk at startup.
+
+A folder missing any of the seven files is skipped rather than drawn with holes
+in it. The skin is remembered by name, so adding or removing folders never
+silently repoints you at a different one.
 
 ## Overlay shortcut
 
@@ -317,15 +457,19 @@ you can tweak by hand or pre-configure a deployment.
 | `[Shortcut]` | `KeyModifiers` | Keyboard modifier bitmask (Alt=1, Ctrl=2, Shift=4, Win=8) |
 | `[Shortcut]` | `KeyCode` | Keyboard virtual-key code (must have a modifier) |
 | `[Input]` | `SwapConfirmBackButtons` | `0` = A confirm / B back (RPCS3 style), `1` = B confirm / A back (Cemu style) |
-| `[Input]` | `BackgroundIndex` | Index into the bundled `Assets/Wallpapers/background*.png` choices; one past the last one means **No Background** (transparent backdrop) |
+| `[Input]` | `BackgroundIndex` | Position in the Background row's own order: `0` = default wallpaper, `1` = **Clear** (transparent backdrop), `2`+ = the remaining bundled `Assets/Wallpapers/background*.png` images |
 | `[Input]` | `StoryMode` | `1` = show only the starter pack when picking a figure, `0` = all series |
 | `[Input]` | `ButtonConfirm` / `ButtonBack` / `ButtonSettings` | Raw XInput button for confirm / back / open settings (A=4096, B=8192, Y=32768) |
 | `[Input]` | `ButtonMoveActive` / `ButtonQuickLoad` / `ButtonQuickClear` | Raw XInput button for the one-press pad actions (X=16384, RB=512, LB=256). D-pad values are ignored and fall back to the default |
 | | | The triggers extend the XInput mask: **LT=65536**, **RT=131072**. They work anywhere a button value does, including `[Shortcut] ControllerMask` |
-| `[Input]` | `ToypadLeds` | `1` = mirror the game's Toypad LEDs onto the pads / `0` = off, no LED polling at all (default `1`) |
+| `[Input]` | `ToypadLeds` | `1` = mirror the game's Toypad LEDs onto the pads / `0` = off, no LED polling at all (default `0`) |
+| `[Input]` | `SoundEffects` | `1` = play the navigate / select blips from `Assets/SFX` / `0` = silent (default `1`) |
+| `[Input]` | `SoundVolume` | Playback level 0-100 (default `70`), applied by scaling the WAV samples |
+| `[Input]` | `PadSkin` | Name of the folder under `Assets/Pads` supplying the pad art (default `Default`). An unknown name falls back to the built-in skin |
 | `[Input]` | `ButtonStyle` | `Auto` (follow the connected pad) / `Xbox` / `DualShock4` / `Switch`. Icons only — every pad works either way |
 | `[Window]` | `Draggable` | `0` = overlay is fixed and re-centres on the game's monitor every time it is shown, `1` = drag it with the mouse and it stays put (default `0`) |
 | `[Window]` | `RememberedPosition` | `1` = `PositionX`/`PositionY` hold a real dragged spot, `0` = never moved, so it is still centred (default `0`) |
+| `[Window]` | `Opacity` | Whole-panel translucency as a percentage of solid (default `92`). The Settings row cycles 100/92/85/75/65/55/45; hand-edited values are clamped to 20-100 |
 | `[Window]` | `PositionX` / `PositionY` | Screen coordinates of the window's top-left corner, written when you drop it. Negative values are fine (a monitor left of or above the primary one). Ignored if the spot no longer lands on any connected monitor, and nudged back on-screen if too little of the window would be reachable there |
 | `[Web]` | `Enabled` | `1` = serve the phone UI / `0` = no web server at all (default `1`) |
 | `[Web]` | `Port` | Port the HTTP server binds (default `8765`) |
@@ -340,6 +484,7 @@ A tiny fire-and-forget TCP protocol on loopback to the emulator's listener:
 | **REMOVE** | `0x02`, pad, index, `0x00`, `0x00` | — |
 | **MOVE** | `0x03`, destPad, destIndex, srcPad, srcIndex | — |
 | **GET_LED** | `0x04`, `0x00`, `0x00`, `0x00`, `0x00` | — (the listener replies, see below) |
+| **GET_TAG** | `0x05`, pad, index, `0x00`, `0x00` | — (the listener replies, see below) |
 
 `pad`/`index` select one of the emulator's 7 Toypad slots. Tag bytes come from
 the embedded resources, and since there is no on-disk `.bin` anymore the LOAD
@@ -360,6 +505,23 @@ snapshot.
 (`1 = centre, 2 = left, 3 = right`). Durations are Toypad ticks of ~40ms each.
 The serial lets the app skip a snapshot it has already applied, so an unchanged
 flash is never restarted mid-cycle.
+
+`GET_TAG` is the other message that expects a reply, and it is what makes
+**Custom tags** possible: it asks the listener for the 180 bytes it currently
+holds for one Toypad slot, including whatever the running game has written
+there. The reply is a fixed 184-byte frame:
+
+```
+[0]     0x54  'T' magic
+[1]     status       1 = that slot holds a tag, 0 = empty (the 180 bytes are then meaningless)
+[2]     0x01         protocol version
+[3]     0x00         reserved
+[4..183] 180 raw tag bytes
+```
+
+A listener that predates `GET_TAG` simply never answers it. The app treats a
+receive timeout as "this build can't do that", says so on the capture screen and
+stops polling, rather than stalling the overlay retrying forever.
 
 ## Notes
 

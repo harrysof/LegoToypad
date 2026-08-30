@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -43,7 +44,23 @@ namespace
 	constexpr uint8_t kLoadCommand = 0x01;
 	constexpr uint8_t kRemoveCommand = 0x02;
 	constexpr uint8_t kMoveCommand = 0x03;
-	constexpr UINT_PTR kControllerTimer = 1;
+	// The controller poll used to run on a WM_TIMER. Windows only synthesises
+	// WM_TIMER when the message queue is otherwise empty, and it shares that
+	// lowest priority tier with WM_PAINT - so every millisecond spent painting
+	// was a millisecond the next controller poll was delayed by, and a slow
+	// frame turned directly into a dropped or late button press. A posted
+	// message is an ordinary queued message and is delivered ahead of both, so
+	// input now always wins over drawing. A small thread does the pacing; the
+	// handler still runs on the UI thread, so nothing about the app's
+	// single-threaded state model changes.
+	constexpr UINT kTickMessage = WM_APP + 4;
+	// 8ms while the picker is up, so a quick tap of a button is never missed.
+	// Twice that while it is hidden, where the only thing the poll is looking
+	// for is the toggle shortcut - which nobody presses for less than 16ms -
+	// and where this app otherwise sits in the tray all day burning CPU for
+	// nothing.
+	constexpr DWORD kTickIntervalVisibleMs = 8;
+	constexpr DWORD kTickIntervalHiddenMs = 16;
 	// NOTE: this string is a cross-repo contract with the Cemu fork's
 	// Controller.cpp, which opens this same named event and waits on it to
 	// know when to neutralize real controller input. It must match the
@@ -57,7 +74,12 @@ namespace
 	// time by generate_assets.py - nothing is read from disk at runtime.
 constexpr int kOverlayWidth = 900;
 	constexpr int kOverlayHeight = 610;
-	constexpr BYTE kOverlayAlpha = 235; // 0-255, uniform translucency for the whole panel.
+	// Uniform translucency for the whole panel, as a percentage of opaque.
+	// 92% is the old fixed 235/255. The Settings row steps this (and sound
+	// volume) by kSettingsPercentStep in either direction.
+	constexpr int kDefaultOpacityPercent = 92;
+	constexpr int kOpacityFloorPercent = 20; // below this the window becomes hard to see
+	constexpr int kSettingsPercentStep = 15;
 	constexpr int kWindowCornerRadius = 6;
 	constexpr wchar_t kAppVersion[] = L"1.6.0";
 
@@ -94,6 +116,15 @@ constexpr int kOverlayWidth = 900;
 		{3, 5, L"Right - lower left"},
 		{3, 6, L"Right - lower right"},
 	}};
+
+	// The real Toypad only writes tags through its centre portal - the two
+	// side portals are read-only in hardware. That is a fixed fact about the
+	// physical device, not something this app or the picker's own pad
+	// selection has any say in: when a game prompts for a blank tag to
+	// create a custom one, it always means the centre pad, regardless of
+	// which of the 7 slots the user had focused when they opened the "+"
+	// tile.
+	constexpr size_t kCenterPadSlotIndex = 1;
 
 	// Controller inputs as a bitmask. XInput's own WORD is full (0x0001 to
 	// 0x8000), so the analog triggers - which XInput reports as axes, not
@@ -262,8 +293,11 @@ constexpr int kOverlayWidth = 900;
 		uint8_t curR = 0, curG = 0, curB = 0;
 	};
 
-	// One flat slot in the roster grid: either a character portrait, a
-	// vehicle's build-1 portrait, or the "+" tile of a multi-build vehicle.
+	// One flat slot in the roster grid: a character portrait, a vehicle's
+	// build-1 portrait, or the "+" tile of a multi-build vehicle.
+	//
+	// Character makes up the grid's first (character) section; Vehicle / Plus
+	// make up the second one, below the separator.
 	struct RosterSlot
 	{
 		enum class Kind { Character, Vehicle, Plus } kind = Kind::Character;
@@ -279,6 +313,7 @@ constexpr int kOverlayWidth = 900;
 		int hoveredPadActionIndex = -1;
 		int pressedPadActionIndex = -1;
 		size_t settingsIndex = 0;
+		int settingsTopRow = 0; // first visible Settings row (scrolled list)
 		uint16_t port = 9191;
 		std::wstring status;
 
@@ -311,10 +346,26 @@ bool swapConfirmBackButtons = false;
 		// is connected), 1..4 = pinned to one style.
 		size_t buttonStyleChoice = 0;
 		// Mirrors the running game's toypad LEDs onto the overlay's pads.
-		// On by default, because the lights are the point of the mirror; off
-		// stops the poll thread entirely, so nothing talks to the listener
-		// and the pads stay their plain colours.
-		bool ledMirrorEnabled = true;
+		// OFF by default: the mirror repaints the pads as bare outlines and
+		// polls the listener 30x a second, which is not what a first run
+		// should look like or cost. Turning it on in Settings starts the poll
+		// thread; turning it off stops it entirely, so nothing talks to the
+		// listener and the pads stay their printed glass art.
+		bool ledMirrorEnabled = false;
+		// UI sound effects (Assets/SFX): a blip when the selection moves and
+		// a different one when something is confirmed.
+		bool soundEffects = true;
+		// Playback level, 0-100. PlaySound has no volume control of its own,
+		// so this is applied by scaling the WAV's samples (see GetSoundBytes).
+		int soundVolume = 70;
+		// Whole-window translucency, as a percentage of opaque. Applied as
+		// UpdateLayeredWindow's constant alpha on top of the frame's own
+		// per-pixel alpha, so it dims glows and art alike.
+		int opacityPercent = kDefaultOpacityPercent;
+		// Which folder under Assets/Pads supplies the seven pad images.
+		// Stored by name in the ini so adding or removing a skin folder never
+		// silently repoints this at a different one.
+		size_t padSkinIndex = 0;
 		// Window placement. Fixed re-centres the overlay on the active
 		// monitor every time it is shown; draggable lets the mouse pick it
 		// up anywhere that isn't a clickable control and remembers where it
@@ -372,6 +423,209 @@ bool swapConfirmBackButtons = false;
 	AppState g_app;
 	HANDLE g_inputOwnershipEvent = nullptr;
 
+	// ---------------------------------------------------------------------
+	// Transitions
+	// ---------------------------------------------------------------------
+	// Two independent fades:
+	//
+	//   - the whole window fades in when the overlay is summoned and back out
+	//     when it is dismissed, so it arrives and leaves instead of snapping.
+	//     This one rides UpdateLayeredWindow's constant alpha, which costs
+	//     nothing extra: the frame is already presented that way, only the
+	//     blend value changes.
+	//   - the screen content cross-fades (and settles up a few pixels) every
+	//     time the picker moves between screens. That one renders the content
+	//     into a scratch layer for the ~150ms it lasts and composites the
+	//     layer at a scaled alpha; outside a transition it is drawn straight
+	//     into the frame with no layer at all, so the steady state is exactly
+	//     as cheap as before.
+	//
+	// Both are driven off the existing 8ms controller timer, which already
+	// owned the "does anything still need repainting" decision for the LEDs.
+	constexpr DWORD kWindowFadeInMs = 140;
+	constexpr DWORD kWindowFadeOutMs = 110;
+	constexpr DWORD kScreenFadeMs = 150;
+	constexpr int kScreenFadeRisePx = 10;
+
+	DWORD g_windowFadeStart = 0;
+	bool g_windowFadingOut = false;
+	// True from the moment a hide is asked for until the fade-out finishes
+	// and the window is really hidden. The overlay still counts as visible
+	// (and still paints) throughout, but stops accepting navigation.
+	bool g_overlayHiding = false;
+	DWORD g_screenFadeStart = 0;
+	Screen g_lastTransitionScreen = Screen::PadViewer;
+
+	// The focused tile's landing animation. The selection glow itself is
+	// steady; what moves is a single small spring the moment the selection
+	// arrives somewhere new - the tile swells ~5% and settles back over
+	// ~220ms, and then nothing animates at all.
+	//
+	// This replaced a glow that breathed continuously. That version had two
+	// problems: every frame of it was a full-window repaint forever, and
+	// because the whole 900x610 layered surface was being re-presented at a
+	// slightly different alpha several times a second, the entire panel
+	// appeared to shimmer rather than the selected tile appearing to glow.
+	// A one-shot animation is both calmer to look at and free when idle.
+	constexpr DWORD kSelectionTapMs = 220;
+	constexpr float kSelectionTapScale = 0.05f;  // 5% at the peak
+	constexpr float kSelectionGlowRest = 0.80f;  // steady glow alpha between taps
+
+	DWORD g_selectionTapStart = 0;
+	uint64_t g_lastSelectionSignature = 0;
+	bool g_hasSelectionSignature = false;
+
+	bool SelectionTapActive()
+	{
+		return g_selectionTapStart != 0 && GetTickCount() - g_selectionTapStart < kSelectionTapMs;
+	}
+
+	// 0 -> 1 -> 0 over the tap, rising quickly and settling slowly, with zero
+	// velocity at both ends so it neither jerks on nor stops dead. The time
+	// warp (t^0.6) is what puts the peak at ~31% of the duration instead of
+	// halfway, which is the difference between a tap and a throb.
+	float SelectionTapAmount()
+	{
+		if (!SelectionTapActive())
+			return 0.0f;
+		const float t = std::clamp(
+			static_cast<float>(GetTickCount() - g_selectionTapStart) / static_cast<float>(kSelectionTapMs),
+			0.0f, 1.0f);
+		return std::pow(std::sin(3.14159265f * std::pow(t, 0.6f)), 1.5f);
+	}
+
+	// How much the focused tile is scaled up right now, about its own centre.
+	float SelectionTapScale()
+	{
+		return 1.0f + kSelectionTapScale * SelectionTapAmount();
+	}
+
+	// The focused tile's halo: steady, with a small lift while the tap runs.
+	float SelectionGlowAlpha()
+	{
+		return kSelectionGlowRest + (1.0f - kSelectionGlowRest) * SelectionTapAmount();
+	}
+
+	// Poll pacing. kTickPending keeps at most one tick in flight, so a slow
+	// frame can never let the queue fill with a backlog of stale polls that
+	// would then all run at once (which is what "it registers something I
+	// didn't press, then starts accepting input again" looks like).
+	std::atomic<bool> g_tickRunning{false};
+	std::atomic<bool> g_tickPending{false};
+	// Read by the pacing thread, written by the UI thread when the overlay is
+	// shown or hidden - hence the atomic rather than reading overlayVisible
+	// across threads.
+	std::atomic<DWORD> g_tickIntervalMs{kTickIntervalHiddenMs};
+	std::thread g_tickThread;
+
+	// Cubic ease-out: fast at the start, gentle at the end. Applied to both
+	// fades so they feel like they are settling rather than stopping dead.
+	float EaseOutCubic(float t)
+	{
+		t = std::clamp(t, 0.0f, 1.0f);
+		const float inv = 1.0f - t;
+		return 1.0f - inv * inv * inv;
+	}
+
+	float ElapsedFraction(DWORD start, DWORD durationMs)
+	{
+		if (start == 0 || durationMs == 0)
+			return 1.0f;
+		const DWORD elapsed = GetTickCount() - start;
+		return elapsed >= durationMs ? 1.0f : static_cast<float>(elapsed) / static_cast<float>(durationMs);
+	}
+
+	BYTE TargetOverlayAlpha()
+	{
+		const int percent = std::clamp(g_app.opacityPercent, 20, 100);
+		return static_cast<BYTE>(std::clamp(percent * 255 / 100, 1, 255));
+	}
+
+	bool WindowFadeActive()
+	{
+		return g_windowFadeStart != 0 &&
+			ElapsedFraction(g_windowFadeStart, g_windowFadingOut ? kWindowFadeOutMs : kWindowFadeInMs) < 1.0f;
+	}
+
+	// The constant alpha handed to UpdateLayeredWindow this frame.
+	BYTE CurrentOverlayAlpha()
+	{
+		const BYTE target = TargetOverlayAlpha();
+		if (g_windowFadeStart == 0)
+			return target;
+		const float t = EaseOutCubic(
+			ElapsedFraction(g_windowFadeStart, g_windowFadingOut ? kWindowFadeOutMs : kWindowFadeInMs));
+		const float scale = g_windowFadingOut ? 1.0f - t : t;
+		return static_cast<BYTE>(std::clamp(static_cast<int>(target * scale + 0.5f), 0, 255));
+	}
+
+	// Starts a window fade that is already `fromShownFraction` of the way to
+	// being visible (0 = invisible, 1 = fully shown). Reversing mid-fade
+	// passes the fraction it had reached, so a quick double-tap of the
+	// shortcut looks like the window changed its mind rather than teleporting
+	// to one end and starting over. The start time is back-dated through the
+	// inverse of the ease so the motion stays continuous across the reversal.
+	void BeginWindowFade(bool fadingOut, float fromShownFraction)
+	{
+		g_windowFadingOut = fadingOut;
+		const float eased = std::clamp(fadingOut ? 1.0f - fromShownFraction : fromShownFraction, 0.0f, 1.0f);
+		const float linear = 1.0f - std::cbrt(1.0f - eased); // inverse of EaseOutCubic
+		const DWORD duration = fadingOut ? kWindowFadeOutMs : kWindowFadeInMs;
+		g_windowFadeStart = GetTickCount() - static_cast<DWORD>(linear * duration);
+		if (g_windowFadeStart == 0)
+			g_windowFadeStart = 1; // 0 is the "no fade running" sentinel
+	}
+
+	// How far along the current fade the window is, as a shown-ness fraction.
+	float CurrentShownFraction()
+	{
+		const BYTE target = TargetOverlayAlpha();
+		if (target == 0)
+			return 0.0f;
+		return std::clamp(static_cast<float>(CurrentOverlayAlpha()) / static_cast<float>(target), 0.0f, 1.0f);
+	}
+
+	bool ScreenTransitionActive()
+	{
+		return g_screenFadeStart != 0 && ElapsedFraction(g_screenFadeStart, kScreenFadeMs) < 1.0f;
+	}
+
+	float ScreenFadeAlpha()
+	{
+		if (g_screenFadeStart == 0)
+			return 1.0f;
+		return EaseOutCubic(ElapsedFraction(g_screenFadeStart, kScreenFadeMs));
+	}
+
+	// Detects a screen change and starts the content fade. Called from the
+	// timer (so it is noticed within a tick of the change) and from Paint (so
+	// a repaint that beats the timer still fades rather than popping).
+	// PadViewer and PadAction are the same picture - the seven pads - with an
+	// action bar added under the focused one. Cross-fading between them made
+	// the whole pad grid blink every time a pad was opened or backed out of,
+	// which reads as a glitch rather than a transition. They are treated as
+	// one screen here, so only real screen changes fade.
+	bool IsSamePadScene(Screen a, Screen b)
+	{
+		const auto padScene = [](Screen screen) {
+			return screen == Screen::PadViewer || screen == Screen::PadAction;
+		};
+		return padScene(a) && padScene(b);
+	}
+
+	void SyncScreenTransition()
+	{
+		if (g_app.screen == g_lastTransitionScreen)
+			return;
+		const Screen previous = g_lastTransitionScreen;
+		g_lastTransitionScreen = g_app.screen;
+		if (IsSamePadScene(previous, g_app.screen))
+			return;
+		g_screenFadeStart = GetTickCount();
+		if (g_screenFadeStart == 0)
+			g_screenFadeStart = 1;
+	}
+
 	// The picker's rebindable actions, in the order they appear as Settings
 	// rows. Confirm/Back stay subject to the swap-confirm-back setting on
 	// top of whatever buttons they are bound to.
@@ -391,11 +645,59 @@ bool swapConfirmBackButtons = false;
 		{L"Quick clear", L"ButtonQuickClear", &AppState::buttonQuickClear},
 	}};
 
-	// Settings rows: shortcut, confirm style, background, story mode,
-	// button labels, Toypad LEDs, window placement, one rebind row per
-	// kBindableActions entry, clear all pads, web remote, reset to defaults.
-	constexpr size_t kSettingsBindingFirst = 7;
-	constexpr size_t kSettingsItemCount = kSettingsBindingFirst + kBindableActions.size() + 3;
+	// ---------------------------------------------------------------------
+	// Settings model
+	// ---------------------------------------------------------------------
+	// The Settings screen is a scrolled list grouped into categories, laid
+	// out like the franchise grid: a translucent panel, a right-edge scroll
+	// bar and a viewport that follows the focus. A row is either a category
+	// heading (not focusable, not activatable) or one setting.
+	//
+	// The same table drives painting and activation, so a row can never end
+	// up wired to the wrong action - which is exactly what the old
+	// "settingsIndex == 6" chain made easy to get wrong every time a row was
+	// inserted.
+	enum class SettingAction
+	{
+		Heading,
+		Shortcut,
+		ConfirmStyle,
+		ButtonStyle,
+		Binding,        // uses bindingIndex
+		Background,
+		PadSkin,
+		Opacity,
+		WindowPlacement,
+		LedMirror,
+		SoundEffects,
+		SoundVolume,
+		StoryMode,
+		ClearAllPads,
+		WebRemote,
+		ResetDefaults,
+	};
+
+	// Whether a row's value is an on/off state, and which way. On is drawn
+	// green and Off red, so the state of every switch in the list is readable
+	// without reading a single word. Settings whose value is a choice rather
+	// than a switch (a wallpaper, a window mode) stay Neutral - colouring
+	// "All series" green would be asserting something meaningless.
+	enum class SettingValueTone { Neutral, On, Off };
+
+	struct SettingsEntry
+	{
+		SettingAction action = SettingAction::Heading;
+		std::wstring label;     // "Toypad LEDs", or the category name on a heading
+		std::wstring value;     // "Off" - drawn separately so it can be coloured
+		SettingValueTone tone = SettingValueTone::Neutral;
+		ButtonMask icons = 0;   // trailing pad-button icons, 0 for none
+		size_t bindingIndex = 0;
+	};
+
+	bool IsSettingsHeading(const SettingsEntry& entry)
+	{
+		return entry.action == SettingAction::Heading;
+	}
 
 	// Auto resolves to the connected pad's own style; a pinned choice wins
 	// over detection entirely.
@@ -470,6 +772,7 @@ bool swapConfirmBackButtons = false;
 	// Forward-declared here; defined later in the file. Confirm()/Back() run
 	// before those definitions appear.
 void UpdateInputOwnership(HWND window);
+	void Paint(HWND window);
 	void HideOverlay(HWND window);
 	void BeginShortcutCapture();
 	void CancelShortcutCapture();
@@ -488,6 +791,24 @@ void UpdateInputOwnership(HWND window);
 	std::wstring DescribeWebRemote();
 	std::wstring GetLanAddress();
 	void HandleWebJob(WebJob& job);
+	void SyncSelectionTap();
+	void StartTickThread(HWND window);
+	void StopTickThread();
+	// Settings list (built from the categorised table further down).
+	std::vector<SettingsEntry> BuildSettingsEntries();
+	void MoveSettingsSelection(int direction);
+	void ActivateSettingsEntry();
+	void AdjustSettingsValue(int direction);
+	void ClampSettingsSelection();
+	void BuildPadSkinList();
+	void CyclePadSkin(int direction);
+	void CycleOpacity(int direction);
+	void CycleSoundVolume(int direction);
+	void ToggleSoundEffects();
+	std::wstring DescribePadSkin();
+	std::wstring DescribeOpacity();
+	std::wstring DescribeSoundEffects();
+	std::wstring DescribeSoundVolume();
 
 	// ---------------------------------------------------------------------
 	// GDI+ plumbing
@@ -521,6 +842,7 @@ void UpdateInputOwnership(HWND window);
 		Background,   // full-window starfield + dark overlay
 		ScaledImage,  // raw asset rescaled (optionally rounded-rect clipped) once
 		LedHalo,      // per-region LED glow (tinted soft halo, cached per color+level)
+		FocusGlow,    // soft pulsing halo behind the focused pad / franchise tile
 	};
 
 	struct GlossKey
@@ -646,15 +968,258 @@ void UpdateInputOwnership(HWND window);
 	}
 
 	// ---------------------------------------------------------------------
+	// UI sound effects
+	// ---------------------------------------------------------------------
+	// Two short WAVs embedded like every other asset (Assets/SFX): one blip
+	// when the highlight moves, one when something is confirmed. Played
+	// straight out of the resource bytes with PlaySound(SND_MEMORY), which
+	// needs nothing on disk and no audio library - winmm is already linked
+	// for the timer resolution. SND_ASYNC means a new blip cuts off the
+	// previous one, which is what fast scrolling should sound like anyway.
+	//
+	// The resource memory belongs to the module and outlives playback, so
+	// handing PlaySound a pointer into it is safe for the async case.
+	// Volume-adjusted copies of the embedded WAVs, keyed by (resource, level).
+	// PlaySound offers no volume control and the process-wide mixer volume is
+	// not ours to touch, so the level is baked into the samples instead. The
+	// copies are cached and never freed, which is what lets us hand PlaySound
+	// a pointer and return immediately: an async playback keeps reading the
+	// buffer after this function is done with it. There are only two sounds
+	// and a handful of levels, so the cache is a few hundred KB at worst.
+	std::map<std::pair<int, int>, std::vector<uint8_t>> g_scaledSounds;
+
+	// Applies gain in place to the PCM samples of a RIFF/WAVE buffer. Walks
+	// the chunk list properly rather than assuming the canonical 44-byte
+	// header, because a WAV exported by any real tool tends to carry LIST or
+	// fact chunks before the data. Anything that isn't 8- or 16-bit PCM is
+	// left alone and simply plays at full volume.
+	void ApplyWavGain(std::vector<uint8_t>& wav, int volumePercent)
+	{
+		if (wav.size() < 44 || std::memcmp(wav.data(), "RIFF", 4) != 0 ||
+			std::memcmp(wav.data() + 8, "WAVE", 4) != 0)
+			return;
+
+		const auto readU16 = [&wav](size_t at) {
+			return static_cast<uint16_t>(wav[at] | (wav[at + 1] << 8));
+		};
+		const auto readU32 = [&wav](size_t at) {
+			return static_cast<uint32_t>(wav[at] | (wav[at + 1] << 8) |
+				(wav[at + 2] << 16) | (static_cast<uint32_t>(wav[at + 3]) << 24));
+		};
+
+		uint16_t format = 0;
+		uint16_t bits = 0;
+		size_t dataOffset = 0;
+		size_t dataSize = 0;
+		size_t cursor = 12;
+		while (cursor + 8 <= wav.size())
+		{
+			const uint32_t chunkSize = readU32(cursor + 4);
+			const size_t body = cursor + 8;
+			if (body > wav.size())
+				break;
+			const size_t available = std::min(static_cast<size_t>(chunkSize), wav.size() - body);
+			if (std::memcmp(wav.data() + cursor, "fmt ", 4) == 0 && available >= 16)
+			{
+				format = readU16(body);
+				bits = readU16(body + 14);
+			}
+			else if (std::memcmp(wav.data() + cursor, "data", 4) == 0)
+			{
+				dataOffset = body;
+				dataSize = available;
+				break;
+			}
+			// Chunks are word-aligned: an odd size is followed by a pad byte.
+			cursor = body + available + (available & 1);
+		}
+
+		if (dataSize == 0 || format != 1)
+			return;
+
+		const int gain = std::clamp(volumePercent, 0, 100);
+		if (bits == 16)
+		{
+			for (size_t i = 0; i + 1 < dataSize; i += 2)
+			{
+				int16_t sample = static_cast<int16_t>(
+					wav[dataOffset + i] | (wav[dataOffset + i + 1] << 8));
+				sample = static_cast<int16_t>(std::clamp(sample * gain / 100, -32768, 32767));
+				wav[dataOffset + i] = static_cast<uint8_t>(sample & 0xFF);
+				wav[dataOffset + i + 1] = static_cast<uint8_t>((sample >> 8) & 0xFF);
+			}
+		}
+		else if (bits == 8)
+		{
+			// 8-bit WAV samples are unsigned with silence at 128, so the gain
+			// has to be applied around that midpoint, not around zero.
+			for (size_t i = 0; i < dataSize; ++i)
+			{
+				const int centred = static_cast<int>(wav[dataOffset + i]) - 128;
+				wav[dataOffset + i] =
+					static_cast<uint8_t>(std::clamp(128 + centred * gain / 100, 0, 255));
+			}
+		}
+	}
+
+	const std::vector<uint8_t>* GetSoundBytes(int resourceId, int volumePercent)
+	{
+		const auto key = std::make_pair(resourceId, volumePercent);
+		const auto cached = g_scaledSounds.find(key);
+		if (cached != g_scaledSounds.end())
+			return &cached->second;
+
+		std::vector<uint8_t> wav = LoadResourceBytes(resourceId);
+		if (wav.empty())
+			return nullptr;
+		if (volumePercent < 100)
+			ApplyWavGain(wav, volumePercent);
+		return &g_scaledSounds.emplace(key, std::move(wav)).first->second;
+	}
+
+	void PlayUiSound(int resourceId)
+	{
+		if (!g_app.soundEffects || resourceId == 0 || g_app.soundVolume <= 0)
+			return;
+		const std::vector<uint8_t>* wav = GetSoundBytes(resourceId, g_app.soundVolume);
+		if (!wav || wav->empty())
+			return;
+		PlaySoundW(reinterpret_cast<LPCWSTR>(wav->data()), nullptr,
+			SND_MEMORY | SND_ASYNC | SND_NODEFAULT | SND_NOWAIT);
+	}
+
+	void PlayNavigateSound()
+	{
+		PlayUiSound(kSfxNavigateResourceId);
+	}
+
+	void PlaySelectSound()
+	{
+		PlayUiSound(kSfxSelectResourceId);
+	}
+
+	// Plays once a Move or Clear has actually gone through - after the wire
+	// send succeeds, not on the button press that requested it - so the
+	// sound confirms the pad genuinely changed rather than just that a
+	// button was pressed (Select already covers that).
+	void PlayMoveSound()
+	{
+		PlayUiSound(kSfxMoveResourceId);
+	}
+
+	void PlayRemoveSound()
+	{
+		PlayUiSound(kSfxRemoveResourceId);
+	}
+
+	void StopUiSounds()
+	{
+		PlaySoundW(nullptr, nullptr, SND_PURGE);
+	}
+
+	// ---------------------------------------------------------------------
+	// Pad skins
+	// ---------------------------------------------------------------------
+	// The seven pad images come from a folder under Assets/Pads: "default" is
+	// the built-in look, and any sibling folder holding the same seven
+	// filenames is another selectable skin. Two sources feed the list:
+	//
+	//   - folders that existed at build time, compiled into the exe as
+	//     resources (kPadSkins), and
+	//   - folders dropped into "Assets/Pads/<name>" next to the .exe after
+	//     the fact, loaded from disk at startup.
+	//
+	// Disk art can't have a resource id, so its slots get synthetic negative
+	// ids (-1, -2, ...) that index g_padDiskArtPaths. Everything downstream -
+	// including the gloss cache key - just carries the id, so switching skins
+	// stays a repaint with no cache invalidation: each skin's pads are simply
+	// different cache entries.
+	struct PadSkinOption
+	{
+		std::wstring name;
+		std::array<int, 7> artIds{};
+	};
+
+	std::vector<PadSkinOption> g_padSkins;
+	std::vector<std::filesystem::path> g_padDiskArtPaths;
+	std::map<int, Gdiplus::Bitmap*> g_padDiskBitmaps;
+
+	// Filenames a skin folder must contain, in kPadCells order.
+	constexpr std::array<const wchar_t*, 7> kPadSlotArtNames = {
+		L"left_upper", L"center", L"right_upper",
+		L"left_lower_left", L"left_lower_right",
+		L"right_lower_left", L"right_lower_right",
+	};
+
+	Gdiplus::Bitmap* GetPadArtBitmap(int artId)
+	{
+		if (artId >= 0)
+			return GetAssetBitmap(artId);
+
+		const auto cached = g_padDiskBitmaps.find(artId);
+		if (cached != g_padDiskBitmaps.end())
+			return cached->second;
+
+		const size_t pathIndex = static_cast<size_t>(-artId - 1);
+		Gdiplus::Bitmap* bitmap = nullptr;
+		if (pathIndex < g_padDiskArtPaths.size())
+		{
+			bitmap = new Gdiplus::Bitmap(g_padDiskArtPaths[pathIndex].c_str());
+			if (bitmap->GetLastStatus() != Gdiplus::Ok)
+			{
+				delete bitmap;
+				bitmap = nullptr;
+			}
+		}
+		// A failed load is cached as null too, so a broken PNG is decoded
+		// once instead of on every frame.
+		g_padDiskBitmaps[artId] = bitmap;
+		return bitmap;
+	}
+
+	void ReleasePadDiskBitmaps()
+	{
+		for (auto& [id, bitmap] : g_padDiskBitmaps)
+			delete bitmap;
+		g_padDiskBitmaps.clear();
+	}
+
+	// The art id for one pad slot under the active skin. Falls back to the
+	// compiled-in default table if the skin list is somehow empty, so the
+	// pads are never blank.
+	int PadArtIdForSlot(size_t slotIndex)
+	{
+		if (slotIndex >= 7)
+			return 0;
+		if (g_padSkins.empty())
+			return kPadBackgroundResourceIds[slotIndex];
+		const size_t skin = std::min(g_app.padSkinIndex, g_padSkins.size() - 1);
+		return g_padSkins[skin].artIds[slotIndex];
+	}
+
+	// ---------------------------------------------------------------------
 	// Glossy / glowing shape renderers (each runs ONCE per cached state)
 	// ---------------------------------------------------------------------
 
 	constexpr unsigned int kGlowGold = 0x00FFCC33;    // selection glow everywhere
-	constexpr unsigned int kGlowBlue = 0x005A96E0;    // move-source pads
+	// Move-source highlight: the pad you are picking a new home for. This was
+	// previously named kGlowBlue but its packed value (0x00BBGGRR) actually
+	// unpacked to R=224,G=150,B=90 - a dull orange, not blue at all, and with
+	// only a single-pass 8px glow it read as barely-there. Reusing the vivid
+	// blue this project already used for tile selection before that unified
+	// on red/coral (RGB 66,157,255), and giving it the same two-pass
+	// bloom+core halo as the pad/tile selection glow (see RenderFocusGlow) so
+	// "you are about to move this" is unmistakable at a glance.
+	constexpr unsigned int kMoveSourceGlow = 0x00FF9D42; // RGB(66, 157, 255)
 	constexpr unsigned int kPadBorderIdle = 0x00525A6A;
 	constexpr unsigned int kPadBorderOccupied = 0x0060B476;
-	constexpr unsigned int kPadFocusEdge = 0x003838E8; // selected pad edge (RGB 232,56,56)
-	constexpr unsigned int kFranchiseFocusEdge = 0x00FF9D42; // selected franchise edge (RGB 66,157,255)
+	// One selection colour for the pad grid and the franchise grid alike. The
+	// old look was a 1.5-3.25px hairline - red on the pads, blue on the
+	// tiles - which disappeared against busy art and read as a defect rather
+	// than a highlight. Both now use this colour as a soft halo that breathes
+	// (see RenderFocusGlow / FocusPulse) plus a wide-then-crisp double stroke,
+	// so the focus is obvious at a glance without a hard line anywhere.
+	constexpr unsigned int kSelectionGlow = 0x004848FF; // RGB 255,72,72
 
 	void AddRoundedRectPath(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect, float radius)
 	{
@@ -834,7 +1399,8 @@ void UpdateInputOwnership(HWND window);
 		const int w = (cell.right - cell.left) + kPadGlowMargin * 2;
 		const int h = (cell.bottom - cell.top) + kPadGlowMargin * 2;
 		const int variant = static_cast<int>(visual) | (outlineOnly ? kPadOutlineVariantBit : 0);
-		const GlossKey key{GlossKind::Pad, variant, kPadBackgroundResourceIds[slotIndex], occupantColor, w, h};
+		const GlossKey key{GlossKind::Pad, variant, PadArtIdForSlot(static_cast<size_t>(slotIndex)),
+			occupantColor, w, h};
 		const auto cached = g_glossCache.find(key);
 		if (cached != g_glossCache.end())
 			return cached->second;
@@ -852,14 +1418,14 @@ void UpdateInputOwnership(HWND window);
 		const bool selected = visual == PadVisual::IdleSelected || visual == PadVisual::OccupiedSelected;
 		const bool occupied = visual == PadVisual::Occupied || visual == PadVisual::OccupiedSelected;
 		const bool moveSource = visual == PadVisual::MoveSource;
-
-		if (moveSource)
-			DrawGlow(g, path, kGlowBlue, 8, w, h);
+		(void)moveSource; // the halo itself is now drawn externally, see DrawPad
 
 		// The real pad art (already includes the glass/gloss look) fills the
 		// cell rect; the procedural gradient and synthetic glossy streak are
 		// gone. The rounded-rect clip keeps the shape's outline crisp.
-		Gdiplus::Bitmap* padImage = outlineOnly ? nullptr : GetAssetBitmap(kPadBackgroundResourceIds[slotIndex]);
+		Gdiplus::Bitmap* padImage = outlineOnly
+			? nullptr
+			: GetPadArtBitmap(PadArtIdForSlot(static_cast<size_t>(slotIndex)));
 		if (padImage)
 		{
 			Gdiplus::Region clip(&path);
@@ -878,14 +1444,191 @@ void UpdateInputOwnership(HWND window);
 			g.FillPath(&tint, &path);
 		}
 
-		const unsigned int border = moveSource ? kGlowBlue
-			: (selected ? kPadFocusEdge
-				: (occupied ? occupiedColor : kPadBorderIdle));
-		Gdiplus::Pen borderPen(
-			Gdiplus::Color(selected ? 230 : 255, GetRValue(border), GetGValue(border), GetBValue(border)),
-			selected ? 3.25f : 2.0f);
-		borderPen.SetLineJoin(Gdiplus::LineJoinRound);
-		g.DrawPath(&borderPen, &path);
+		if (selected)
+		{
+			// Wide translucent stroke first, crisp thin one over it: the edge
+			// keeps a definite position while still fading into the halo
+			// drawn behind the pad, instead of being a single hard line.
+			Gdiplus::Pen wide(Gdiplus::Color(80, GetRValue(kSelectionGlow),
+				GetGValue(kSelectionGlow), GetBValue(kSelectionGlow)), 7.5f);
+			wide.SetLineJoin(Gdiplus::LineJoinRound);
+			g.DrawPath(&wide, &path);
+			Gdiplus::Pen crisp(Gdiplus::Color(225, GetRValue(kSelectionGlow),
+				GetGValue(kSelectionGlow), GetBValue(kSelectionGlow)), 2.4f);
+			crisp.SetLineJoin(Gdiplus::LineJoinRound);
+			g.DrawPath(&crisp, &path);
+		}
+		else
+		{
+			const unsigned int border = moveSource ? kMoveSourceGlow
+				: (occupied ? occupiedColor : kPadBorderIdle);
+			// A bit heavier than the plain idle/occupied edge, so the crisp
+			// line itself - not just the halo behind it - reads as
+			// deliberately emphasized rather than incidental.
+			Gdiplus::Pen borderPen(
+				Gdiplus::Color(255, GetRValue(border), GetGValue(border), GetBValue(border)),
+				moveSource ? 2.75f : 2.0f);
+			borderPen.SetLineJoin(Gdiplus::LineJoinRound);
+			g.DrawPath(&borderPen, &path);
+		}
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
+
+	// ---------------------------------------------------------------------
+	// Focus glow: the soft, slowly breathing halo behind whatever is selected
+	// ---------------------------------------------------------------------
+	// The halo itself is expensive (two box-blurred silhouettes) but it is
+	// built ONCE per shape+size+colour and cached like every other surface.
+	// The pulse is not baked into it: the cached bitmap is drawn at full
+	// strength and the breathing comes from scaling its alpha at blit time
+	// with a colour matrix, which is one DrawImage. So a pulsing selection
+	// costs the same per frame as the old static outline did - no per-frame
+	// blur, no cache entry per animation step, and nothing to invalidate when
+	// the phase moves.
+	constexpr int kFocusGlowMargin = 20;
+	constexpr float kFocusPulsePeriodMs = 2400.0f; // one slow breath
+	// The breath is quantised to this many brightness steps. Nothing about the
+	// drawing needs it - the alpha is continuous - but the repaint decision
+	// does: a continuously varying alpha means "repaint forever at whatever
+	// frame rate we pick", while a stepped one means "repaint only when the
+	// picture would actually differ". At 24 steps over 2.4s that is ~19
+	// repaints a second on average and none at all when the breath is near
+	// its turning points, and the steps are ~2.4% of alpha apart, which is
+	// far below what the eye resolves in a soft glow.
+	constexpr int kFocusPulseSteps = 24;
+
+	enum class FocusShape : int
+	{
+		RoundedPad,      // pad tiles (14px corners)
+		Circle,          // the round centre pad
+		RoundedTile,     // franchise tiles (12px corners)
+	};
+
+	// Which step of the breath the wall clock is on. Every focused element
+	// shares the phase, so the whole screen breathes together instead of
+	// drifting apart element by element, and the repaint gate in the tick
+	// handler watches this same number.
+	int FocusPulseStep()
+	{
+		const float phase =
+			static_cast<float>(GetTickCount() % static_cast<DWORD>(kFocusPulsePeriodMs)) / kFocusPulsePeriodMs;
+		const float raw = 0.5f - 0.5f * std::cos(phase * 6.28318530718f);
+		return std::clamp(static_cast<int>(raw * (kFocusPulseSteps - 1) + 0.5f), 0, kFocusPulseSteps - 1);
+	}
+
+	// 0..1, stepped. Drawing uses the same quantised value the repaint gate
+	// tests, so a frame is never skipped while the painted alpha keeps
+	// drifting underneath it.
+	float FocusPulse()
+	{
+		return static_cast<float>(FocusPulseStep()) / static_cast<float>(kFocusPulseSteps - 1);
+	}
+
+	// Screens that animate continuously and therefore need repainting while
+	// they are up. The pad and franchise grids are deliberately NOT in this
+	// list: their selection is a steady glow plus a one-shot tap, so they are
+	// completely idle between keypresses.
+	bool ScreenHasPulsingFocus()
+	{
+		return false;
+	}
+
+	// DrawImage with the whole bitmap's alpha scaled by `alpha` (0..1), into
+	// an arbitrary destination rectangle. Used by the selection tap (scaled
+	// about a centre) and by the screen-transition fade (moved, not scaled).
+	void DrawImageWithAlpha(Gdiplus::Graphics& g, Gdiplus::Bitmap* bitmap,
+		const Gdiplus::RectF& dest, float alpha)
+	{
+		if (!bitmap || alpha <= 0.004f)
+			return;
+		const int w = static_cast<int>(bitmap->GetWidth());
+		const int h = static_cast<int>(bitmap->GetHeight());
+		const bool native = std::fabs(dest.Width - w) < 0.5f && std::fabs(dest.Height - h) < 0.5f;
+		if (alpha >= 0.999f && native)
+		{
+			// The (x, y) overload draws at the bitmap's own size with no
+			// scaler in the path at all; a rect overload can still go through
+			// the interpolator even at 1:1.
+			g.DrawImage(bitmap, static_cast<int>(dest.X + 0.5f), static_cast<int>(dest.Y + 0.5f));
+			return;
+		}
+		if (alpha >= 0.999f)
+		{
+			g.DrawImage(bitmap, dest);
+			return;
+		}
+		Gdiplus::ColorMatrix matrix = {
+			{{1.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+			 {0.0f, 1.0f, 0.0f, 0.0f, 0.0f},
+			 {0.0f, 0.0f, 1.0f, 0.0f, 0.0f},
+			 {0.0f, 0.0f, 0.0f, alpha, 0.0f},
+			 {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}}};
+		Gdiplus::ImageAttributes attributes;
+		attributes.SetColorMatrix(&matrix, Gdiplus::ColorMatrixFlagsDefault, Gdiplus::ColorAdjustTypeBitmap);
+		g.DrawImage(bitmap, dest, 0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h),
+			Gdiplus::UnitPixel, &attributes);
+	}
+
+	void DrawImageWithAlpha(Gdiplus::Graphics& g, Gdiplus::Bitmap* bitmap, int x, int y, float alpha)
+	{
+		if (!bitmap)
+			return;
+		DrawImageWithAlpha(g, bitmap, Gdiplus::RectF(static_cast<float>(x), static_cast<float>(y),
+			static_cast<float>(bitmap->GetWidth()), static_cast<float>(bitmap->GetHeight())), alpha);
+	}
+
+	// Draws `bitmap` at (x, y) scaled by `scale` about the point (cx, cy) - so
+	// a tile grows into its own centre instead of towards the top-left. At
+	// scale 1 this collapses to a plain blit.
+	void DrawImageScaledAbout(Gdiplus::Graphics& g, Gdiplus::Bitmap* bitmap,
+		float x, float y, float cx, float cy, float scale, float alpha = 1.0f)
+	{
+		if (!bitmap)
+			return;
+		const float w = static_cast<float>(bitmap->GetWidth());
+		const float h = static_cast<float>(bitmap->GetHeight());
+		const Gdiplus::RectF dest(cx - (cx - x) * scale, cy - (cy - y) * scale, w * scale, h * scale);
+		DrawImageWithAlpha(g, bitmap, dest, alpha);
+	}
+
+	// Blurred halo of one shape, padded by kFocusGlowMargin on every side.
+	// Two passes at different radii: a tight bright core right at the edge
+	// and a wide faint bloom around it, which is what makes it read as light
+	// rather than as a fat second outline.
+	Gdiplus::Bitmap* RenderFocusGlow(int shapeW, int shapeH, FocusShape shape, unsigned int color)
+	{
+		const int w = shapeW + kFocusGlowMargin * 2;
+		const int h = shapeH + kFocusGlowMargin * 2;
+		const GlossKey key{GlossKind::FocusGlow, static_cast<int>(shape), 0, color, w, h};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
+		Gdiplus::Graphics g(bitmap);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+		const Gdiplus::RectF rect(static_cast<float>(kFocusGlowMargin), static_cast<float>(kFocusGlowMargin),
+			static_cast<float>(shapeW), static_cast<float>(shapeH));
+		Gdiplus::GraphicsPath path;
+		switch (shape)
+		{
+		case FocusShape::Circle:
+			path.AddEllipse(rect);
+			path.CloseFigure();
+			break;
+		case FocusShape::RoundedTile:
+			AddRoundedRectPath(path, rect, 12.0f);
+			break;
+		case FocusShape::RoundedPad:
+			AddRoundedRectPath(path, rect, 14.0f);
+			break;
+		}
+
+		DrawGlow(g, path, color, 13, w, h); // wide bloom
+		DrawGlow(g, path, color, 5, w, h);  // tight core
 
 		g_glossCache[key] = bitmap;
 		return bitmap;
@@ -933,6 +1676,12 @@ void UpdateInputOwnership(HWND window);
 	// brighter ring plus a colored glow. `diameter` is the circle size; the
 	// bitmap is padded by kPortraitMargin for the glow.
 	constexpr int kPortraitMargin = 10;
+
+	// Trimmed art bounds per resource id. The scan below is a full-size probe
+	// bitmap plus a per-pixel alpha sweep, and the answer only depends on the
+	// image - so it is computed once per asset rather than once per (asset,
+	// size, focus state) portrait variant.
+	std::map<int, Gdiplus::Rect> g_opaqueBoundsCache;
 
 	Gdiplus::Rect GetOpaqueContentBounds(Gdiplus::Bitmap* image)
 	{
@@ -986,6 +1735,17 @@ void UpdateInputOwnership(HWND window);
 		return Gdiplus::Rect(left, top, right - left + 1, bottom - top + 1);
 	}
 
+	// Cached front end for the above, keyed by resource id.
+	Gdiplus::Rect GetOpaqueContentBoundsCached(int resId, Gdiplus::Bitmap* image)
+	{
+		const auto cached = g_opaqueBoundsCache.find(resId);
+		if (cached != g_opaqueBoundsCache.end())
+			return cached->second;
+		const Gdiplus::Rect bounds = GetOpaqueContentBounds(image);
+		g_opaqueBoundsCache[resId] = bounds;
+		return bounds;
+	}
+
 	void DrawCircularFocusHalo(Gdiplus::Graphics& g, const Gdiplus::RectF& circle, unsigned int color)
 	{
 		Gdiplus::RectF outer = circle;
@@ -1026,7 +1786,7 @@ void UpdateInputOwnership(HWND window);
 		Gdiplus::Bitmap* photo = GetAssetBitmap(resId);
 		if (photo)
 		{
-			const Gdiplus::Rect source = GetOpaqueContentBounds(photo);
+			const Gdiplus::Rect source = GetOpaqueContentBoundsCached(resId, photo);
 			const float targetD = d * 0.92f;
 			const float scale = std::min(targetD / source.Width, targetD / source.Height);
 			const float drawW = source.Width * scale;
@@ -1217,12 +1977,27 @@ void UpdateInputOwnership(HWND window);
 			g.ResetClip();
 		}
 
-		const unsigned int border = focused ? kFranchiseFocusEdge : kPadBorderIdle;
-		Gdiplus::Pen borderPen(
-			Gdiplus::Color(focused ? 230 : 200, GetRValue(border), GetGValue(border), GetBValue(border)),
-			focused ? 2.75f : 1.5f);
-		borderPen.SetLineJoin(Gdiplus::LineJoinRound);
-		g.DrawPath(&borderPen, &path);
+		if (focused)
+		{
+			// Same double stroke as a focused pad, in the same colour: the
+			// two grids are the same kind of "pick one of these", so they now
+			// look the same when you do.
+			Gdiplus::Pen wide(Gdiplus::Color(80, GetRValue(kSelectionGlow),
+				GetGValue(kSelectionGlow), GetBValue(kSelectionGlow)), 6.5f);
+			wide.SetLineJoin(Gdiplus::LineJoinRound);
+			g.DrawPath(&wide, &path);
+			Gdiplus::Pen crisp(Gdiplus::Color(225, GetRValue(kSelectionGlow),
+				GetGValue(kSelectionGlow), GetBValue(kSelectionGlow)), 2.2f);
+			crisp.SetLineJoin(Gdiplus::LineJoinRound);
+			g.DrawPath(&crisp, &path);
+		}
+		else
+		{
+			Gdiplus::Pen borderPen(Gdiplus::Color(200, GetRValue(kPadBorderIdle),
+				GetGValue(kPadBorderIdle), GetBValue(kPadBorderIdle)), 1.5f);
+			borderPen.SetLineJoin(Gdiplus::LineJoinRound);
+			g.DrawPath(&borderPen, &path);
+		}
 
 		g_glossCache[key] = bitmap;
 		return bitmap;
@@ -1684,9 +2459,10 @@ void UpdateInputOwnership(HWND window);
 			"; SwapConfirmBackButtons = 0 uses A to enter and B to go back (RPCS3 style).\n"
 			"; SwapConfirmBackButtons = 1 uses B to enter and A to go back (Cemu style).\n"
 			"SwapConfirmBackButtons=0\n"
-"; BackgroundIndex selects the app background from bundled Assets/Wallpapers images.\n"
-			"; The value one past the last wallpaper means No Background: the overlay\n"
-			"; is drawn transparent between the UI elements so the game shows through.\n"
+"; BackgroundIndex walks the Background row's own order, which is NOT the\n"
+			"; raw wallpaper order: 0 is the default wallpaper, 1 is Clear (the overlay\n"
+			"; is drawn transparent between the UI elements so the game shows through),\n"
+			"; and 2 upwards are the remaining bundled Assets/Wallpapers images.\n"
 			"BackgroundIndex=0\n"
 			"; StoryMode = 1 shows only the starter pack (Batman, Gandalf The Grey,\n"
 			"; Wyldstyle, Batmobile) when picking a figure, skipping the series grid.\n"
@@ -1707,6 +2483,24 @@ void UpdateInputOwnership(HWND window);
 			"; (Xbox wins when several are plugged in). Icons only - every pad works\n"
 			"; either way, and the values above stay raw XInput numbers.\n"
 			"ButtonStyle=Auto\n"
+			"; ToypadLeds = 1 mirrors the running game's toypad LEDs onto the pads.\n"
+			"; It is off by default: mirroring redraws the pads as bare colour boxes\n"
+			"; and polls the emulator's listener ~30 times a second.\n"
+			"ToypadLeds=0\n"
+			"; SoundEffects = 1 plays Assets/SFX/Navigate.wav when the highlight moves\n"
+			"; and Select.wav when something is confirmed.\n"
+			"SoundEffects=1\n"
+			"; SoundVolume is the playback level, 0-100. PlaySound has no volume\n"
+			"; control of its own, so the level is baked into a cached copy of the\n"
+			"; samples. The Settings row offers 100/85/70/55/40.\n"
+			"SoundVolume=70\n"
+			"; PadSkin names the folder under Assets/Pads whose seven images are drawn\n"
+			"; as the toypad. \"Default\" is the built-in art. Any folder holding the\n"
+			"; same seven filenames (left_upper, center, right_upper, left_lower_left,\n"
+			"; left_lower_right, right_lower_left, right_lower_right) is another skin -\n"
+			"; including ones you drop into Assets/Pads next to this exe after install,\n"
+			"; which are picked up at startup and switchable from Settings.\n"
+			"PadSkin=Default\n"
 			"\n"
 			"; Written by the app when you change the Window row in Settings.\n"
 			"[Window]\n"
@@ -1721,6 +2515,10 @@ void UpdateInputOwnership(HWND window);
 			"RememberedPosition=0\n"
 			"PositionX=0\n"
 			"PositionY=0\n"
+			"; Opacity is the whole panel's translucency, as a percentage of solid.\n"
+			"; The Settings row cycles 100/92/85/75/65/55/45; hand-edited values are\n"
+			"; clamped to 20-100 so the window can never become impossible to see.\n"
+			"Opacity=92\n"
 			"\n"
 			"[Web]\n"
 			"; Web remote serves the same Toypad UI to a phone browser on your local\n"
@@ -1860,17 +2658,31 @@ void UpdateInputOwnership(HWND window);
 		return 0; // Auto, including anything unrecognized
 	}
 
-	// backgroundIndex == kBackgroundChoiceCount is the extra "No Background"
-	// choice appended after the bundled wallpapers: nothing is drawn behind
-	// the UI and those pixels become transparent (see ApplyOverlayTransparency).
+	// backgroundIndex walks a display order that is NOT the bundled wallpaper
+	// order: position 0 is the default wallpaper, position 1 is the clear
+	// (transparent) backdrop, and positions 2..N are the remaining
+	// wallpapers. Clear sits second because it is the one people reach for -
+	// it is what turns the overlay into a HUD over the running game - and
+	// burying it past a dozen wallpapers made it feel like an afterthought.
+	// Nothing is drawn behind the UI for it and those pixels stay at alpha 0
+	// (see ApplyOverlayTransparency).
+	constexpr size_t kClearBackgroundPosition = 1;
+
+	size_t BackgroundOptionCount()
+	{
+		return kBackgroundChoiceCount + 1; // wallpapers + the clear backdrop
+	}
+
 	size_t ClampBackgroundIndex(size_t index)
 	{
-		return kBackgroundChoiceCount == 0 ? 0 : std::min(index, kBackgroundChoiceCount);
+		return std::min(index, BackgroundOptionCount() - 1);
 	}
 
 	bool IsNoBackground()
 	{
-		return kBackgroundChoiceCount != 0 && ClampBackgroundIndex(g_app.backgroundIndex) == kBackgroundChoiceCount;
+		if (kBackgroundChoiceCount == 0)
+			return true; // nothing bundled: clear is the only thing left
+		return ClampBackgroundIndex(g_app.backgroundIndex) == kClearBackgroundPosition;
 	}
 
 	const BackgroundChoice* CurrentBackgroundChoice()
@@ -1878,9 +2690,14 @@ void UpdateInputOwnership(HWND window);
 		if (kBackgroundChoiceCount == 0)
 			return nullptr;
 		g_app.backgroundIndex = ClampBackgroundIndex(g_app.backgroundIndex);
-		if (g_app.backgroundIndex == kBackgroundChoiceCount)
-			return nullptr; // No Background
-		return &kBackgroundChoices[g_app.backgroundIndex];
+		if (g_app.backgroundIndex == kClearBackgroundPosition)
+			return nullptr; // Clear
+		// Everything past the clear slot is shifted back onto the wallpaper
+		// table it came from.
+		const size_t wallpaper = g_app.backgroundIndex < kClearBackgroundPosition
+			? g_app.backgroundIndex
+			: g_app.backgroundIndex - 1;
+		return &kBackgroundChoices[std::min(wallpaper, kBackgroundChoiceCount - 1)];
 	}
 
 	int CurrentBackgroundResourceId()
@@ -1894,7 +2711,7 @@ void UpdateInputOwnership(HWND window);
 	std::wstring DescribeBackgroundChoice()
 	{
 		if (IsNoBackground())
-			return L"No Background";
+			return L"Clear (see the game through it)";
 		const BackgroundChoice* choice = CurrentBackgroundChoice();
 		return choice ? choice->name : L"(none)";
 	}
@@ -1923,6 +2740,15 @@ void UpdateInputOwnership(HWND window);
 			ButtonStyleIniValue(g_app.buttonStyleChoice), iniPath.c_str());
 		WritePrivateProfileStringW(L"Input", L"ToypadLeds",
 			g_app.ledMirrorEnabled ? L"1" : L"0", iniPath.c_str());
+		WritePrivateProfileStringW(L"Input", L"SoundEffects",
+			g_app.soundEffects ? L"1" : L"0", iniPath.c_str());
+		WritePrivateProfileStringW(L"Input", L"SoundVolume",
+			std::to_wstring(g_app.soundVolume).c_str(), iniPath.c_str());
+		// Stored by folder name, not by index: adding or removing a skin
+		// folder must never silently repoint this at a different one.
+		WritePrivateProfileStringW(L"Input", L"PadSkin",
+			g_app.padSkinIndex < g_padSkins.size() ? g_padSkins[g_app.padSkinIndex].name.c_str() : L"Default",
+			iniPath.c_str());
 		for (const auto& action : kBindableActions)
 			WritePrivateProfileStringW(L"Input", action.iniKey,
 				std::to_wstring(g_app.*(action.button)).c_str(), iniPath.c_str());
@@ -1942,7 +2768,23 @@ void UpdateInputOwnership(HWND window);
 			static_cast<DWORD>(styleBuffer.size()), iniPath.c_str());
 		g_app.buttonStyleChoice = ButtonStyleChoiceFromIni(styleBuffer.data());
 		g_app.ledMirrorEnabled =
-			GetPrivateProfileIntW(L"Input", L"ToypadLeds", 1, iniPath.c_str()) != 0;
+			GetPrivateProfileIntW(L"Input", L"ToypadLeds", 0, iniPath.c_str()) != 0;
+		g_app.soundEffects =
+			GetPrivateProfileIntW(L"Input", L"SoundEffects", 1, iniPath.c_str()) != 0;
+		g_app.soundVolume = std::clamp(static_cast<int>(GetPrivateProfileIntW(
+			L"Input", L"SoundVolume", 70, iniPath.c_str())), 0, 100);
+		std::array<wchar_t, 96> padSkinBuffer{};
+		GetPrivateProfileStringW(L"Input", L"PadSkin", L"Default", padSkinBuffer.data(),
+			static_cast<DWORD>(padSkinBuffer.size()), iniPath.c_str());
+		g_app.padSkinIndex = 0;
+		for (size_t i = 0; i < g_padSkins.size(); ++i)
+		{
+			if (_wcsicmp(g_padSkins[i].name.c_str(), padSkinBuffer.data()) == 0)
+			{
+				g_app.padSkinIndex = i;
+				break;
+			}
+		}
 		// A hand-edited value falls back to the built-in default when it is
 		// unset (0) or a D-pad button, and is dropped entirely (leaving the
 		// action unbound, shown as "(none)" in Settings) when it collides
@@ -1968,9 +2810,10 @@ void UpdateInputOwnership(HWND window);
 		g_app.status = L"Character selection: " + DescribeStoryMode();
 	}
 
-	void CycleButtonStyle()
+	void CycleButtonStyle(int direction)
 	{
-		g_app.buttonStyleChoice = (g_app.buttonStyleChoice + 1) % kButtonStyleChoiceCount;
+		const size_t step = direction < 0 ? kButtonStyleChoiceCount - 1 : 1;
+		g_app.buttonStyleChoice = (g_app.buttonStyleChoice + step) % kButtonStyleChoiceCount;
 		SaveInputSettingsToIni();
 		g_app.status = L"Button labels: " + DescribeButtonStyle();
 	}
@@ -1995,16 +2838,19 @@ void UpdateInputOwnership(HWND window);
 		InvalidateRect(window, nullptr, FALSE);
 	}
 
-	void CycleBackgroundChoice()
+	void CycleBackgroundChoice(int direction)
 	{
 		if (kBackgroundChoiceCount == 0)
 		{
 			g_app.status = L"No backgrounds are bundled in Assets/Wallpapers.";
 			return;
 		}
-		// The cycle covers every bundled wallpaper plus the trailing
-		// "No Background" choice.
-		g_app.backgroundIndex = (ClampBackgroundIndex(g_app.backgroundIndex) + 1) % (kBackgroundChoiceCount + 1);
+		// The cycle covers every bundled wallpaper plus the clear backdrop
+		// wedged in at position 1. `direction` lets the Settings row be walked
+		// backwards with Left as well as forwards with Right / Confirm.
+		const size_t count = BackgroundOptionCount();
+		const size_t step = direction < 0 ? count - 1 : 1;
+		g_app.backgroundIndex = (ClampBackgroundIndex(g_app.backgroundIndex) + step) % count;
 		SaveInputSettingsToIni();
 		ApplyOverlayTransparency(g_mainWindow);
 		g_app.status = L"Background: " + DescribeBackgroundChoice();
@@ -2056,6 +2902,8 @@ void UpdateInputOwnership(HWND window);
 			std::to_wstring(g_app.savedWindowX).c_str(), iniPath.c_str());
 		WritePrivateProfileStringW(L"Window", L"PositionY",
 			std::to_wstring(g_app.savedWindowY).c_str(), iniPath.c_str());
+		WritePrivateProfileStringW(L"Window", L"Opacity",
+			std::to_wstring(g_app.opacityPercent).c_str(), iniPath.c_str());
 	}
 
 	void LoadWindowSettingsFromIni()
@@ -2076,6 +2924,10 @@ void UpdateInputOwnership(HWND window);
 		GetPrivateProfileStringW(L"Window", L"PositionY", L"0", buffer.data(),
 			static_cast<DWORD>(buffer.size()), iniPath.c_str());
 		g_app.savedWindowY = _wtoi(buffer.data());
+		// Clamped rather than rejected: a hand-edited 5% would leave a window
+		// nobody can see well enough to fix the setting from.
+		g_app.opacityPercent = std::clamp(static_cast<int>(GetPrivateProfileIntW(
+			L"Window", L"Opacity", kDefaultOpacityPercent, iniPath.c_str())), kOpacityFloorPercent, 100);
 	}
 
 	std::wstring DescribeWindowPlacement()
@@ -2195,6 +3047,49 @@ void UpdateInputOwnership(HWND window);
 		return true;
 	}
 
+	// Milliseconds a connect() is allowed before this app gives up on it.
+	// Every caller of this helper runs on the UI thread (SendToypadMessage),
+	// so a hang here is a hang of the whole window - no repaint, no input,
+	// nothing - for however long it lasts. A plain blocking connect() has no
+	// such ceiling: Windows' own default TCP connect timeout runs into many
+	// seconds, and that is exactly what a closed or unresponsive listener
+	// port (no emulator running, or one that silently drops the connection)
+	// was hitting, over and over. 250ms is generous for a real loopback
+	// listener - those accept in well under a millisecond - and still short
+	// enough that a missing one is a brief hitch, not a freeze.
+	constexpr int kSocketConnectTimeoutMs = 250;
+
+	// connect() with a bounded wait instead of an unbounded one. The socket is
+	// switched to non-blocking only for the handshake and always restored to
+	// blocking before returning (success or failure), so callers keep using
+	// ordinary blocking send()/recv() exactly as they did before.
+	bool ConnectWithTimeout(SOCKET socket, const sockaddr_in& address, int timeoutMs)
+	{
+		u_long nonBlocking = 1;
+		ioctlsocket(socket, FIONBIO, &nonBlocking);
+
+		bool connected = connect(socket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0;
+		if (!connected && WSAGetLastError() == WSAEWOULDBLOCK)
+		{
+			fd_set writeSet;
+			FD_ZERO(&writeSet);
+			FD_SET(socket, &writeSet);
+			fd_set errorSet = writeSet;
+			timeval timeout{timeoutMs / 1000, (timeoutMs % 1000) * 1000};
+			if (select(0, nullptr, &writeSet, &errorSet, &timeout) > 0 && FD_ISSET(socket, &writeSet))
+			{
+				int socketError = 0;
+				int socketErrorLen = sizeof(socketError);
+				connected = getsockopt(socket, SOL_SOCKET, SO_ERROR,
+					reinterpret_cast<char*>(&socketError), &socketErrorLen) == 0 && socketError == 0;
+			}
+		}
+
+		u_long blocking = 0;
+		ioctlsocket(socket, FIONBIO, &blocking);
+		return connected;
+	}
+
 	// Shared connect-send-close for LOAD/REMOVE/MOVE. On failure, errorOut is
 	// set to a message suitable for g_app.status and false is returned.
 	bool SendToypadMessage(const uint8_t* data, size_t length, std::wstring& errorOut)
@@ -2213,7 +3108,7 @@ void UpdateInputOwnership(HWND window);
 		address.sin_family = AF_INET;
 		address.sin_port = htons(g_app.port);
 		address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-		if (connect(clientSocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR)
+		if (!ConnectWithTimeout(clientSocket, address, kSocketConnectTimeoutMs))
 		{
 			closesocket(clientSocket);
 			errorOut = L"Could not connect to Cemu. Enable the emulated Toypad and listener first.";
@@ -2237,18 +3132,14 @@ void UpdateInputOwnership(HWND window);
 		return entry.name;
 	}
 
-	bool SendLoadResourceToSlot(int binResourceId, size_t slotIndex, std::wstring& errorOut)
+	// Sends one tag's 180 bytes to a pad slot, whatever they came from - an
+	// embedded resource for the shipped library, a file on disk for a custom
+	// tag. The wire message is identical either way.
+	bool SendLoadBytesToSlot(const std::vector<uint8_t>& tagData, size_t slotIndex, std::wstring& errorOut)
 	{
-		if (binResourceId == 0)
-		{
-			errorOut = L"Missing tag data for this entry.";
-			return false;
-		}
-
-		const std::vector<uint8_t> tagData = LoadResourceBytes(binResourceId);
 		if (tagData.size() != kTagSize)
 		{
-			errorOut = L"The embedded tag for this entry has the wrong size.";
+			errorOut = L"That tag is not " + std::to_wstring(kTagSize) + L" bytes long.";
 			return false;
 		}
 
@@ -2263,6 +3154,23 @@ void UpdateInputOwnership(HWND window);
 		message[5 + kTagSize + 1] = 0;
 
 		return SendToypadMessage(message.data(), message.size(), errorOut);
+	}
+
+	bool SendLoadResourceToSlot(int binResourceId, size_t slotIndex, std::wstring& errorOut)
+	{
+		if (binResourceId == 0)
+		{
+			errorOut = L"Missing tag data for this entry.";
+			return false;
+		}
+
+		const std::vector<uint8_t> tagData = LoadResourceBytes(binResourceId);
+		if (tagData.size() != kTagSize)
+		{
+			errorOut = L"The embedded tag for this entry has the wrong size.";
+			return false;
+		}
+		return SendLoadBytesToSlot(tagData, slotIndex, errorOut);
 	}
 
 	bool SendMoveSlotToSlot(size_t sourceIndex, size_t destIndex, std::wstring& errorOut)
@@ -2338,6 +3246,7 @@ void UpdateInputOwnership(HWND window);
 
 		g_app.padState[slotIndex] = PadSlot{};
 		g_app.status = std::wstring(L"CLEAR sent: ") + kSlots[slotIndex].label;
+		PlayRemoveSound();
 		if (updateUi)
 		{
 			g_app.screen = Screen::PadViewer;
@@ -2395,6 +3304,10 @@ void UpdateInputOwnership(HWND window);
 			g_app.status = error;
 			return;
 		}
+		// Covers all three outcomes below (plain move, swap, and the
+		// same-pad refresh) - each is a MOVE wire message that just
+		// succeeded, which is exactly what this sound confirms.
+		PlayMoveSound();
 
 		const PadSlot sourceSlot = g_app.padState[sourceIndex];
 		const PadSlot destSlot = g_app.padState[destIndex];
@@ -2403,7 +3316,8 @@ void UpdateInputOwnership(HWND window);
 		{
 			if (destSlot.occupied)
 			{
-				if (!SendLoadResourceToSlot(destSlot.binResourceId, sourceIndex, error))
+				const bool reloaded = SendLoadResourceToSlot(destSlot.binResourceId, sourceIndex, error);
+				if (!reloaded)
 				{
 					g_app.padState[destIndex] = sourceSlot;
 					g_app.padState[sourceIndex] = PadSlot{};
@@ -2563,12 +3477,17 @@ void UpdateInputOwnership(HWND window);
 	constexpr RosterMetrics kRosterNormalMetrics{160, 94, 60, 16, 30};
 	constexpr RosterMetrics kRosterCompactMetrics{148, 84, 56, 12, 24};
 
+	// Size of the grid's first section - the one above the separator. It holds
+	// the world's characters, then that world's captured custom tags, then the
+	// tile that captures a new one; the vehicles start after it.
 	size_t GetRosterCharacterCount()
 	{
 		size_t count = 0;
-		while (count < g_app.rosterSlots.size() &&
-			g_app.rosterSlots[count].kind == RosterSlot::Kind::Character)
+		while (count < g_app.rosterSlots.size())
 		{
+			const RosterSlot::Kind kind = g_app.rosterSlots[count].kind;
+			if (kind == RosterSlot::Kind::Vehicle || kind == RosterSlot::Kind::Plus)
+				break;
 			++count;
 		}
 		return count;
@@ -2699,12 +3618,21 @@ void UpdateInputOwnership(HWND window);
 			vehicleSectionOffset + metrics.portraitDiameter + metrics.labelH;
 	}
 
+	// Whether the current page needs the tighter metrics: the separator gap
+	// between the character and vehicle sections adds extra vertical space
+	// wherever it lands, and that gap can push the last visible row past the
+	// window's bottom edge on ANY page it appears on - not only when the
+	// whole roster fits without scrolling (the only case this used to check).
+	// A franchise with enough vehicles to need scrolling could land the
+	// character/vehicle boundary in the middle of a scrolled page and hit the
+	// exact same overflow, with nothing to catch it: the last row's portraits
+	// and labels simply ran past the window edge and were clipped.
+	// IsRosterSeparatorVisible() already implies a mixed roster (it checks
+	// characterCount is neither zero nor the whole list), so no separate
+	// "hasSeparator" check is needed on top of it.
 	RosterMetrics GetRosterMetrics(Gdiplus::Graphics& g)
 	{
-		const size_t characterCount = GetRosterCharacterCount();
-		const bool onePage = GetRosterVisualRowCount() <= kRosterVisibleRows;
-		const bool hasSeparator = characterCount > 0 && characterCount < g_app.rosterSlots.size();
-		if (onePage && hasSeparator &&
+		if (IsRosterSeparatorVisible() &&
 			GetRosterContentBottom(g, kRosterNormalMetrics) > kRosterGridBottomLimit)
 		{
 			return kRosterCompactMetrics;
@@ -2757,7 +3685,44 @@ void UpdateInputOwnership(HWND window);
 			g_app.rosterTopRow = 0;
 	}
 
-	void NavigateGrid(int dx, int dy)
+	// A cheap fingerprint of "what is highlighted right now". Navigation
+	// sounds are gated on this changing, so pushing a direction into the edge
+	// of a grid - which deliberately does nothing - stays silent instead of
+	// blipping at every frame of a held stick.
+	uint64_t SelectionSignature()
+	{
+		uint64_t signature = static_cast<uint64_t>(g_app.screen);
+		signature = signature * 131 + g_app.slotIndex;
+		signature = signature * 131 + g_app.padActionIndex;
+		signature = signature * 131 + g_app.franchiseIndex;
+		signature = signature * 131 + g_app.rosterIndex;
+		signature = signature * 131 + g_app.plusBuildIndex;
+		signature = signature * 131 + g_app.settingsIndex;
+		return signature;
+	}
+
+	// Starts the landing animation when the highlight has moved since the last
+	// tick. Watching the signature rather than hooking every navigation site
+	// means mouse clicks, screen changes and the web remote all get the same
+	// treatment for free, and none of them can forget to.
+	void SyncSelectionTap()
+	{
+		const uint64_t signature = SelectionSignature();
+		if (!g_hasSelectionSignature)
+		{
+			g_hasSelectionSignature = true;
+			g_lastSelectionSignature = signature;
+			return;
+		}
+		if (signature == g_lastSelectionSignature)
+			return;
+		g_lastSelectionSignature = signature;
+		g_selectionTapStart = GetTickCount();
+		if (g_selectionTapStart == 0)
+			g_selectionTapStart = 1;
+	}
+
+	void NavigateGridInternal(int dx, int dy)
 	{
 		switch (g_app.screen)
 		{
@@ -2770,19 +3735,25 @@ void UpdateInputOwnership(HWND window);
 		case Screen::RosterList:
 			MoveRosterSelection(dx, dy);
 			break;
+		case Screen::Settings:
+			// Horizontal is handled by the NavigateGrid wrapper (it edits the
+			// value); only the vertical axis reaches here.
+			if (dy != 0)
+				MoveSettingsSelection(dy);
+			break;
 		default:
 			break;
 		}
 	}
 
-	void Navigate(int direction)
+	void NavigateInternal(int direction)
 	{
 		switch (g_app.screen)
 		{
 		case Screen::PadViewer:
 		case Screen::FranchiseList:
 		case Screen::RosterList:
-			NavigateGrid(0, direction);
+			NavigateGridInternal(0, direction);
 			break;
 		case Screen::PadAction:
 			// The bottom bar is horizontal (Load | Move | Clear), so
@@ -2802,12 +3773,35 @@ void UpdateInputOwnership(HWND window);
 			}
 			break;
 		case Screen::Settings:
-			if (direction < 0)
-				SelectPrevious(kSettingsItemCount, g_app.settingsIndex);
-			else
-				SelectNext(kSettingsItemCount, g_app.settingsIndex);
+			MoveSettingsSelection(direction);
 			break;
 		}
+	}
+
+	// Public entry points: navigate, then blip if the highlight actually
+	// moved.
+	void NavigateGrid(int dx, int dy)
+	{
+		// On the Settings screen the horizontal axis edits the focused row's
+		// value rather than moving the highlight, so a switch can be flipped
+		// with Left/Right as well as with Confirm.
+		if (g_app.screen == Screen::Settings && dx != 0)
+		{
+			AdjustSettingsValue(dx);
+			return;
+		}
+		const uint64_t before = SelectionSignature();
+		NavigateGridInternal(dx, dy);
+		if (SelectionSignature() != before)
+			PlayNavigateSound();
+	}
+
+	void Navigate(int direction)
+	{
+		const uint64_t before = SelectionSignature();
+		NavigateInternal(direction);
+		if (SelectionSignature() != before)
+			PlayNavigateSound();
 	}
 
 	// ---------------------------------------------------------------------
@@ -2915,6 +3909,9 @@ void UpdateInputOwnership(HWND window);
 
 	void Confirm()
 	{
+		// One blip for every confirm, wherever it lands: picking a pad, a
+		// figure, a settings row or a letter on the naming keyboard.
+		PlaySelectSound();
 		switch (g_app.screen)
 		{
 		case Screen::PadViewer:
@@ -2974,30 +3971,8 @@ void UpdateInputOwnership(HWND window);
 			if (g_app.plusGroup && g_app.plusBuildIndex < g_app.plusGroup->builds.size())
 				LoadRosterEntryToPad(g_app.plusGroup->builds[g_app.plusBuildIndex]);
 			break;
-case Screen::Settings:
-			if (g_app.settingsIndex == 0)
-				BeginShortcutCapture();
-			else if (g_app.settingsIndex == 1)
-				ToggleConfirmButtonMode();
-			else if (g_app.settingsIndex == 2)
-				CycleBackgroundChoice();
-			else if (g_app.settingsIndex == 3)
-				ToggleStoryMode();
-			else if (g_app.settingsIndex == 4)
-				CycleButtonStyle();
-			else if (g_app.settingsIndex == 5)
-				ToggleLedMirror();
-			else if (g_app.settingsIndex == 6)
-				ToggleWindowDraggable();
-			else if (g_app.settingsIndex >= kSettingsBindingFirst &&
-				g_app.settingsIndex < kSettingsBindingFirst + kBindableActions.size())
-				BeginBindingCapture(g_app.settingsIndex - kSettingsBindingFirst);
-			else if (g_app.settingsIndex == kSettingsItemCount - 3)
-				ClearAllPads(true);
-			else if (g_app.settingsIndex == kSettingsItemCount - 2)
-				ToggleWebRemote();
-			else if (g_app.settingsIndex == kSettingsItemCount - 1)
-				ResetSettingsToDefaults();
+		case Screen::Settings:
+			ActivateSettingsEntry();
 			break;
 		}
 	}
@@ -3168,7 +4143,19 @@ case Screen::Settings:
 	void ShowOverlay(HWND window)
 	{
 		if (g_app.overlayVisible)
+		{
+			// Caught mid-dismiss: turn the fade around instead of ignoring
+			// the press, which would otherwise look like a dropped input.
+			if (g_overlayHiding)
+			{
+				g_overlayHiding = false;
+				BeginWindowFade(false, CurrentShownFraction());
+				UpdateInputOwnership(window);
+				ForceForegroundWindow(window);
+				InvalidateRect(window, nullptr, FALSE);
+			}
 			return;
+		}
 
 		const HWND currentForeground = GetForegroundWindow();
 		if (currentForeground && currentForeground != window)
@@ -3179,23 +4166,52 @@ case Screen::Settings:
 		// is no tick where Cemu can read the controller while the picker is
 		// showing (the 16ms poll alone was too slow for that handoff).
 		g_app.overlayVisible = true;
+		g_overlayHiding = false;
+		g_tickIntervalMs.store(kTickIntervalVisibleMs, std::memory_order_relaxed);
+		// The very first frame has to be the faded-in one, so the fade is
+		// armed before the window is shown - otherwise ShowWindow presents
+		// the previous frame at full alpha for a beat.
+		BeginWindowFade(false, 0.0f);
+		// A fresh show is always the front screen's entrance, so the content
+		// fade runs too rather than only the window's.
+		g_screenFadeStart = GetTickCount();
+		if (g_screenFadeStart == 0)
+			g_screenFadeStart = 1;
 		UpdateInputOwnership(window);
+		Paint(window);
 		ShowWindow(window, SW_SHOW);
 		ForceForegroundWindow(window);
 		InvalidateRect(window, nullptr, FALSE);
 	}
 
+	// Asks the overlay to go away. It does not vanish here: the window fades
+	// out over kWindowFadeOutMs and FinishOverlayHide (driven by the timer)
+	// does the actual hiding once the fade lands. Input ownership is held for
+	// the whole fade, so the button press that dismissed the picker still
+	// never reaches the game.
 	void HideOverlay(HWND window)
 	{
-		if (!g_app.overlayVisible)
+		if (!g_app.overlayVisible || g_overlayHiding)
 			return;
 
-		ShowWindow(window, SW_HIDE);
-		g_app.overlayVisible = false;
+		g_overlayHiding = true;
 		g_app.capturingShortcut = false;
 		g_app.capturingBindingIndex = -1;
-		// Release ownership only once the overlay is hidden, so the very
-		// button press that closed it never reaches the game either.
+		BeginWindowFade(true, CurrentShownFraction());
+		InvalidateRect(window, nullptr, FALSE);
+	}
+
+	void FinishOverlayHide(HWND window)
+	{
+		if (!g_overlayHiding)
+			return;
+		g_overlayHiding = false;
+		ShowWindow(window, SW_HIDE);
+		g_app.overlayVisible = false;
+		g_tickIntervalMs.store(kTickIntervalHiddenMs, std::memory_order_relaxed);
+		g_windowFadeStart = 0;
+		// Release ownership only once the overlay is really hidden, so the
+		// very button press that closed it never reaches the game either.
 		UpdateInputOwnership(window);
 
 		if (g_app.previousForegroundWindow && IsWindow(g_app.previousForegroundWindow))
@@ -3204,7 +4220,7 @@ case Screen::Settings:
 
 	void ToggleOverlay(HWND window)
 	{
-		if (g_app.overlayVisible)
+		if (g_app.overlayVisible && !g_overlayHiding)
 			HideOverlay(window);
 		else
 			ShowOverlay(window);
@@ -3309,6 +4325,9 @@ case Screen::Settings:
 		g_app.backgroundIndex = defaults.backgroundIndex;
 		g_app.storyMode = defaults.storyMode;
 		g_app.buttonStyleChoice = defaults.buttonStyleChoice;
+		g_app.soundEffects = defaults.soundEffects;
+		g_app.padSkinIndex = defaults.padSkinIndex;
+		g_app.opacityPercent = defaults.opacityPercent;
 		if (g_app.ledMirrorEnabled != defaults.ledMirrorEnabled)
 			SetLedMirrorEnabled(defaults.ledMirrorEnabled); // starts/stops the poll
 		for (const auto& action : kBindableActions)
@@ -3962,7 +4981,12 @@ case Screen::Settings:
 					address.sin_family = AF_INET;
 					address.sin_port = htons(g_app.port);
 					address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-					if (connect(clientSocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR)
+					// This runs on its own thread, so a slow connect() can't
+					// freeze the window the way it could on the UI-thread
+					// callers - but it would still hold g_socketMutex for
+					// however long it took, starving every Load/Move/Clear
+					// and custom-tag request behind it. Same bounded wait.
+					if (!ConnectWithTimeout(clientSocket, address, kSocketConnectTimeoutMs))
 					{
 						closesocket(clientSocket);
 					}
@@ -4082,6 +5106,365 @@ case Screen::Settings:
 		g_app.status = L"Toypad LEDs: " + DescribeLedMirror();
 	}
 
+	// ---------------------------------------------------------------------
+	// Pad skins (list building + the Settings row)
+	// ---------------------------------------------------------------------
+
+	// Builds the selectable skin list: every complete folder that existed
+	// under Assets/Pads at build time (compiled in), followed by every
+	// complete folder found under "Assets/Pads" next to the .exe at startup.
+	// The on-disk half is what makes "add a folder of your own pad art" work
+	// without rebuilding: drop Assets/Pads/MySkin/{left_upper,center,...}.png
+	// beside LegoToypad.exe and it shows up as another choice.
+	void BuildPadSkinList()
+	{
+		g_padSkins.clear();
+		g_padDiskArtPaths.clear();
+		ReleasePadDiskBitmaps();
+
+		for (size_t i = 0; i < kPadSkinCount; ++i)
+		{
+			PadSkinOption option;
+			option.name = kPadSkins[i].name;
+			for (size_t slot = 0; slot < 7; ++slot)
+				option.artIds[slot] = kPadSkins[i].slotResourceIds[slot];
+			g_padSkins.push_back(std::move(option));
+		}
+
+		std::error_code ec;
+		const auto padsRoot = GetExecutableDirectory() / L"Assets" / L"Pads";
+		if (!std::filesystem::is_directory(padsRoot, ec))
+			return;
+
+		std::vector<std::filesystem::path> folders;
+		for (const auto& entry : std::filesystem::directory_iterator(padsRoot, ec))
+		{
+			if (entry.is_directory(ec))
+				folders.push_back(entry.path());
+		}
+		std::sort(folders.begin(), folders.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
+			return _wcsicmp(a.filename().c_str(), b.filename().c_str()) < 0;
+		});
+
+		for (const auto& folder : folders)
+		{
+			const std::wstring folderName = folder.filename().wstring();
+			// A folder that shipped with the build is already in the list
+			// under its own name; the disk copy would just be a duplicate.
+			const bool alreadyBuiltIn = std::any_of(g_padSkins.begin(), g_padSkins.end(),
+				[&](const PadSkinOption& skin) { return _wcsicmp(skin.name.c_str(), folderName.c_str()) == 0; });
+			if (alreadyBuiltIn || _wcsicmp(folderName.c_str(), L"default") == 0)
+				continue;
+
+			// All seven or none: a half-skin would draw holes where the
+			// missing pads are, which looks like a bug rather than a choice.
+			std::array<std::filesystem::path, 7> files;
+			bool complete = true;
+			for (size_t slot = 0; slot < 7 && complete; ++slot)
+			{
+				complete = false;
+				for (const wchar_t* extension : {L".png", L".jpg", L".jpeg"})
+				{
+					const auto candidate = folder / (std::wstring(kPadSlotArtNames[slot]) + extension);
+					if (std::filesystem::is_regular_file(candidate, ec))
+					{
+						files[slot] = candidate;
+						complete = true;
+						break;
+					}
+				}
+			}
+			if (!complete)
+				continue;
+
+			PadSkinOption option;
+			option.name = folderName;
+			for (size_t slot = 0; slot < 7; ++slot)
+			{
+				g_padDiskArtPaths.push_back(files[slot]);
+				// Synthetic negative ids: -1 is g_padDiskArtPaths[0], and so on.
+				option.artIds[slot] = -static_cast<int>(g_padDiskArtPaths.size());
+			}
+			g_padSkins.push_back(std::move(option));
+		}
+	}
+
+	std::wstring DescribePadSkin()
+	{
+		if (g_padSkins.empty())
+			return L"(none bundled)";
+		const size_t index = std::min(g_app.padSkinIndex, g_padSkins.size() - 1);
+		return g_padSkins[index].name + L" (" + std::to_wstring(index + 1) + L"/" +
+			std::to_wstring(g_padSkins.size()) + L")";
+	}
+
+	void CyclePadSkin(int direction)
+	{
+		if (g_padSkins.size() <= 1)
+		{
+			g_app.status = L"Only one pad skin is available. Add a folder of pad art to "
+				L"Assets/Pads next to the app to get more.";
+			return;
+		}
+		// Every skin is a separate set of cache entries keyed by its own art
+		// ids, so switching is a plain repaint - nothing to invalidate, and
+		// flipping back to a skin you already used is instant.
+		const size_t step = direction < 0 ? g_padSkins.size() - 1 : 1;
+		g_app.padSkinIndex = (g_app.padSkinIndex + step) % g_padSkins.size();
+		SaveInputSettingsToIni();
+		g_app.status = L"Pad skin: " + DescribePadSkin();
+		if (g_mainWindow)
+			InvalidateRect(g_mainWindow, nullptr, FALSE);
+	}
+
+	// ---------------------------------------------------------------------
+	// Window transparency
+	// ---------------------------------------------------------------------
+
+	std::wstring DescribeOpacity()
+	{
+		return std::to_wstring(g_app.opacityPercent) + L"% opaque" +
+			(g_app.opacityPercent >= 100 ? L" (solid)" : L"");
+	}
+
+	void CycleOpacity(int direction)
+	{
+		// A plain +/-15 clamped to [floor, 100] rather than a step through a
+		// fixed list: Right always makes the panel more opaque, Left always
+		// less, and it simply stops at either end instead of wrapping around
+		// (wrapping a magnitude like this - "keep going right and you're
+		// suddenly back at ghostly" - reads as a bug, not a feature).
+		g_app.opacityPercent = std::clamp(
+			g_app.opacityPercent + direction * kSettingsPercentStep, kOpacityFloorPercent, 100);
+		SaveWindowSettingsToIni();
+		g_app.status = L"Window transparency: " + DescribeOpacity();
+		if (g_mainWindow)
+			InvalidateRect(g_mainWindow, nullptr, FALSE);
+	}
+
+	// ---------------------------------------------------------------------
+	// Sound effects
+	// ---------------------------------------------------------------------
+
+	std::wstring DescribeSoundVolume()
+	{
+		return std::to_wstring(g_app.soundVolume) + L"%";
+	}
+
+	void CycleSoundVolume(int direction)
+	{
+		// Same plain +/-15, clamped rather than wrapped - see CycleOpacity.
+		// 0 is a reachable, valid value here (not guarded the way opacity's
+		// floor is): a silent volume is just the effects being inaudible,
+		// with the separate Sound effects switch above it still doing the
+		// on/off job.
+		g_app.soundVolume = std::clamp(
+			g_app.soundVolume + direction * kSettingsPercentStep, 0, 100);
+		SaveInputSettingsToIni();
+		g_app.status = L"Sound volume: " + DescribeSoundVolume();
+		// Play the blip at the level just chosen, so the setting demonstrates
+		// itself instead of being a number you have to go and test.
+		PlaySelectSound();
+	}
+	std::wstring DescribeSoundEffects()
+	{
+		if (kSfxNavigateResourceId == 0 && kSfxSelectResourceId == 0)
+			return L"Off (no sounds bundled)";
+		return g_app.soundEffects ? L"On" : L"Off";
+	}
+
+	void ToggleSoundEffects()
+	{
+		g_app.soundEffects = !g_app.soundEffects;
+		if (!g_app.soundEffects)
+			StopUiSounds();
+		SaveInputSettingsToIni();
+		g_app.status = L"Sound effects: " + DescribeSoundEffects();
+		if (g_app.soundEffects)
+			PlaySelectSound(); // let the user hear what they just turned on
+	}
+
+	// ---------------------------------------------------------------------
+	// The Settings list
+	// ---------------------------------------------------------------------
+
+	SettingValueTone ToneForSwitch(bool on)
+	{
+		return on ? SettingValueTone::On : SettingValueTone::Off;
+	}
+
+	std::vector<SettingsEntry> BuildSettingsEntries()
+	{
+		std::vector<SettingsEntry> entries;
+		const auto heading = [&entries](const wchar_t* title) {
+			entries.push_back({SettingAction::Heading, title, {}, SettingValueTone::Neutral, 0, 0});
+		};
+		const auto row = [&entries](SettingAction action, std::wstring label, std::wstring value,
+			SettingValueTone tone = SettingValueTone::Neutral, ButtonMask icons = 0,
+			size_t bindingIndex = 0) {
+			entries.push_back({action, std::move(label), std::move(value), tone, icons, bindingIndex});
+		};
+
+		heading(L"Appearance");
+		row(SettingAction::Background, L"Background", DescribeBackgroundChoice());
+		row(SettingAction::PadSkin, L"Pad skin", DescribePadSkin());
+		row(SettingAction::Opacity, L"Window transparency", DescribeOpacity());
+		row(SettingAction::WindowPlacement, L"Window", DescribeWindowPlacement());
+		row(SettingAction::LedMirror, L"Toypad LEDs", DescribeLedMirror(),
+			ToneForSwitch(g_app.ledMirrorEnabled));
+
+		heading(L"Audio");
+		// Nothing bundled means the switch is effectively off however it is
+		// set, and the row should not claim otherwise.
+		const bool soundsAvailable = kSfxNavigateResourceId != 0 || kSfxSelectResourceId != 0;
+		row(SettingAction::SoundEffects, L"Sound effects", DescribeSoundEffects(),
+			ToneForSwitch(g_app.soundEffects && soundsAvailable));
+		row(SettingAction::SoundVolume, L"Sound volume", DescribeSoundVolume());
+
+		heading(L"Library");
+		row(SettingAction::StoryMode, L"Character selection", DescribeStoryMode());
+
+		heading(L"Controls");
+		if (g_app.shortcutType == ShortcutType::Controller)
+			row(SettingAction::Shortcut, L"Toggle shortcut", {}, SettingValueTone::Neutral,
+				g_app.shortcutControllerMask);
+		else
+			row(SettingAction::Shortcut, L"Toggle shortcut", DescribeShortcut());
+		row(SettingAction::ConfirmStyle, L"Confirm button", DescribeConfirmButtonMode());
+		row(SettingAction::ButtonStyle, L"Button labels", DescribeButtonStyle());
+
+		heading(L"Button bindings");
+		for (size_t i = 0; i < kBindableActions.size(); ++i)
+		{
+			row(SettingAction::Binding, std::wstring(L"Button - ") + kBindableActions[i].label, {},
+				SettingValueTone::Neutral, g_app.*(kBindableActions[i].button), i);
+		}
+
+		heading(L"System");
+		row(SettingAction::ClearAllPads, L"Clear all pads", {});
+		row(SettingAction::WebRemote, L"Web remote", DescribeWebRemote(),
+			ToneForSwitch(g_app.webEnabled));
+		row(SettingAction::ResetDefaults, L"Reset all settings to defaults", {});
+		return entries;
+	}
+
+	// settingsIndex points at a row in the full (headings included) list, so
+	// painting and navigation never have to translate between two numbering
+	// schemes. Headings are simply skipped when moving and refused when
+	// activating.
+	void ClampSettingsSelection()
+	{
+		const std::vector<SettingsEntry> entries = BuildSettingsEntries();
+		if (entries.empty())
+		{
+			g_app.settingsIndex = 0;
+			return;
+		}
+		if (g_app.settingsIndex >= entries.size())
+			g_app.settingsIndex = entries.size() - 1;
+		// Land on a real setting, never on a heading (which is where index 0
+		// starts out).
+		while (g_app.settingsIndex < entries.size() && IsSettingsHeading(entries[g_app.settingsIndex]))
+			++g_app.settingsIndex;
+		if (g_app.settingsIndex >= entries.size())
+		{
+			g_app.settingsIndex = entries.size() - 1;
+			while (g_app.settingsIndex > 0 && IsSettingsHeading(entries[g_app.settingsIndex]))
+				--g_app.settingsIndex;
+		}
+	}
+
+	// Rows visible at once in the Settings viewport, and the geometry the
+	// paint code and the scroll follow both use.
+	// The panel used to start at y=92, which put its top edge underneath the
+	// wordmark band (kTopMargin 20 + kTopBarH 90 = 110). It now begins below
+	// that, and shows one row fewer so the list plus the capture hint still
+	// clear the bottom of the window.
+	constexpr int kSettingsTop = 130;
+	constexpr int kSettingsPitch = 32;
+	constexpr size_t kSettingsVisibleRows = 12;
+
+	void ScrollSettingsIntoView()
+	{
+		const int focused = static_cast<int>(g_app.settingsIndex);
+		// A setting directly under a heading brings its heading along, so you
+		// can always see which category you are in.
+		if (focused - 1 < g_app.settingsTopRow)
+			g_app.settingsTopRow = std::max(0, focused - 1);
+		while (focused >= g_app.settingsTopRow + static_cast<int>(kSettingsVisibleRows))
+			++g_app.settingsTopRow;
+		const int maxTop = std::max(0,
+			static_cast<int>(BuildSettingsEntries().size()) - static_cast<int>(kSettingsVisibleRows));
+		g_app.settingsTopRow = std::clamp(g_app.settingsTopRow, 0, maxTop);
+	}
+
+	void MoveSettingsSelection(int direction)
+	{
+		const std::vector<SettingsEntry> entries = BuildSettingsEntries();
+		if (entries.empty())
+			return;
+		const int step = direction < 0 ? -1 : 1;
+		int index = static_cast<int>(g_app.settingsIndex);
+		const int count = static_cast<int>(entries.size());
+		// Walk past headings; the wrap keeps the list circular like every
+		// other menu in the picker.
+		for (int guard = 0; guard < count; ++guard)
+		{
+			index = (index + step + count) % count;
+			if (!IsSettingsHeading(entries[static_cast<size_t>(index)]))
+				break;
+		}
+		g_app.settingsIndex = static_cast<size_t>(index);
+		ScrollSettingsIntoView();
+	}
+
+	// Changes the focused row's value. `direction` is +1 for Confirm and
+	// Right, -1 for Left, so a list of choices can be walked either way
+	// instead of only ever forwards. Rows that are not a value at all - the
+	// capture rows, the one-shot actions - only respond to Confirm, which is
+	// what `allowAction` marks.
+	void AdjustSettingsEntry(int direction, bool allowAction)
+	{
+		ClampSettingsSelection();
+		const std::vector<SettingsEntry> entries = BuildSettingsEntries();
+		if (g_app.settingsIndex >= entries.size())
+			return;
+		const SettingsEntry& entry = entries[g_app.settingsIndex];
+		switch (entry.action)
+		{
+		case SettingAction::Heading: break;
+		case SettingAction::Shortcut: if (allowAction) BeginShortcutCapture(); break;
+		case SettingAction::Binding: if (allowAction) BeginBindingCapture(entry.bindingIndex); break;
+		case SettingAction::ClearAllPads: if (allowAction) ClearAllPads(true); break;
+		case SettingAction::ResetDefaults: if (allowAction) ResetSettingsToDefaults(); break;
+		case SettingAction::ConfirmStyle: ToggleConfirmButtonMode(); break;
+		case SettingAction::ButtonStyle: CycleButtonStyle(direction); break;
+		case SettingAction::Background: CycleBackgroundChoice(direction); break;
+		case SettingAction::PadSkin: CyclePadSkin(direction); break;
+		case SettingAction::Opacity: CycleOpacity(direction); break;
+		case SettingAction::WindowPlacement: ToggleWindowDraggable(); break;
+		case SettingAction::LedMirror: ToggleLedMirror(); break;
+		case SettingAction::SoundEffects: ToggleSoundEffects(); break;
+		case SettingAction::SoundVolume: CycleSoundVolume(direction); break;
+		case SettingAction::StoryMode: ToggleStoryMode(); break;
+		case SettingAction::WebRemote: ToggleWebRemote(); break;
+		}
+	}
+
+	void ActivateSettingsEntry()
+	{
+		AdjustSettingsEntry(1, true);
+	}
+
+	// Left/Right on a settings row. Only ever changes a value, never triggers
+	// a capture or a destructive one-shot - reaching "Reset all settings to
+	// defaults" with the stick and having it fire sideways would be a nasty
+	// surprise.
+	void AdjustSettingsValue(int direction)
+	{
+		AdjustSettingsEntry(direction, false);
+	}
+
 	// Franchise grid layout: 4 columns of large logo tiles, scrolled vertically.
 	constexpr int kFranchiseOriginX = 40;
 	constexpr int kFranchiseOriginY = 106;
@@ -4131,12 +5514,48 @@ case Screen::Settings:
 			visual = PadVisual::Idle;
 
 		const unsigned int occupantColor = occupied ? g_app.padState[index].ringColor : 0;
+
+		// The focused pad springs about its own centre as the selection lands
+		// on it, then sits still. Its halo and its art are scaled by the same
+		// factor about the same point, so the two never separate.
+		const float scale = selected ? SelectionTapScale() : 1.0f;
+		const float cx = (cell.left + cell.right) / 2.0f;
+		const float cy = (cell.top + cell.bottom) / 2.0f;
+
+		// The halo goes down first, so the pad's own art sits on top of it and
+		// only the light spilling past the edge is visible.
+		if (selected)
+		{
+			Gdiplus::Bitmap* glow = RenderFocusGlow(
+				static_cast<int>(cell.right - cell.left), static_cast<int>(cell.bottom - cell.top),
+				index == 1 ? FocusShape::Circle : FocusShape::RoundedPad, kSelectionGlow);
+			DrawImageScaledAbout(g, glow, static_cast<float>(cell.left - kFocusGlowMargin),
+				static_cast<float>(cell.top - kFocusGlowMargin), cx, cy, scale, SelectionGlowAlpha());
+		}
+		// The pad you are moving FROM gets the same rich two-pass halo, in
+		// blue, so it reads as "this one's on the move" at a glance instead
+		// of the old single-pass glow that (on top of being the wrong
+		// colour) was too faint to notice. Static, not tapped/animated - it
+		// sits on this pad for as long as the destination pick lasts, not
+		// just the instant it was landed on.
+		if (isMoveSource)
+		{
+			Gdiplus::Bitmap* glow = RenderFocusGlow(
+				static_cast<int>(cell.right - cell.left), static_cast<int>(cell.bottom - cell.top),
+				index == 1 ? FocusShape::Circle : FocusShape::RoundedPad, kMoveSourceGlow);
+			g.DrawImage(glow, static_cast<int>(cell.left) - kFocusGlowMargin,
+				static_cast<int>(cell.top) - kFocusGlowMargin);
+		}
+
 		// Toypad LEDs on: the pads are bare outlines so the LED colour reads
 		// directly instead of staining the printed glass art.
 		Gdiplus::Bitmap* pad = RenderPad(static_cast<int>(index), cell, visual, occupantColor,
 			g_app.ledMirrorEnabled);
 		if (pad)
-			g.DrawImage(pad, static_cast<int>(cell.left) - kPadGlowMargin, static_cast<int>(cell.top) - kPadGlowMargin);
+		{
+			DrawImageScaledAbout(g, pad, static_cast<float>(cell.left - kPadGlowMargin),
+				static_cast<float>(cell.top - kPadGlowMargin), cx, cy, scale);
+		}
 	}
 
 	// The loaded figure's portrait, drawn on top of the LED tint so a lit pad
@@ -4162,7 +5581,14 @@ case Screen::Settings:
 
 		Gdiplus::Bitmap* portrait = RenderPortrait(slot.portraitResourceId, slot.ringColor, false, kOccupantDiameter);
 		if (portrait)
-			g.DrawImage(portrait, circleX - kPortraitMargin, circleY - kPortraitMargin);
+		{
+			// Rides the focused pad's spring, about the same centre, so the
+			// figure stays planted on its tile instead of sliding across it.
+			const float scale = index == g_app.slotIndex ? SelectionTapScale() : 1.0f;
+			DrawImageScaledAbout(g, portrait, static_cast<float>(circleX - kPortraitMargin),
+				static_cast<float>(circleY - kPortraitMargin),
+				(cell.left + cell.right) / 2.0f, (cell.top + cell.bottom) / 2.0f, scale);
+		}
 	}
 
 	// The focused occupied pad's occupant name, as muted translucent text
@@ -4427,12 +5853,15 @@ case Screen::Settings:
 		const double frac = topRow / static_cast<double>(totalRows - visibleRows);
 		const int thumbY = trackTop + static_cast<int>((trackH - thumbH) * frac);
 
-		Gdiplus::Bitmap* bar = GetAssetBitmap(kScrollBarResourceId);
+		// Cached, for the same reason as the wordmark and even more so: the
+		// scroll bar asset is 512x9984, so drawing it scaled straight to a
+		// ~14px-wide thumb is a 5-megapixel resample. There are only a handful
+		// of distinct thumb heights per screen, so the cache stays tiny.
+		Gdiplus::Bitmap* bar = RenderScaledAsset(kScrollBarResourceId, kScrollBarW, thumbH, 0);
 		if (!bar)
 			return;
 		const int x = kOverlayWidth - kScrollBarW - kScrollBarMarginX;
-		g.DrawImage(bar, static_cast<float>(x), static_cast<float>(thumbY),
-			static_cast<float>(kScrollBarW), static_cast<float>(thumbH));
+		g.DrawImage(bar, x, thumbY);
 	}
 
 	void DrawFranchiseGrid(Gdiplus::Graphics& g)
@@ -4449,9 +5878,22 @@ case Screen::Settings:
 				const int x = kFranchiseOriginX + static_cast<int>(col) * kFranchisePitchX;
 				const int y = kFranchiseOriginY + static_cast<int>(row) * kFranchisePitchY;
 				const bool focused = index == g_app.franchiseIndex;
+				const float scale = focused ? SelectionTapScale() : 1.0f;
+				const float cx = x + kFranchiseTileW / 2.0f;
+				const float cy = y + kFranchiseTileH / 2.0f;
+				if (focused)
+				{
+					Gdiplus::Bitmap* glow = RenderFocusGlow(
+						kFranchiseTileW, kFranchiseTileH, FocusShape::RoundedTile, kSelectionGlow);
+					DrawImageScaledAbout(g, glow, static_cast<float>(x - kFocusGlowMargin),
+						static_cast<float>(y - kFocusGlowMargin), cx, cy, scale, SelectionGlowAlpha());
+				}
 				Gdiplus::Bitmap* tile = RenderFranchiseTile(kFranchises[index].logoResourceId, focused);
 				if (tile)
-					g.DrawImage(tile, x - kTileGlowMargin, y - kTileGlowMargin);
+				{
+					DrawImageScaledAbout(g, tile, static_cast<float>(x - kTileGlowMargin),
+						static_cast<float>(y - kTileGlowMargin), cx, cy, scale);
+				}
 			}
 		}
 
@@ -4552,6 +5994,7 @@ case Screen::Settings:
 		DrawScrollBar(g, trackTop, trackBottom, totalRows, kRosterVisibleRows, g_app.rosterTopRow);
 	}
 
+
 	void Paint(HWND window)
 	{
 		// Top-left wordmark and the "by harrysof" marker (top-right) share a
@@ -4629,27 +6072,61 @@ case Screen::Settings:
 		// here would leave alpha at 0 and punch a hole in the frame.
 		Gdiplus::Bitmap frame(width, height, width * 4, PixelFormat32bppPARGB,
 			static_cast<BYTE*>(s_bufferBits));
-		Gdiplus::Graphics g(&frame);
-		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-		g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+		Gdiplus::Graphics frameGraphics(&frame);
+		frameGraphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+		frameGraphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
 
 		Gdiplus::Bitmap* background = RenderBackground(width, height);
 		if (background)
-			g.DrawImage(background, 0, 0);
+			frameGraphics.DrawImage(background, 0, 0);
 
 		// Persistent wordmark in the top-left of every screen — enlarged.
+		// Drawn straight onto the frame, outside the transition layer: the
+		// backdrop and the branding are the parts that do NOT change when the
+		// picker moves between screens, so fading them would just make the
+		// whole window flicker on every keypress.
+		//
+		// It goes through RenderScaledAsset rather than DrawImage-ing the raw
+		// asset: the source PNG is 3294x1853 and the target is ~160x90, so a
+		// direct draw is a 6-megapixel high-quality bicubic resample - per
+		// frame, on every screen. That was invisible while repaints only
+		// happened on a keypress and became the dominant cost the moment
+		// anything animated continuously. Cached, it is one blit.
 		{
 			Gdiplus::Bitmap* wordmark = GetAssetBitmap(kWordmarkResourceId);
 			if (wordmark)
 			{
 				const Gdiplus::RectF box(kTopMargin, kTopMargin, 460.0f, kTopBarH);
 				const float scale = std::min(box.Width / wordmark->GetWidth(), box.Height / wordmark->GetHeight());
-				const float drawW = wordmark->GetWidth() * scale;
-				const float drawH = wordmark->GetHeight() * scale;
-				const Gdiplus::RectF dest(box.X, box.Y + (box.Height - drawH) / 2.0f, drawW, drawH);
-				g.DrawImage(wordmark, dest);
+				const int drawW = static_cast<int>(wordmark->GetWidth() * scale);
+				const int drawH = static_cast<int>(wordmark->GetHeight() * scale);
+				if (Gdiplus::Bitmap* cached = RenderScaledAsset(kWordmarkResourceId, drawW, drawH, 0))
+				{
+					frameGraphics.DrawImage(cached, static_cast<int>(box.X),
+						static_cast<int>(box.Y + (box.Height - drawH) / 2.0f));
+				}
 			}
 		}
+
+		// Everything from here down is this screen's own content. During a
+		// screen transition it goes into a scratch layer that is composited
+		// at a rising alpha and a shrinking upward offset, so the new screen
+		// fades up into place. Outside a transition `g` IS the frame, so the
+		// steady state allocates nothing and costs exactly what it used to.
+		SyncScreenTransition();
+		const float screenAlpha = ScreenFadeAlpha();
+		const bool transitioning = screenAlpha < 0.999f;
+		std::unique_ptr<Gdiplus::Bitmap> layerBitmap;
+		std::unique_ptr<Gdiplus::Graphics> layerGraphics;
+		if (transitioning)
+		{
+			layerBitmap = std::make_unique<Gdiplus::Bitmap>(width, height, PixelFormat32bppPARGB);
+			layerGraphics = std::make_unique<Gdiplus::Graphics>(layerBitmap.get());
+			layerGraphics->Clear(Gdiplus::Color(0, 0, 0, 0));
+			layerGraphics->SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+			layerGraphics->SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+		}
+		Gdiplus::Graphics& g = transitioning ? *layerGraphics : frameGraphics;
 
 		switch (g_app.screen)
 		{
@@ -4742,58 +6219,104 @@ case Screen::RosterList:
 		}
 		case Screen::Settings:
 		{
-			// A row is text, optionally followed by the pad icons for a
-			// button mask - that is how a binding shows the button itself
-			// rather than spelling its name out.
-			struct SettingsRow
-			{
-				std::wstring text;
-				ButtonMask icons = 0;
-			};
-			std::vector<SettingsRow> rows;
-			rows.reserve(kSettingsItemCount);
-			if (g_app.shortcutType == ShortcutType::Controller)
-				rows.push_back({L"Toggle shortcut: ", g_app.shortcutControllerMask});
-			else
-				rows.push_back({L"Toggle shortcut: " + DescribeShortcut(), 0});
-			rows.push_back({L"Confirm button: " + DescribeConfirmButtonMode(), 0});
-			rows.push_back({L"Background: " + DescribeBackgroundChoice(), 0});
-			rows.push_back({L"Character selection: " + DescribeStoryMode(), 0});
-			rows.push_back({L"Button labels: " + DescribeButtonStyle(), 0});
-			rows.push_back({L"Toypad LEDs: " + DescribeLedMirror(), 0});
-			rows.push_back({L"Window: " + DescribeWindowPlacement(), 0});
-			for (const auto& action : kBindableActions)
-				rows.push_back({std::wstring(L"Button - ") + action.label + L": ",
-					g_app.*(action.button)});
-			rows.push_back({L"Clear all pad", 0});
-			rows.push_back({L"Web remote: " + DescribeWebRemote(), 0});
-			rows.push_back({L"Reset all settings to defaults", 0});
+			// Same furniture as the franchise and roster grids: one
+			// translucent panel behind the whole list, a viewport that
+			// follows the focus, and the shared right-edge scroll bar. The
+			// list itself is the categorised table from BuildSettingsEntries,
+			// so painting and activation can never disagree about which row
+			// is which.
+			ClampSettingsSelection();
+			const std::vector<SettingsEntry> rows = BuildSettingsEntries();
+			ScrollSettingsIntoView();
 
-			// 29px pitch (down from 40, then 33, then 31) so the grown list
-			// plus the capture hint and status line below still fit the
-			// fixed-height overlay. Each new row costs one pitch step, and
-			// the hint under the last row must stay above the bottom edge.
-			constexpr int kSettingsTop = 92;
-			constexpr int kSettingsPitch = 29;
+			constexpr int kSettingsPanelX = 30;
 			constexpr float kSettingsIconH = 28.0f;
-			for (size_t index = 0; index < rows.size(); ++index)
+			const int panelW = width - kSettingsPanelX * 2;
+			const size_t visibleRows =
+				std::min(kSettingsVisibleRows, rows.size() - static_cast<size_t>(g_app.settingsTopRow));
+			const int panelH = static_cast<int>(visibleRows) * kSettingsPitch + 24;
+			// settings_tile.png if it was bundled; the roster panel art
+			// otherwise, so a build without the new asset still has a panel.
+			const int settingsPanelResource =
+				kSettingsTileResourceId != 0 ? kSettingsTileResourceId : kCharactersTileResourceId;
+			if (Gdiplus::Bitmap* panel = RenderScaledAsset(settingsPanelResource, panelW, panelH, 14))
 			{
-				const int y = kSettingsTop + static_cast<int>(index) * kSettingsPitch;
+				g.DrawImage(panel, kSettingsPanelX, kSettingsTop - 12);
+			}
+
+			for (size_t visible = 0; visible < visibleRows; ++visible)
+			{
+				const size_t index = static_cast<size_t>(g_app.settingsTopRow) + visible;
+				const SettingsEntry& row = rows[index];
+				const int y = kSettingsTop + static_cast<int>(visible) * kSettingsPitch;
+
+				if (IsSettingsHeading(row))
+				{
+					// A category heading: centred, with a rule running out to
+					// both edges, so the groups read as dividers rather than
+					// as more settings.
+					DrawTextLineCentered(g, row.label, kSettingsPanelX, y, panelW,
+						RGB(255, 204, 51), kSettingsPitch);
+					const float labelW = MeasureTextWidth(g, row.label, 22.0f);
+					const float centre = kSettingsPanelX + panelW / 2.0f;
+					const float ruleY = y + kSettingsPitch / 2.0f - 1.0f;
+					const float innerGap = labelW / 2.0f + 14.0f;
+					const float leftEdge = static_cast<float>(kSettingsPanelX + 22);
+					const float rightEdge = static_cast<float>(kSettingsPanelX + panelW - 22);
+					Gdiplus::SolidBrush rule(Gdiplus::Color(70, 255, 204, 51));
+					if (centre - innerGap > leftEdge)
+						g.FillRectangle(&rule, leftEdge, ruleY, centre - innerGap - leftEdge, 2.0f);
+					if (rightEdge > centre + innerGap)
+						g.FillRectangle(&rule, centre + innerGap, ruleY, rightEdge - centre - innerGap, 2.0f);
+					continue;
+				}
+
 				const bool selected = index == g_app.settingsIndex;
 				if (selected)
 				{
-					Gdiplus::SolidBrush selectionFill(Gdiplus::Color(255, 36, 99, 170));
-					g.FillRectangle(&selectionFill, 18, y - 1, width - 36, kSettingsPitch);
+					Gdiplus::GraphicsPath highlight;
+					AddRoundedRectPath(highlight,
+						Gdiplus::RectF(static_cast<float>(kSettingsPanelX + 8), static_cast<float>(y),
+							static_cast<float>(panelW - 16), static_cast<float>(kSettingsPitch - 2)),
+						8.0f);
+					Gdiplus::LinearGradientBrush fill(
+						Gdiplus::RectF(static_cast<float>(kSettingsPanelX + 8), static_cast<float>(y),
+							static_cast<float>(panelW - 16), static_cast<float>(kSettingsPitch - 2)),
+						Gdiplus::Color(255, 58, 110, 176), Gdiplus::Color(255, 32, 74, 130),
+						Gdiplus::LinearGradientModeVertical);
+					g.FillPath(&fill, &highlight);
 				}
-				DrawTextLine(g, rows[index].text, 30, y, width - 60,
-					selected ? RGB(255, 255, 255) : RGB(228, 232, 238));
-				if (rows[index].icons != 0)
+
+				// Label first, then the value in its own colour immediately
+				// after it. Splitting the two is what lets an On read green
+				// and an Off read red without tinting the whole row.
+				const bool hasTrailer = !row.value.empty() || row.icons != 0;
+				const std::wstring label = hasTrailer ? row.label + L": " : row.label;
+				const int labelX = kSettingsPanelX + 24;
+				DrawTextLine(g, label, labelX, y, panelW - 60,
+					selected ? RGB(255, 255, 255) : RGB(228, 232, 238), kSettingsPitch);
+
+				const float trailerX = labelX + MeasureTextWidth(g, label, 22.0f);
+				if (!row.value.empty())
 				{
-					const float iconX = 30.0f + MeasureTextWidth(g, rows[index].text, 22.0f);
-					DrawPadButtonMask(g, rows[index].icons, iconX,
+					COLORREF valueColor = RGB(255, 214, 140); // a choice, not a switch
+					if (row.tone == SettingValueTone::On)
+						valueColor = RGB(126, 226, 142);
+					else if (row.tone == SettingValueTone::Off)
+						valueColor = RGB(255, 108, 108);
+					DrawTextLine(g, row.value, static_cast<int>(trailerX), y,
+						kSettingsPanelX + panelW - 24 - static_cast<int>(trailerX),
+						valueColor, kSettingsPitch);
+				}
+				else if (row.icons != 0)
+				{
+					DrawPadButtonMask(g, row.icons, trailerX,
 						y + (kSettingsPitch - kSettingsIconH) / 2.0f, kSettingsIconH, true);
 				}
 			}
+
+			DrawScrollBar(g, kSettingsTop, kSettingsTop + static_cast<int>(visibleRows) * kSettingsPitch,
+				rows.size(), kSettingsVisibleRows, g_app.settingsTopRow);
 
 			// While a button is being captured the status line carries the
 			// whole conversation - what to press, and why a press was
@@ -4802,7 +6325,7 @@ case Screen::RosterList:
 			// message there would just be noise.
 			if ((g_app.capturingShortcut || g_app.capturingBindingIndex >= 0) && !g_app.status.empty())
 			{
-				const int hintY = kSettingsTop + static_cast<int>(rows.size()) * kSettingsPitch + 10;
+				const int hintY = kSettingsTop + static_cast<int>(visibleRows) * kSettingsPitch + 16;
 				DrawTextLine(g, g_app.status, 24, hintY, width - 48, RGB(255, 204, 51), 26);
 			}
 			break;
@@ -4888,11 +6411,24 @@ case Screen::RosterList:
 			g.DrawString(warning.c_str(), -1, &warningFont, plate, &warningFormat, &warningBrush);
 		}
 
+		// Composite the transition layer, if there is one. The few pixels of
+		// upward travel are applied as a destination offset rather than a
+		// transform, so nothing inside the layer had to know it was being
+		// animated.
+		if (transitioning)
+		{
+			layerGraphics.reset(); // flush the layer's drawing before reading it
+			const int rise = static_cast<int>(kScreenFadeRisePx * (1.0f - screenAlpha) + 0.5f);
+			DrawImageWithAlpha(frameGraphics, layerBitmap.get(), 0, rise, screenAlpha);
+		}
+
 		// Per-pixel alpha from the DIB, plus the panel-wide translucency that
-		// SetLayeredWindowAttributes used to apply, in a single present.
+		// SetLayeredWindowAttributes used to apply, in a single present. The
+		// constant alpha is the user's opacity setting, scaled by whatever
+		// show/dismiss fade is running.
 		POINT source{0, 0};
 		SIZE size{width, height};
-		BLENDFUNCTION blend{AC_SRC_OVER, 0, kOverlayAlpha, AC_SRC_ALPHA};
+		BLENDFUNCTION blend{AC_SRC_OVER, 0, CurrentOverlayAlpha(), AC_SRC_ALPHA};
 		UpdateLayeredWindow(window, nullptr, nullptr, &size, s_bufferDC, &source,
 			0, &blend, ULW_ALPHA);
 
@@ -5194,6 +6730,13 @@ void PollController(HWND window)
 			}
 		}
 
+		// A dismissed overlay keeps painting (and keeps input ownership) for
+		// the length of its fade-out, but must not act on anything: the
+		// picker is on its way out, and a stray press during those ~110ms
+		// would land on a screen the user has already left.
+		if (g_overlayHiding)
+			return;
+
 		// Menu navigation only applies while the overlay is actually visible.
 		// Foreground focus is deliberately NOT required here: the overlay is
 		// an always-on-top controller picker, Cemu (or the game) almost always
@@ -5259,8 +6802,10 @@ void PollController(HWND window)
 			}
 		}
 
+		// Screens navigated in two dimensions.
 		const bool gridScreen = g_app.screen == Screen::PadViewer ||
-			g_app.screen == Screen::FranchiseList || g_app.screen == Screen::RosterList;
+			g_app.screen == Screen::FranchiseList || g_app.screen == Screen::RosterList ||
+			g_app.screen == Screen::Settings;
 		const DWORD now = GetTickCount();
 
 		// D-pad edge presses move immediately instead of waiting out the
@@ -5288,9 +6833,18 @@ void PollController(HWND window)
 		{
 			if (gridScreen)
 			{
-				const int dx = stickLeft ? -1 : (stickRight ? 1 : 0);
+				int dx = stickLeft ? -1 : (stickRight ? 1 : 0);
 				const int dy = stickUp ? -1 : (stickDown ? 1 : 0);
-				NavigateGrid(dx, dy);
+				// On the Settings screen the horizontal axis edits values, and
+				// values must not auto-repeat: holding Right on "Web remote"
+				// would stop and restart the HTTP server six times a second,
+				// and on "Toypad LEDs" it would thrash the poll thread. A
+				// value changes once per deliberate press; only the vertical
+				// axis (moving between rows) repeats while held.
+				if (g_app.screen == Screen::Settings)
+					dx = 0;
+				if (dx != 0 || dy != 0)
+					NavigateGrid(dx, dy);
 			}
 			else if (stickLeft || stickRight)
 			{
@@ -6107,6 +7661,38 @@ if (changed)
 			g_webThread.join();
 	}
 
+	// Paces the controller poll. It does no work of its own beyond posting a
+	// message - everything still happens on the UI thread in the kTickMessage
+	// handler - so this is purely about which queue tier the poll arrives on.
+	void TickThread(HWND window)
+	{
+		while (g_tickRunning.load(std::memory_order_relaxed))
+		{
+			if (!g_tickPending.exchange(true, std::memory_order_acq_rel))
+			{
+				if (!PostMessageW(window, kTickMessage, 0, 0))
+					g_tickPending.store(false, std::memory_order_release);
+			}
+			Sleep(g_tickIntervalMs.load(std::memory_order_relaxed));
+		}
+	}
+
+	void StartTickThread(HWND window)
+	{
+		bool expected = false;
+		if (!g_tickRunning.compare_exchange_strong(expected, true))
+			return;
+		g_tickThread = std::thread(TickThread, window);
+	}
+
+	void StopTickThread()
+	{
+		if (!g_tickRunning.exchange(false))
+			return;
+		if (g_tickThread.joinable())
+			g_tickThread.join();
+	}
+
 	void ApplyWindowCornerRadius(HWND window)
 	{
 		RECT rect{};
@@ -6180,11 +7766,17 @@ if (changed)
 			{
 			case VK_UP: Navigate(-1); break;
 			case VK_DOWN: Navigate(1); break;
+			// Bit 30 of lParam is the previous key state: set means this is a
+			// hardware auto-repeat rather than a fresh press. Values are only
+			// edited on a fresh press, for the same reason the stick repeat
+			// above skips them.
 			case VK_LEFT:
-				NavigateGrid(-1, 0);
+				if (g_app.screen != Screen::Settings || (lParam & (1 << 30)) == 0)
+					NavigateGrid(-1, 0);
 				break;
 			case VK_RIGHT:
-				NavigateGrid(1, 0);
+				if (g_app.screen != Screen::Settings || (lParam & (1 << 30)) == 0)
+					NavigateGrid(1, 0);
 				break;
 			case VK_RETURN: Confirm(); break;
 			case VK_ESCAPE: Back(window); break;
@@ -6223,6 +7815,8 @@ if (changed)
 			}
 			InvalidateRect(window, nullptr, FALSE);
 			return 0;
+		case WM_CHAR:
+			return DefWindowProcW(window, message, wParam, lParam);
 		case WM_MOUSEMOVE:
 		{
 			if (g_app.draggingWindow)
@@ -6353,6 +7947,7 @@ if (changed)
 
 				g_app.slotIndex = index;
 				g_app.hoveredPadActionIndex = -1;
+				PlaySelectSound();
 				if (g_app.screen == Screen::PadViewer && g_app.selectingMoveDestination)
 					MoveToDestination(index);
 				else if (g_app.screen == Screen::PadViewer || g_app.screen == Screen::PadAction)
@@ -6432,14 +8027,55 @@ if (changed)
 				break;
 			}
 			return 0;
-		case WM_TIMER:
-			if (wParam == kControllerTimer)
+		case kTickMessage:
+		{
+			// Clear the in-flight flag first: the pacing thread may queue the
+			// next tick while this one is still running, and that is fine -
+			// what must not happen is a backlog building up behind a slow
+			// frame.
+			g_tickPending.store(false, std::memory_order_release);
+
+			PollController(window);
+			SyncScreenTransition();
+			SyncSelectionTap();
+
+			const bool ledAnimating = AdvanceLedAnimation();
+			if (g_app.overlayVisible)
 			{
-				PollController(window);
-				if (AdvanceLedAnimation() && g_app.overlayVisible)
-					InvalidateRect(window, nullptr, FALSE);
+				// Anything still moving asks for another frame, but only when
+				// the frame would actually look different. The breathing halo
+				// is stepped (see kFocusPulseSteps), so an otherwise idle
+				// screen repaints ~19 times a second instead of continuously,
+				// and stops entirely at the turning points of the breath.
+				// Genuinely continuous animations - LED flashes, screen
+				// transitions, the show/dismiss fade - get a plain frame-rate
+				// cap instead.
+				static DWORD lastAnimationFrame = 0;
+				static int lastPulseStep = -1;
+				const bool pulsing = ScreenHasPulsingFocus();
+				const int pulseStep = pulsing ? FocusPulseStep() : -1;
+				const bool continuous = ledAnimating || ScreenTransitionActive() ||
+					WindowFadeActive() || SelectionTapActive();
+				if (continuous || (pulsing && pulseStep != lastPulseStep))
+				{
+					constexpr DWORD kMinAnimationFrameMs = 16; // never above ~60fps
+					const DWORD now = GetTickCount();
+					if (now - lastAnimationFrame >= kMinAnimationFrameMs)
+					{
+						lastAnimationFrame = now;
+						lastPulseStep = pulseStep;
+						InvalidateRect(window, nullptr, FALSE);
+					}
+				}
 			}
+
+			// The dismiss fade lands here rather than in HideOverlay, so
+			// the last frame of it is actually presented before the
+			// window disappears.
+			if (g_overlayHiding && !WindowFadeActive())
+				FinishOverlayHide(window);
 			return 0;
+		}
 		case WM_ACTIVATE:
 			UpdateInputOwnership(window);
 			return 0;
@@ -6448,7 +8084,8 @@ if (changed)
 			UpdateInputOwnership(window);
 			return 0;
 		case WM_DESTROY:
-			KillTimer(window, kControllerTimer);
+			StopTickThread();
+			StopUiSounds();
 			UnregisterHotKey(window, kToggleHotkeyId);
 			RemoveTrayIcon(window);
 			StopWebServer();
@@ -6545,7 +8182,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
 	LoadUIFont();
 
-EnsureDefaultIniExists();
+	EnsureDefaultIniExists();
+	// The pad-skin list has to exist before the settings load, because the
+	// saved skin is stored by name and resolved against this list.
+	BuildPadSkinList();
 	g_app.port = ReadPort();
 	LoadShortcutFromIni();
 	LoadInputSettingsFromIni();
@@ -6585,10 +8225,11 @@ g_app.status = std::to_wstring(embeddedTags) +
 	HWND window = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
 		className, L"LEGO Dimensions Toypad Picker", WS_POPUP,
 		CW_USEDEFAULT, CW_USEDEFAULT, kOverlayWidth, kOverlayHeight, nullptr, nullptr, instance, nullptr);
-if (!window)
+	if (!window)
 	{
 		ReleaseGlossCache();
 		ReleaseAssetImages();
+		ReleasePadDiskBitmaps();
 		UnloadUIFont();
 		Gdiplus::GdiplusShutdown(g_gdiplusToken);
 		WSACleanup();
@@ -6599,7 +8240,7 @@ if (!window)
 	ApplyWindowCornerRadius(window);
 	AddTrayIcon(window);
 	RegisterToggleHotkeyIfNeeded(window);
-	SetTimer(window, kControllerTimer, 8, nullptr);
+	StartTickThread(window);
 
 	// Start the LED mirror poll: it reports the running game's pad glows so the
 	// overlay lights up like a physical toypad. It only talks when Cemu is up,
@@ -6640,6 +8281,7 @@ if (!window)
 
 	ReleaseGlossCache();
 	ReleaseAssetImages();
+	ReleasePadDiskBitmaps();
 	UnloadUIFont();
 	SDL_Quit();
 	Gdiplus::GdiplusShutdown(g_gdiplusToken);
