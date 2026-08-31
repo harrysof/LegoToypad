@@ -73,7 +73,4 @@ cmake --build build --config Release
 ```
 
 ## Notes
-
-- Custom tags are stored as `CustomBins/<World>/<Name>.bin` next to the exe - back them up or copy them between machines freely.
-- Toypad LED mirroring and custom tag capture both need one of the listener builds above; older listeners simply won't respond to those features.
 - The exe is unsigned, so Windows SmartScreen will flag it on first launch. Click "More info" then "Run anyway."
