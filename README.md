@@ -26,7 +26,6 @@ LegoToypad needs an emulator build with the Toypad listener enabled. Grab the on
 - Full tag library built in: all 30 franchises, 78 characters, 240 vehicles
 - Controller-first UI, no mouse needed
 - True Toypad layout: 7 pad slots (3/1/3), with Load / Move / Clear per slot
-- Custom tags: capture whatever the game writes to the Center pad and save it as your own
 - Live Toypad LEDs mirrored from the emulator in real time (off by default)
 - Swappable pad art (skins)
 - Web remote: control the pads from your phone over LAN
