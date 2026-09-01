@@ -28,6 +28,7 @@ outputs, and files are only rewritten when their content actually changes, so an
 """
 
 import argparse
+import csv
 import io
 import os
 import re
@@ -117,14 +118,24 @@ def make_resource_names(world_id, kind, name_id, build=None):
 # ---------------------------------------------------------------------------
 
 VEHICLE_PREFIX_RE = re.compile(r"^(\d+)[.\-]\s*(.+)$")
+CHARACTER_VEHICLE_RE = re.compile(r"^(.+?) - (\d+)[.\-]\s*(.+)$")
 
 
 def split_vehicle_stem(stem):
-    """Returns (build_number, base_name); unnumbered files become build 1."""
-    match = VEHICLE_PREFIX_RE.match(stem)
-    if match:
-        return int(match.group(1)), match.group(2).strip()
-    return 1, stem.strip()
+    """Returns (owner, build_number, base_name).
+
+    Prepending the owning character ("<Character> - 1. Jakemobile") lets the
+    generator group every character's vehicles together. The owner is returned
+    as None when the stem has not been renamed (legacy "1. Jakemobile" style)
+    or unnumbered. Unnumbered files become build 1.
+    """
+    renamed = CHARACTER_VEHICLE_RE.match(stem)
+    if renamed:
+        return renamed.group(1).strip(), int(renamed.group(2)), renamed.group(3).strip()
+    legacy = VEHICLE_PREFIX_RE.match(stem)
+    if legacy:
+        return None, int(legacy.group(1)), legacy.group(2).strip()
+    return None, 1, stem.strip()
 
 
 def normalize(stem: str) -> str:
@@ -237,6 +248,41 @@ def ascii_ok(parts, warnings):
 
 
 # ---------------------------------------------------------------------------
+# Vehicle ownership / family grouping
+# ---------------------------------------------------------------------------
+# The source of truth for which character owns which vehicle, and which of a
+# vehicle's two alternate builds belong with it, is the hand-researched
+# vehicles.csv at the project root (World, Character, Build, Vehicle, Family).
+# The generator reads it purely to group each character's vehicles under the
+# multi-build "Family" so the in-app "+ Build picker" lists Build 1/2/3 of one
+# vehicle together, and to order each world's vehicles by its characters. The
+# rename that produces the "<Character> - 1. Name" stems is what the app sorts
+# on; the CSV only supplies the family (base-build) association, which the
+# filename cannot carry.
+
+def load_vehicle_families(csv_path):
+    """Returns {world_fold: {vehicle_name_fold: (character, family_base)}}."""
+    families = {}
+    if not csv_path or not csv_path.is_file():
+        return families
+    try:
+        with open(csv_path, "r", newline="", encoding="utf-8") as fp:
+            reader = csv.reader(fp)
+            header = next(reader, None)
+            for row in reader:
+                if len(row) < 5:
+                    continue
+                world, character, _build, vehicle, family = row[:5]
+                world_fold = world.strip().casefold()
+                vehicle_fold = vehicle.strip().casefold()
+                families.setdefault(world_fold, {})[vehicle_fold] = (
+                    character.strip(), family.strip())
+    except OSError as exc:
+        return families
+    return families
+
+
+# ---------------------------------------------------------------------------
 # Main generation
 # ---------------------------------------------------------------------------
 
@@ -258,6 +304,11 @@ def generate(root: Path, out_dir: Path) -> int:
     symbols = SymbolTable()
     log_lines = []  # (resource_name, rc_line, color_line)
     franchises = []
+
+    # (world folder -> {vehicle name -> (character, family base)}) used to group
+    # each character's vehicle builds (the "family") and order vehicles by
+    # character. Optional: without it every build becomes its own group.
+    vehicle_families = load_vehicle_families(root / "vehicles.csv")
 
     world_folders = sorted(
         [d for d in source_root.iterdir() if d.is_dir()], key=lambda d: d.name.casefold())
@@ -304,35 +355,43 @@ def generate(root: Path, out_dir: Path) -> int:
             })
 
         # ---- vehicles -----------------------------------------------------
+        # Grouped by (owning character, family base) so each of a character's
+        # vehicles appears as one multi-build group (Build 1/2/3 together) and
+        # the world's vehicles are ordered by the characters that own them.
         veh_groups = {}
         veh_folder = discover_case_insensitive(world, "Vehicules")
         veh_bins = [f for f in (veh_folder.iterdir() if veh_folder else [])
                     if f.is_file() and f.suffix.lower() == ".bin"]
+        world_families = vehicle_families.get(world.name.casefold(), {})
         for binary, portrait in pair_bins_and_images(veh_bins, image_files(veh_folder), warnings):
-            build, base = split_vehicle_stem(binary.stem)
-            name_id = sanitize(base)
+            owner, build, name = split_vehicle_stem(binary.stem)
+            name_id = sanitize(name)
             bin_name, png_name = make_resource_names(world_id, "VEH", name_id, build)
             bin_sym = symbols.allocate(bin_name, binary)
             png_sym = symbols.allocate(png_name, portrait) if portrait else alloc(png_name)
             if portrait:
                 ascii_ok([str(binary), str(portrait)], warnings)
-            entry = {"name": base, "bin": bin_sym, "png": png_sym, "build": build}
-            veh_groups.setdefault(base.casefold(), {"base": base, "builds": []})
-            veh_groups[base.casefold()]["builds"].append(entry)
+
+            owner_key = owner.casefold() if owner else ""
+            family = name  # fallback: the build is its own group
+            owned = world_families.get(name.casefold())
+            if owned is not None and (not owner_key or owned[0].casefold() == owner_key):
+                family = owned[1]
+            group_key = (owner_key, family.casefold())
+            group = veh_groups.get(group_key)
+            if group is None:
+                group = {"character": owner or "", "base": family, "builds": []}
+                veh_groups[group_key] = group
+            group["builds"].append({
+                "name": name, "bin": bin_sym, "png": png_sym, "build": build,
+            })
 
         vehicles = []
-        for key in sorted(veh_groups.keys()):
-            group = veh_groups[key]
+        # Order by owning character (alphabetical, matching the roster order),
+        # then by the vehicle family's base name, then builds in build order.
+        for group_key in sorted(veh_groups.keys()):
+            group = veh_groups[group_key]
             group["builds"] = sorted(group["builds"], key=lambda e: e["build"])
-            base_name = group["base"]
-            # Several builds whose printable names differ only by case collapse
-            # into one group key; keep the most common original spelling.
-            if len(set(x["name"] for x in group["builds"])) > 1:
-                warnings.append("vehicle builds with differing spellings merged: %s"
-                                % ", ".join(x["name"] for x in group["builds"]))
-            claimed = max(set(x["name"] for x in group["builds"]),
-                          key=lambda n: sum(1 for x in group["builds"] if x["name"] == n))
-            group["base"] = claimed
             vehicles.append(group)
 
         franchises.append({

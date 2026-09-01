@@ -3127,8 +3127,9 @@ void UpdateInputOwnership(HWND window);
 
 	std::wstring EntryDisplayName(const RosterEntry& entry)
 	{
-		if (entry.buildNumber > 1)
-			return entry.name + L" \u00b7 Build " + std::to_wstring(entry.buildNumber);
+		// Build number not shown: a multi-build vehicle's alternate forms are
+		// picked from the build picker by their own names (e.g. "Snail Dude
+		// Jake"), so the number only clutters the label.
 		return entry.name;
 	}
 
@@ -3824,10 +3825,10 @@ void UpdateInputOwnership(HWND window);
 		{
 			if (vehicle.builds.empty())
 				continue;
+			// Only the default (build 1) tile is shown; its alternates are
+			// revealed through the build picker when the tile is confirmed.
 			const RosterEntry* first = &vehicle.builds.front();
 			g_app.rosterSlots.push_back({RosterSlot::Kind::Vehicle, first, &vehicle});
-			if (vehicle.builds.size() > 1)
-				g_app.rosterSlots.push_back({RosterSlot::Kind::Plus, nullptr, &vehicle});
 		}
 		g_app.rosterIndex = 0;
 		g_app.rosterTopRow = 0;
@@ -3888,8 +3889,6 @@ void UpdateInputOwnership(HWND window);
 			if (!batmobile->builds.empty())
 			{
 				g_app.rosterSlots.push_back({RosterSlot::Kind::Vehicle, &batmobile->builds.front(), batmobile});
-				if (batmobile->builds.size() > 1)
-					g_app.rosterSlots.push_back({RosterSlot::Kind::Plus, nullptr, batmobile});
 			}
 		}
 
@@ -3957,8 +3956,17 @@ void UpdateInputOwnership(HWND window);
 			switch (g_app.rosterSlots[g_app.rosterIndex].kind)
 			{
 			case RosterSlot::Kind::Character:
-			case RosterSlot::Kind::Vehicle:
 				if (g_app.rosterSlots[g_app.rosterIndex].entry)
+					LoadRosterEntryToPad(*g_app.rosterSlots[g_app.rosterIndex].entry);
+				break;
+			case RosterSlot::Kind::Vehicle:
+				// A multi-build vehicle shows only its default tile here; the
+				// alternates are revealed in the build picker, which loads the
+				// chosen build. A single-build vehicle loads straight away.
+				if (g_app.rosterSlots[g_app.rosterIndex].group &&
+					g_app.rosterSlots[g_app.rosterIndex].group->builds.size() > 1)
+					OpenPlusPicker(*g_app.rosterSlots[g_app.rosterIndex].group);
+				else if (g_app.rosterSlots[g_app.rosterIndex].entry)
 					LoadRosterEntryToPad(*g_app.rosterSlots[g_app.rosterIndex].entry);
 				break;
 			case RosterSlot::Kind::Plus:
@@ -5783,9 +5791,10 @@ void UpdateInputOwnership(HWND window);
 	}
 
 	// Plus-picker: the vehicle's builds as a row of portrait circles (colored
-	// ring + name below), plus a trailing "+" glyph - the same visual
-	// language as the franchise roster grid, on a shared characters_tile
-	// panel. The franchise logo is drawn above this in the screen painter.
+	// ring + name below), on a shared characters_tile panel. The franchise logo
+	// is drawn above this in the screen painter. Panel width and label height
+	// are sized from the longest build name so nothing gets cropped, and the
+	// whole row is anchored to the panel so it stays centred.
 	void DrawPlusPickerMenu(Gdiplus::Graphics& g)
 	{
 		if (!g_app.plusGroup || g_app.plusGroup->builds.empty())
@@ -5795,46 +5804,60 @@ void UpdateInputOwnership(HWND window);
 		const size_t count = builds.size();
 
 		constexpr int diam = 90;
-		constexpr int step = 156;
-		constexpr int gapToPlus = 40;
+		constexpr int step = 156;            // cell width / centre-to-centre
 		constexpr int circleY = 160;
-		constexpr int labelH = 58;
+		constexpr int kLabelGap = 8;         // circle bottom -> label top
+		constexpr int kPanelPadX = 20;
+		constexpr int kPanelPadTop = 20;
 
-		const int groupW = static_cast<int>(count - 1) * step + diam + gapToPlus + diam;
-		const int groupX = (kOverlayWidth - groupW) / 2;
+		// Fit the label block to the longest name: measure its wrapped height at
+		// the shrink floor (17px) and give it that much room, so the auto-fit
+		// text renderer never has to truncate a long vehicle name.
+		int labelH = 34;
+		for (const auto& build : builds)
+		{
+			const float textH = MeasureWrappedTextHeight(
+				g, EntryDisplayName(build), step, 400, 17.0f);
+			labelH = std::max(labelH, static_cast<int>(std::ceil(textH)) + 6);
+		}
+		if (labelH > 100)
+			labelH = 100;
 
-		// Large translucent panel (characters_tile art) behind the circles.
-		constexpr int panelXPad = 24;
-		constexpr int panelTopPad = 20;
-		const int panelX = groupX - panelXPad;
-		const int panelY = circleY - panelTopPad;
-		const int panelH = panelTopPad + diam + 8 + labelH + 16;
-		const int panelW = groupW + panelXPad * 2;
+		// Panel covers the label row (count cells of `step`) plus padding, and
+		// is centred on the overlay. The circles sit at each cell's centre, so
+		// the group is symmetric within the panel.
+		const int rowW = static_cast<int>(count) * step;
+		const int panelW = rowW + kPanelPadX * 2;
+		const int panelX = (kOverlayWidth - panelW) / 2;
+		const int panelY = circleY - kPanelPadTop;
+		const int panelH = kPanelPadTop + diam + kLabelGap + labelH + 16;
 		if (Gdiplus::Bitmap* panel = RenderScaledAsset(
 			kCharactersTileResourceId, panelW, panelH, 16))
 		{
 			g.DrawImage(panel, panelX, panelY);
 		}
 
+		const int cell0X = panelX + kPanelPadX;   // left edge of the first cell
 		for (size_t i = 0; i < count; ++i)
 		{
 			const RosterEntry& build = builds[i];
-			const int x = groupX + static_cast<int>(i) * step;
+			const int cellLeft = cell0X + static_cast<int>(i) * step;
+			const int centerX = cellLeft + step / 2;
 			const bool focused = i == g_app.plusBuildIndex;
 			Gdiplus::Bitmap* visual = build.portraitResourceId != 0
 				? RenderPortrait(build.portraitResourceId, build.ringColor, focused, diam)
 				: RenderPlaceholder(build.name.empty() ? L'?' : build.name[0], build.ringColor, focused, diam);
+			// RenderPortrait's bitmap is (diam + 2*margin) with the ring centred
+			// in it, so offset by the full half-extent or the ring drifts right
+			// of centre by diam/2 and no longer lines up with its label.
 			if (visual)
-				g.DrawImage(visual, x - kPortraitMargin, circleY - kPortraitMargin);
-			DrawTextWrappedCentered(g, EntryDisplayName(build), x - 16, circleY + diam + 8, step, labelH,
+				g.DrawImage(visual, centerX - kPortraitMargin - diam / 2, circleY - kPortraitMargin);
+			// The label is centred in its cell (same width the height was
+			// measured at), so it hugs the circle and stays inside the panel.
+			DrawTextWrappedCenteredFit(g, EntryDisplayName(build),
+				cellLeft, circleY + diam + kLabelGap, step, labelH,
 				focused ? RGB(255, 236, 190) : RGB(214, 220, 230));
 		}
-
-		// Trailing "+" glyph (non-interactive), matching the roster marker.
-		const int plusX = groupX + static_cast<int>(count - 1) * step + diam + gapToPlus;
-		Gdiplus::Bitmap* plus = RenderPlusTile(builds[0].ringColor, false, diam);
-		if (plus)
-			g.DrawImage(plus, plusX - kPortraitMargin, circleY - kPortraitMargin);
 	}
 
 	// Right-edge scroll indicator for vertically scrollable grids. The track
