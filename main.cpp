@@ -6940,6 +6940,7 @@ void PollController(HWND window)
 		static std::unordered_map<SDL_JoystickID, ControllerState> controllers;
 		static ButtonMask previousCombinedButtons = 0;
 		static DWORD lastNavigation = 0;
+		static int navHoldMoves = 0;
 
 		SDL_Event event;
 		while (SDL_PollEvent(&event))
@@ -7261,8 +7262,13 @@ void PollController(HWND window)
 
 		// D-pad edge presses move immediately instead of waiting out the
 		// hold-repeat throttle, so quick taps are never swallowed. Holding a
-		// direction (stick or D-pad held down) repeats at a fixed cadence.
+		// direction (stick or D-pad held down) repeats at a fixed cadence,
+		// but the first repeat waits out a longer initial delay - a stick
+		// flick stays past the deadzone longer than a D-pad click's travel
+		// + spring-back, so without this a single flick could still land
+		// inside the fast-repeat window and move two tiles instead of one.
 		constexpr int kNavRepeatMs = 150;
+		constexpr int kNavInitialRepeatMs = 350;
 		const int dxEdge = (combinedPressed & XINPUT_GAMEPAD_DPAD_RIGHT ? 1 : 0)
 			- (combinedPressed & XINPUT_GAMEPAD_DPAD_LEFT ? 1 : 0);
 		const int dyEdge = (combinedPressed & XINPUT_GAMEPAD_DPAD_UP ? -1 : 0)
@@ -7280,7 +7286,8 @@ void PollController(HWND window)
 				Navigate(dyEdge);
 			navigated = true;
 		}
-		else if (anyDirection && now - lastNavigation >= kNavRepeatMs)
+		else if (anyDirection && now - lastNavigation >=
+			(navHoldMoves <= 1 ? kNavInitialRepeatMs : kNavRepeatMs))
 		{
 			if (gridScreen)
 			{
@@ -7311,10 +7318,14 @@ void PollController(HWND window)
 		if (navigated)
 		{
 			lastNavigation = now;
+			navHoldMoves++;
 			changed = true;
 		}
 		if (!anyDirection)
+		{
 			lastNavigation = 0;
+			navHoldMoves = 0;
+		}
 
 if (changed)
 			InvalidateRect(window, nullptr, FALSE);
