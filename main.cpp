@@ -5624,9 +5624,13 @@ void UpdateInputOwnership(HWND window);
 			g_app.soundVolume + direction * kSettingsPercentStep, 0, 100);
 		SaveInputSettingsToIni();
 		g_app.status = L"Sound volume: " + DescribeSoundVolume();
-		// Play the blip at the level just chosen, so the setting demonstrates
-		// itself instead of being a number you have to go and test.
-		PlaySelectSound();
+		// Play a blip at the level just chosen, so the setting demonstrates
+		// itself instead of being a number you have to go and test. Alternate
+		// between the two UI sounds rather than always previewing Select, so
+		// adjusting the slider actually demonstrates the Navigate sound too.
+		static bool previewNavigate = false;
+		previewNavigate ? PlayNavigateSound() : PlaySelectSound();
+		previewNavigate = !previewNavigate;
 	}
 	std::wstring DescribeSoundEffects()
 	{
