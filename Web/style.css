@@ -320,6 +320,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: clamp(10px, 2.5vw, 18px);
   width: 100%;
 }
 
@@ -473,9 +474,16 @@ body {
     flex-shrink: 0;
   }
 
+  /* Narrow sidebar in landscape: stack Clear/Favorite instead of squeezing
+     them side by side. */
+  #actionBar {
+    flex-direction: column;
+    gap: clamp(6px, 1vh, 10px);
+  }
+
   .actbtn {
     width: 100%;
-    height: clamp(48px, 13vh, 66px);
+    height: clamp(40px, 9vh, 56px);
   }
 
   .status-message {
@@ -761,6 +769,11 @@ body {
 
 #plusGrid .fig {
   flex: none;
+  /* Fixed width (independent of label length) so every build in the
+     picker wraps its name the same way instead of a long name (e.g.
+     "Ancient Psychic Tandem War Elephant") stretching its tile wider
+     than its neighbors and making the row look uneven. */
+  width: clamp(96px, 20vw, 130px);
 }
 
 #plusGrid .fig .ring {
@@ -938,3 +951,4 @@ body {
   white-space: pre-line;
   text-shadow: 0 2px 6px rgba(0, 0, 0, 0.7);
 }
+

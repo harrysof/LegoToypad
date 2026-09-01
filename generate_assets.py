@@ -42,10 +42,10 @@ APP_ICON_ID = 100
 # Version metadata stamped into the exe's VERSIONINFO resource. Bump these
 # together with the release tag; the comma form is what rc.exe's
 # FILEVERSION/PRODUCTVERSION statements require.
-APP_VERSION = "1.5.0"
-APP_VERSION_COMMA = "1,5,0,0"
+APP_VERSION = "1.8.0"
+APP_VERSION_COMMA = "1,8,0,0"
 APP_COMPANY = "HarrysofXD"
-APP_DESCRIPTION = "Controller-driven LEGO Dimensions Toypad companion for Cemu and Rpcs3"
+APP_DESCRIPTION = "Controller-driven LEGO Dimensions Toypad companion for Cemu, RPCS3, shadPS4 and Xenia"
 
 # ---------------------------------------------------------------------------
 # Deterministic hash -> color
@@ -888,6 +888,10 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kByHarrysofResourceId;")
     header.append("extern const int kYButtonResourceId;")
     header.append("extern const int kSettingsTextResourceId;")
+    header.append("// Single source of truth for the app version shown in the UI (web")
+    header.append("// catalog's \"version\" field) - kept in lockstep with APP_VERSION")
+    header.append("// below, which also stamps the exe's own FILEVERSION/ProductVersion.")
+    header.append("extern const wchar_t kAppVersion[];")
     header.append("// [style][button]; style order Xbox, DualShock4, Switch, button")
     header.append("// order as in kButtonNames. 0 = no icon bundled for that button.")
     header.append("extern const int kControllerIconResourceIds[%d][%d];"
@@ -935,6 +939,7 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kByHarrysofResourceId = %s;" % (by_harrysof_sym["name"] if by_harrysof_sym else "0"))
     cpp.append("const int kYButtonResourceId = %s;" % (y_button_sym["name"] if y_button_sym else "0"))
     cpp.append("const int kSettingsTextResourceId = %s;" % (settings_text_sym["name"] if settings_text_sym else "0"))
+    cpp.append("const wchar_t kAppVersion[] = L\"%s\";" % APP_VERSION)
     cpp.append("")
     cpp.append("const int kControllerIconResourceIds[%d][%d] = {"
                % (len(controller_icon_styles), len(controller_icon_buttons)))

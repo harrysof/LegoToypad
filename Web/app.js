@@ -351,27 +351,47 @@ function updateFloatName() {
 }
 
 // --- action bar -----------------------------------------------------------
-function buildActionBar() {
-  const bar = $('actionBar');
-  bar.textContent = '';
+function makeActionButton(iconUrl, label, onTap) {
   const btn = document.createElement('div');
   btn.className = 'actbtn';
   const img = document.createElement('img');
-  img.src = CAT.clearBtn;
-  img.alt = 'CLEAR';
+  img.src = iconUrl;
+  img.alt = label;
   const lbl = document.createElement('span');
   lbl.className = 'alabel';
-  lbl.textContent = 'CLEAR';
+  lbl.textContent = label;
   btn.appendChild(img);
   btn.appendChild(lbl);
-  btn.addEventListener('click', () => onActionTap(0));
-  bar.appendChild(btn);
+  btn.addEventListener('click', () => onTap(btn));
+  return btn;
+}
+
+function buildActionBar() {
+  const bar = $('actionBar');
+  bar.textContent = '';
+  bar.appendChild(makeActionButton(CAT.clearBtn, 'CLEAR', onClearTap));
+  // Favorites are added/removed from whatever is loaded on the selected
+  // pad, next to Clear - not by holding a roster tile.
+  bar.appendChild(makeActionButton(CAT.favoritesIcon, 'FAVORITE', onFavoriteTap));
 }
 
 // --- franchise grid -------------------------------------------------------
 function buildFranchiseGrid() {
   const grid = $('franchiseGrid');
   grid.textContent = '';
+
+  // Favorites tile, first in the grid - same custom_bin.png icon the
+  // desktop overlay's own Favorites tile uses.
+  const favTile = document.createElement('div');
+  favTile.className = 'fworld';
+  const favLogo = document.createElement('img');
+  favLogo.className = 'logo';
+  favLogo.src = CAT.favoritesIcon;
+  favLogo.alt = 'Favorites';
+  favTile.appendChild(favLogo);
+  favTile.addEventListener('click', () => onFavoritesTap(favTile));
+  grid.appendChild(favTile);
+
   CAT.franchises.forEach((world, idx) => {
     const tile = document.createElement('div');
     tile.className = 'fworld';
@@ -402,17 +422,18 @@ function buildRoster(world) {
     grid.appendChild(sep);
   }
 
+  // Only the default (build 1) tile is shown per vehicle, same as the
+  // desktop overlay; its alternates are revealed through the build picker
+  // when the tile itself is pressed, so there's no separate "+" grid slot.
   vehs.forEach((group) => {
-    grid.appendChild(makeFig(group.builds[0]));
-    if (group.builds.length > 1) {
-      grid.appendChild(makePlusFig(group));
-    }
+    const entry = group.builds[0];
+    grid.appendChild(makeFig(entry, group.builds.length > 1 ? group : null));
   });
 
   wireScroller(grid, $('rosterScroll'));
 }
 
-function makeFig(entry) {
+function makeFig(entry, group) {
   const fig = document.createElement('div');
   fig.className = 'fig';
   const ring = document.createElement('div');
@@ -439,27 +460,12 @@ function makeFig(entry) {
 
   fig.addEventListener('click', () => {
     highlightTouched(fig);
-    apiLoad(curSlot, entry.bin, entry.name);
+    if (group) {
+      openPlus(group);
+    } else {
+      apiLoad(curSlot, entry.bin, entry.name);
+    }
   });
-  return fig;
-}
-
-function makePlusFig(group) {
-  const fig = document.createElement('div');
-  fig.className = 'fig plus';
-  const ring = document.createElement('div');
-  ring.className = 'ring plus-ring';
-  ring.style.setProperty('--fig-color', group.builds[0].color);
-  ring.style.boxShadow = `0 0 12px ${rgba(group.builds[0].color, 0.4)}`;
-  const span = document.createElement('span');
-  span.textContent = '+';
-  ring.appendChild(span);
-  fig.appendChild(ring);
-  const lbl = document.createElement('div');
-  lbl.className = 'lbl';
-  lbl.textContent = 'MORE';
-  fig.appendChild(lbl);
-  fig.addEventListener('click', () => openPlus(group));
   return fig;
 }
 
@@ -471,20 +477,8 @@ function buildPlus(group) {
   $('plusWorldLogo').src = curWorld.logo;
 
   group.builds.forEach((entry) => {
-    const fig = makeFig(entry);
-    grid.appendChild(fig);
+    grid.appendChild(makeFig(entry));
   });
-
-  const plus = document.createElement('div');
-  plus.className = 'fig plus';
-  const ring = document.createElement('div');
-  ring.className = 'ring plus-ring';
-  ring.style.setProperty('--fig-color', group.builds[0].color);
-  const span = document.createElement('span');
-  span.textContent = '+';
-  ring.appendChild(span);
-  plus.appendChild(ring);
-  grid.appendChild(plus);
 }
 
 // --- scrollbars -----------------------------------------------------------
@@ -539,12 +533,14 @@ function onPadTap(slot) {
   refreshPadsFromState();
 }
 
-async function onActionTap(action) {
-  const btn = document.querySelector('#actionBar .actbtn');
-  if (btn) {
-    btn.classList.add('tapped');
-    setTimeout(() => btn.classList.remove('tapped'), 220);
-  }
+function tapAnimate(btn) {
+  if (!btn) return;
+  btn.classList.add('tapped');
+  setTimeout(() => btn.classList.remove('tapped'), 220);
+}
+
+function onClearTap(btn) {
+  tapAnimate(btn);
   if (curSlot === null) {
     setStatusMessage('Tap a pad first to select a slot.', 'warn');
     return;
@@ -552,9 +548,59 @@ async function onActionTap(action) {
   apiClear(curSlot);
 }
 
+// Favorites the character/vehicle currently loaded on the selected pad.
+// Toggles: pressing it again on an already-favorited figure removes it.
+async function onFavoriteTap(btn) {
+  tapAnimate(btn);
+  if (curSlot === null) {
+    setStatusMessage('Tap a pad first to select a slot.', 'warn');
+    return;
+  }
+  const pad = lastState && lastState.pads ? lastState.pads[curSlot] : null;
+  if (!pad || !pad.occupied || !pad.bin) {
+    setStatusMessage('Nothing on this pad to favorite.', 'warn');
+    return;
+  }
+  let data;
+  try {
+    const res = await fetch('/api/favorite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bin: pad.bin }),
+    });
+    data = await res.json();
+  } catch (e) {
+    setStatusMessage('Could not reach the desktop app.', 'error');
+    return;
+  }
+  if (!data.ok) {
+    setStatusMessage('Could not update favorites.', 'error');
+    return;
+  }
+  setStatusMessage(
+    data.favorited ? `Added "${pad.name}" to favorites` : `Removed "${pad.name}" from favorites`,
+    'success'
+  );
+}
+
 function onWorldTap(idx, tile) {
   curWorld = CAT.franchises[idx];
   highlightTouched(tile);
+  $('worldLogo').src = curWorld.logo;
+  buildRoster(curWorld);
+  setScreen('roster');
+}
+
+async function onFavoritesTap(tile) {
+  highlightTouched(tile);
+  let world;
+  try {
+    world = await api('/api/favorites');
+  } catch (e) {
+    setStatusMessage('Could not load favorites.', 'error');
+    return;
+  }
+  curWorld = world;
   $('worldLogo').src = curWorld.logo;
   buildRoster(curWorld);
   setScreen('roster');
