@@ -36,7 +36,6 @@ LegoToypad needs an emulator build with the Toypad listener enabled. Grab the on
 
 1. Launch the exe - it sits in the tray until you toggle it (default: controller **Back**).
 2. Pick a pad, then **Load** a franchise/character, **Move** it, or **Clear** it.
-3. The **+** tile at the end of each roster captures a custom tag from the Center pad.
 
 ## Controls
 
