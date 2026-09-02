@@ -4894,6 +4894,24 @@ void UpdateInputOwnership(HWND window);
 	constexpr int kLedGlowMargin = kLedGlowRadius + 8;
 	constexpr int kLedIntensityLevels = 9;
 
+	// The wire carries raw LED drive levels, not display colour: the pad's
+	// three channels have very different luminous efficiency, and the game
+	// compensates by driving them against a white point of (255, 110, 24).
+	// Painted straight to a screen everything skews orange - green sits at
+	// 43% and blue at 9% of where sRGB would put them. Confirmed against
+	// captures across several scenes (including a mid-fade frame, which
+	// scaled all three channels by the same factor, so the drive is linear)
+	// - see toypad-led-color-fix.md. Applied once, here, so every consumer
+	// (halo glow, pad tint) gets true colour without touching the raw wire
+	// state the fade/flash math above operates on.
+	constexpr int kLedWhiteR = 255, kLedWhiteG = 110, kLedWhiteB = 24;
+	void CalibrateLedColor(uint8_t r, uint8_t g, uint8_t b, BYTE& outR, BYTE& outG, BYTE& outB)
+	{
+		outR = static_cast<BYTE>(std::clamp(static_cast<int>(r) * 255 / kLedWhiteR, 0, 255));
+		outG = static_cast<BYTE>(std::clamp(static_cast<int>(g) * 255 / kLedWhiteG, 0, 255));
+		outB = static_cast<BYTE>(std::clamp(static_cast<int>(b) * 255 / kLedWhiteB, 0, 255));
+	}
+
 	// Milliseconds per toypad duration tick. The wire carries single-byte tick
 	// counts, so this is what turns them into wall-clock time. Calibrated from a
 	// LEGO Dimensions trace: the game's idle rainbow issues a Fade All with
@@ -5133,10 +5151,12 @@ void UpdateInputOwnership(HWND window);
 			static_cast<float>(kLedGlowMargin - bbox.left),
 			static_cast<float>(kLedGlowMargin - bbox.top));
 
+		BYTE calR, calG, calB;
+		CalibrateLedColor(r, g, b, calR, calG, calB);
 		const float intensity = static_cast<float>(level) / static_cast<float>(kLedIntensityLevels - 1);
-		const BYTE rr = static_cast<BYTE>(r * intensity);
-		const BYTE gg = static_cast<BYTE>(g * intensity);
-		const BYTE bb = static_cast<BYTE>(b * intensity);
+		const BYTE rr = static_cast<BYTE>(calR * intensity);
+		const BYTE gg = static_cast<BYTE>(calG * intensity);
+		const BYTE bb = static_cast<BYTE>(calB * intensity);
 		DrawGlow(gfx, path, RGB(rr, gg, bb), kLedGlowRadius, w, h);
 
 		g_glossCache[key] = bitmap;
@@ -5172,19 +5192,42 @@ void UpdateInputOwnership(HWND window);
 	// between curR/G/B's two endpoint colours (see ComputeLedFrame).
 	void DrawLedRegionTint(Gdiplus::Graphics& g)
 	{
+		// A flash's dark beat darkens the tile itself rather than merely
+		// omitting the colour tint: a colour-tinted opacity toggle is
+		// invisible whenever the flash colour matches the background
+		// (black-on-dark, white-on-white both animate nothing) - see
+		// toypad-led-color-fix.md. Brightness is colour-independent, so this
+		// reads regardless of what colour the flash actually is.
+		constexpr float kFlashDarkBrightness = 0.34f;
+		constexpr BYTE kFlashDarkAlpha =
+			static_cast<BYTE>((1.0f - kFlashDarkBrightness) * 255.0f + 0.5f);
+
 		for (int region = 0; region < 3; ++region)
 		{
 			const LedRegion& led = g_app.ledRegions[static_cast<size_t>(region)];
-			if (led.mode == LedMode::Off || led.intensity <= 0.004f)
+			if (led.mode == LedMode::Off)
 				continue;
+
 			Gdiplus::GraphicsPath path;
 			AppendLedRegionShape(path, region, 0.0f, 0.0f); // window coordinates
+
+			if (led.mode == LedMode::Flash && led.intensity <= 0.004f)
+			{
+				Gdiplus::SolidBrush dark(Gdiplus::Color(kFlashDarkAlpha, 0, 0, 0));
+				g.FillPath(&dark, &path);
+				continue;
+			}
+			if (led.intensity <= 0.004f)
+				continue;
+
+			BYTE calR, calG, calB;
+			CalibrateLedColor(led.curR, led.curG, led.curB, calR, calG, calB);
 			// 210 rather than the old 140: with the LEDs on the pads are drawn
 			// as empty boxes, so this fill is the LED itself, not a stain on
 			// top of artwork. Scaling by intensity keeps a flash's dark phase
 			// legible as actually dark.
 			const BYTE alpha = static_cast<BYTE>(std::clamp(210.0f * led.intensity, 0.0f, 255.0f));
-			Gdiplus::SolidBrush brush(Gdiplus::Color(alpha, led.curR, led.curG, led.curB));
+			Gdiplus::SolidBrush brush(Gdiplus::Color(alpha, calR, calG, calB));
 			g.FillPath(&brush, &path);
 		}
 	}
