@@ -78,6 +78,29 @@ constexpr int kOverlayWidth = 900;
 	// 92% is the old fixed 235/255. The Settings row steps this (and sound
 	// volume) by kSettingsPercentStep in either direction.
 	constexpr int kDefaultOpacityPercent = 92;
+	// Toypad sneak peek: a click-through, never-activated HUD drawn straight
+	// over the running game while a button is held. It is a second view of
+	// the same seven pads - it reads g_app.padState / g_app.ledRegions and
+	// nothing else, so it is always in lockstep with the overlay's own pads.
+	//
+	// The point of it is that the game keeps running. The picker overlay
+	// takes the foreground and asserts input ownership (see
+	// UpdateInputOwnership), which is exactly what stops the emulator dead
+	// while it is up; the peek window does neither - WS_EX_TRANSPARENT plus
+	// WS_EX_NOACTIVATE means every button, including the one being held to
+	// summon it, goes to the game untouched.
+	constexpr int kPeekSizeChoiceCount = 4; // Off / Small / Medium / Large
+	constexpr size_t kDefaultPeekSizeChoice = 2; // Medium
+	// Pad height as a fraction of the monitor's height at Medium, so the HUD
+	// is the same physical size at 1080p and at 4K. The other sizes scale
+	// this by kPeekSizeScales.
+	constexpr float kPeekPadHeightFraction = 0.145f;
+	constexpr std::array<float, kPeekSizeChoiceCount> kPeekSizeScales = {0.0f, 0.78f, 1.0f, 1.26f};
+	// Screen-edge insets, as fractions of the monitor.
+	constexpr float kPeekMarginXFraction = 0.022f;
+	constexpr float kPeekMarginYFraction = 0.030f;
+	constexpr DWORD kPeekFadeInMs = 90;
+	constexpr DWORD kPeekFadeOutMs = 130;
 	constexpr int kOpacityFloorPercent = 20; // below this the window becomes hard to see
 	constexpr int kSettingsPercentStep = 15;
 	constexpr int kWindowCornerRadius = 6;
@@ -359,6 +382,13 @@ bool swapConfirmBackButtons = false;
 		// conflict, since this only fires on the RosterList screen and
 		// buttonMoveActive only fires on the PadViewer screen.
 		ButtonMask buttonFavorite = XINPUT_GAMEPAD_X;
+		// Held (not tapped) to summon the sneak-peek HUD over the game. The
+		// left trigger by default: nothing else in the picker is bound to it,
+		// and LEGO Dimensions itself only uses it for the shoulder-swap, so
+		// holding it is cheap in-game.
+		ButtonMask buttonSneakPeek = kTriggerLeftButton;
+		// Sneak peek size, 0 = off. Index into kPeekSizeScales.
+		size_t peekSizeChoice = kDefaultPeekSizeChoice;
 		// Index into kBindableActions while capturing a new button for one
 		// of them from Settings; -1 when no binding capture is running.
 		int capturingBindingIndex = -1;
@@ -717,18 +747,25 @@ bool swapConfirmBackButtons = false;
 		// fires on RosterList, Move-active-pad only fires on PadViewer).
 		bool global;
 		Screen scope; // ignored when global is true
+		// True for actions that only fire while the picker is HIDDEN (the
+		// sneak-peek hold). Those can never collide with a picker action,
+		// whatever screen it belongs to, because the two are live at
+		// mutually exclusive times.
+		bool whileHidden = false;
 	};
 
 	// Two actions need distinct buttons only if either fires on every screen,
 	// or they fire on the very same screen.
 	bool ActionsCanConflict(const BindableAction& a, const BindableAction& b)
 	{
+		if (a.whileHidden != b.whileHidden)
+			return false;
 		if (a.global || b.global)
 			return true;
 		return a.scope == b.scope;
 	}
 
-	constexpr std::array<BindableAction, 7> kBindableActions = {{
+	constexpr std::array<BindableAction, 8> kBindableActions = {{
 		{L"Confirm", L"ButtonConfirm", &AppState::buttonConfirm, true, Screen::PadViewer},
 		{L"Back", L"ButtonBack", &AppState::buttonBack, true, Screen::PadViewer},
 		{L"Settings", L"ButtonSettings", &AppState::buttonSettings, false, Screen::PadViewer},
@@ -736,6 +773,8 @@ bool swapConfirmBackButtons = false;
 		{L"Quick load", L"ButtonQuickLoad", &AppState::buttonQuickLoad, false, Screen::PadViewer},
 		{L"Quick clear", L"ButtonQuickClear", &AppState::buttonQuickClear, false, Screen::PadViewer},
 		{L"Add to favorites", L"ButtonFavorite", &AppState::buttonFavorite, false, Screen::RosterList},
+		{L"Sneak peek (hold)", L"ButtonSneakPeek", &AppState::buttonSneakPeek, false,
+			Screen::PadViewer, true},
 	}};
 
 	// ---------------------------------------------------------------------
@@ -761,6 +800,7 @@ bool swapConfirmBackButtons = false;
 		PadSkin,
 		Opacity,
 		WindowPlacement,
+		SneakPeek,
 		LedMirror,
 		SoundEffects,
 		SoundVolume,
@@ -898,6 +938,9 @@ void UpdateInputOwnership(HWND window);
 	void CyclePadSkin(int direction);
 	void CycleOpacity(int direction);
 	void CycleSoundVolume(int direction);
+	void CycleSneakPeek(int direction);
+	std::wstring DescribeSneakPeek();
+	void HidePeekWindow(bool immediate);
 	void ToggleSoundEffects();
 	std::wstring DescribePadSkin();
 	std::wstring DescribeOpacity();
@@ -2572,6 +2615,10 @@ void UpdateInputOwnership(HWND window);
 			"ButtonMoveActive=16384\n"
 			"ButtonQuickLoad=512\n"
 			"ButtonQuickClear=256\n"
+			"ButtonFavorite=16384\n"
+			"; Held, not tapped: the sneak-peek HUD is up for exactly as long as\n"
+			"; this button is down. 65536 is LT.\n"
+			"ButtonSneakPeek=65536\n"
 			"; ButtonStyle picks the button icons/names shown in the UI:\n"
 			"; Auto | Xbox | DualShock4 | Switch. Auto follows the connected pad\n"
 			"; (Xbox wins when several are plugged in). Icons only - every pad works\n"
@@ -2588,6 +2635,11 @@ void UpdateInputOwnership(HWND window);
 			"; control of its own, so the level is baked into a cached copy of the\n"
 			"; samples. The Settings row offers 100/85/70/55/40.\n"
 			"SoundVolume=70\n"
+			"; SneakPeek is the click-through HUD you get by HOLDING ButtonSneakPeek\n"
+			"; while the game runs: the same seven pads, drawn over the game, with\n"
+			"; the game still playing (unlike the picker, which pauses input for the\n"
+			"; emulator while it is open). 0 = off, 1 = small, 2 = medium, 3 = large.\n"
+			"SneakPeek=2\n"
 			"; PadSkin names the folder under Assets/Pads whose seven images are drawn\n"
 			"; as the toypad. \"Default\" is the built-in art. Any folder holding the\n"
 			"; same seven filenames (left_upper, center, right_upper, left_lower_left,\n"
@@ -2838,6 +2890,8 @@ void UpdateInputOwnership(HWND window);
 			g_app.soundEffects ? L"1" : L"0", iniPath.c_str());
 		WritePrivateProfileStringW(L"Input", L"SoundVolume",
 			std::to_wstring(g_app.soundVolume).c_str(), iniPath.c_str());
+		WritePrivateProfileStringW(L"Input", L"SneakPeek",
+			std::to_wstring(g_app.peekSizeChoice).c_str(), iniPath.c_str());
 		// Stored by folder name, not by index: adding or removing a skin
 		// folder must never silently repoint this at a different one.
 		WritePrivateProfileStringW(L"Input", L"PadSkin",
@@ -2867,6 +2921,10 @@ void UpdateInputOwnership(HWND window);
 			GetPrivateProfileIntW(L"Input", L"SoundEffects", 1, iniPath.c_str()) != 0;
 		g_app.soundVolume = std::clamp(static_cast<int>(GetPrivateProfileIntW(
 			L"Input", L"SoundVolume", 70, iniPath.c_str())), 0, 100);
+		g_app.peekSizeChoice = static_cast<size_t>(std::clamp(static_cast<int>(
+			GetPrivateProfileIntW(L"Input", L"SneakPeek",
+				static_cast<INT>(kDefaultPeekSizeChoice), iniPath.c_str())),
+			0, kPeekSizeChoiceCount - 1));
 		std::array<wchar_t, 96> padSkinBuffer{};
 		GetPrivateProfileStringW(L"Input", L"PadSkin", L"Default", padSkinBuffer.data(),
 			static_cast<DWORD>(padSkinBuffer.size()), iniPath.c_str());
@@ -4522,6 +4580,11 @@ void UpdateInputOwnership(HWND window);
 		if (currentForeground && currentForeground != window)
 			g_app.previousForegroundWindow = currentForeground;
 
+		// Two views of the same seven pads on screen at once reads as a bug,
+		// and the picker's own pads are the richer one, so the HUD goes now
+		// rather than fading out behind the overlay.
+		HidePeekWindow(true);
+
 		PositionOverlayWindow(window);
 		// Assert input ownership before the window becomes visible so there
 		// is no tick where Cemu can read the controller while the picker is
@@ -4688,6 +4751,8 @@ void UpdateInputOwnership(HWND window);
 		g_app.buttonStyleChoice = defaults.buttonStyleChoice;
 		g_app.soundEffects = defaults.soundEffects;
 		g_app.padSkinIndex = defaults.padSkinIndex;
+		g_app.peekSizeChoice = defaults.peekSizeChoice;
+		HidePeekWindow(true); // the HUD's size setting just changed under it
 		g_app.opacityPercent = defaults.opacityPercent;
 		if (g_app.ledMirrorEnabled != defaults.ledMirrorEnabled)
 			SetLedMirrorEnabled(defaults.ledMirrorEnabled); // starts/stops the poll
@@ -4919,12 +4984,17 @@ void UpdateInputOwnership(HWND window);
 	// tick lands at ~40ms and a fade fills exactly the interval before it.
 	constexpr int kLedTickMs = 40;
 
-	RECT LedRegionBounds(int region)
+	// The LED geometry helpers take the pad layout they are drawing against
+	// rather than reading kPadCells directly, so the sneak-peek HUD (which
+	// spreads the same seven pads across the whole screen) mirrors the LEDs
+	// through exactly this code instead of a parallel copy of it. Everything
+	// on the overlay's own path keeps passing kPadCells by default.
+	RECT LedRegionBounds(int region, const std::array<RECT, 7>& cells = kPadCells)
 	{
 		RECT bbox{INT_MAX, INT_MAX, INT_MIN, INT_MIN};
 		for (int i = 0; i < kLedRegionSlotCount[region]; ++i)
 		{
-			const RECT& cell = kPadCells[static_cast<size_t>(kLedRegionSlots[region][i])];
+			const RECT& cell = cells[static_cast<size_t>(kLedRegionSlots[region][i])];
 			bbox.left = std::min(bbox.left, cell.left);
 			bbox.top = std::min(bbox.top, cell.top);
 			bbox.right = std::max(bbox.right, cell.right);
@@ -4936,11 +5006,12 @@ void UpdateInputOwnership(HWND window);
 	// Adds one region's pad silhouettes to `path`, translated by (dx, dy) so
 	// the same shapes can be drawn either in window space or in a small
 	// cached halo bitmap's local space.
-	void AppendLedRegionShape(Gdiplus::GraphicsPath& path, int region, float dx, float dy)
+	void AppendLedRegionShape(Gdiplus::GraphicsPath& path, int region, float dx, float dy,
+		const std::array<RECT, 7>& cells = kPadCells)
 	{
 		for (int i = 0; i < kLedRegionSlotCount[region]; ++i)
 		{
-			const RECT& cell = kPadCells[static_cast<size_t>(kLedRegionSlots[region][i])];
+			const RECT& cell = cells[static_cast<size_t>(kLedRegionSlots[region][i])];
 			const Gdiplus::RectF rect(
 				static_cast<float>(cell.left) + dx,
 				static_cast<float>(cell.top) + dy,
@@ -5124,12 +5195,16 @@ void UpdateInputOwnership(HWND window);
 	// Cached soft tinted halo for one region at one brightness level. The
 	// expensive blur runs once per (region, color, level); steady-state fades
 	// then just DrawImage a cached bitmap.
-	Gdiplus::Bitmap* RenderLedHalo(int region, uint8_t r, uint8_t g, uint8_t b, int level)
+	// `layoutTag` separates one layout's cached halos from another's: the
+	// overlay (0) and the sneak-peek HUD (1) can land on the same bitmap
+	// size by coincidence, and their region shapes are not the same.
+	Gdiplus::Bitmap* RenderLedHalo(int region, uint8_t r, uint8_t g, uint8_t b, int level,
+		const std::array<RECT, 7>& cells = kPadCells, int layoutTag = 0)
 	{
 		if (level <= 0)
 			return nullptr;
 
-		const RECT bbox = LedRegionBounds(region);
+		const RECT bbox = LedRegionBounds(region, cells);
 		if (bbox.left == INT_MAX)
 			return nullptr;
 
@@ -5137,7 +5212,7 @@ void UpdateInputOwnership(HWND window);
 		const int h = (bbox.bottom - bbox.top) + kLedGlowMargin * 2;
 		const unsigned int color = (static_cast<unsigned int>(level) << 24) |
 			(static_cast<unsigned int>(r) << 16) | (static_cast<unsigned int>(g) << 8) | b;
-		const GlossKey key{GlossKind::LedHalo, region, 0, color, w, h};
+		const GlossKey key{GlossKind::LedHalo, region, layoutTag, color, w, h};
 		const auto cached = g_glossCache.find(key);
 		if (cached != g_glossCache.end())
 			return cached->second;
@@ -5149,7 +5224,7 @@ void UpdateInputOwnership(HWND window);
 		Gdiplus::GraphicsPath path;
 		AppendLedRegionShape(path, region,
 			static_cast<float>(kLedGlowMargin - bbox.left),
-			static_cast<float>(kLedGlowMargin - bbox.top));
+			static_cast<float>(kLedGlowMargin - bbox.top), cells);
 
 		BYTE calR, calG, calB;
 		CalibrateLedColor(r, g, b, calR, calG, calB);
@@ -5165,7 +5240,8 @@ void UpdateInputOwnership(HWND window);
 
 	// Draws the glow for any lit LED region, behind the pads. Called from
 	// Paint's pad screens before the pad loop.
-	void DrawLedRegionGlows(Gdiplus::Graphics& g)
+	void DrawLedRegionGlows(Gdiplus::Graphics& g, const std::array<RECT, 7>& cells = kPadCells,
+		int layoutTag = 0)
 	{
 		for (int region = 0; region < 3; ++region)
 		{
@@ -5175,10 +5251,11 @@ void UpdateInputOwnership(HWND window);
 			const int level = std::clamp(
 				static_cast<int>(led.intensity * (kLedIntensityLevels - 1) + 0.5f),
 				1, kLedIntensityLevels - 1);
-			Gdiplus::Bitmap* halo = RenderLedHalo(region, led.curR, led.curG, led.curB, level);
+			Gdiplus::Bitmap* halo = RenderLedHalo(region, led.curR, led.curG, led.curB, level,
+				cells, layoutTag);
 			if (!halo)
 				continue;
-			const RECT bbox = LedRegionBounds(region);
+			const RECT bbox = LedRegionBounds(region, cells);
 			g.DrawImage(halo, static_cast<int>(bbox.left) - kLedGlowMargin,
 				static_cast<int>(bbox.top) - kLedGlowMargin);
 		}
@@ -5190,7 +5267,7 @@ void UpdateInputOwnership(HWND window);
 	// scaled by the region's live intensity so solid pads stay lit and flash
 	// blinks read clearly; a fade is always fully lit and instead moves
 	// between curR/G/B's two endpoint colours (see ComputeLedFrame).
-	void DrawLedRegionTint(Gdiplus::Graphics& g)
+	void DrawLedRegionTint(Gdiplus::Graphics& g, const std::array<RECT, 7>& cells = kPadCells)
 	{
 		// A flash's dark beat darkens the tile itself rather than merely
 		// omitting the colour tint: a colour-tinted opacity toggle is
@@ -5209,7 +5286,7 @@ void UpdateInputOwnership(HWND window);
 				continue;
 
 			Gdiplus::GraphicsPath path;
-			AppendLedRegionShape(path, region, 0.0f, 0.0f); // window coordinates
+			AppendLedRegionShape(path, region, 0.0f, 0.0f, cells); // window coordinates
 
 			if (led.mode == LedMode::Flash && led.intensity <= 0.004f)
 			{
@@ -5512,6 +5589,44 @@ void UpdateInputOwnership(HWND window);
 	}
 
 	// ---------------------------------------------------------------------
+	// Sneak peek (the Settings row; the HUD itself lives further down)
+	// ---------------------------------------------------------------------
+
+	std::wstring DescribeSneakPeek()
+	{
+		const wchar_t* size = nullptr;
+		switch (g_app.peekSizeChoice)
+		{
+		case 1: size = L"Small"; break;
+		case 2: size = L"Medium"; break;
+		case 3: size = L"Large"; break;
+		default: break;
+		}
+		if (!size)
+			return L"Off";
+		// The hold button rides along in the value, because a size on its own
+		// says nothing about how the HUD is summoned - and the row for the
+		// binding itself sits several categories further down the list.
+		return std::wstring(size) + L" (hold " +
+			DescribeControllerMask(g_app.buttonSneakPeek) + L")";
+	}
+
+	void CycleSneakPeek(int direction)
+	{
+		const size_t count = static_cast<size_t>(kPeekSizeChoiceCount);
+		const size_t step = direction < 0 ? count - 1 : 1;
+		g_app.peekSizeChoice = (g_app.peekSizeChoice + step) % count;
+		// A size change while the HUD is up would leave the old geometry on
+		// screen until the button is released, so drop it and let the next
+		// hold rebuild it.
+		HidePeekWindow(true);
+		SaveInputSettingsToIni();
+		g_app.status = g_app.peekSizeChoice == 0
+			? L"Sneak peek: Off"
+			: L"Sneak peek: " + DescribeSneakPeek() + L" while the game runs.";
+	}
+
+	// ---------------------------------------------------------------------
 	// Pad skins (list building + the Settings row)
 	// ---------------------------------------------------------------------
 
@@ -5719,6 +5834,8 @@ void UpdateInputOwnership(HWND window);
 		row(SettingAction::PadSkin, L"Pad skin", DescribePadSkin());
 		row(SettingAction::Opacity, L"Window transparency", DescribeOpacity());
 		row(SettingAction::WindowPlacement, L"Window", DescribeWindowPlacement());
+		row(SettingAction::SneakPeek, L"Sneak peek", DescribeSneakPeek(),
+			ToneForSwitch(g_app.peekSizeChoice != 0));
 		row(SettingAction::LedMirror, L"Toypad LEDs", DescribeLedMirror(),
 			ToneForSwitch(g_app.ledMirrorEnabled));
 
@@ -5852,6 +5969,7 @@ void UpdateInputOwnership(HWND window);
 		case SettingAction::PadSkin: CyclePadSkin(direction); break;
 		case SettingAction::Opacity: CycleOpacity(direction); break;
 		case SettingAction::WindowPlacement: ToggleWindowDraggable(); break;
+		case SettingAction::SneakPeek: CycleSneakPeek(direction); break;
 		case SettingAction::LedMirror: ToggleLedMirror(); break;
 		case SettingAction::SoundEffects: ToggleSoundEffects(); break;
 		case SettingAction::SoundVolume: CycleSoundVolume(direction); break;
@@ -6056,6 +6174,400 @@ void UpdateInputOwnership(HWND window);
 			Gdiplus::RectF(static_cast<float>(labelX), static_cast<float>(labelY),
 				static_cast<float>(labelW), static_cast<float>(labelH)),
 			&format, &labelBrush);
+	}
+
+	// ---------------------------------------------------------------------
+	// Toypad sneak peek
+	// ---------------------------------------------------------------------
+	// A second, read-only view of the very same seven pads, drawn straight
+	// over the running game for as long as the peek button is held.
+	//
+	// Why it is a separate window rather than another screen of the picker:
+	// the picker overlay takes the foreground and holds the input-ownership
+	// event, which is exactly what makes the emulator go still while it is
+	// open. This window is created WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, is
+	// never activated, never touches g_inputOwnershipEvent and has no hit
+	// area at all - mouse clicks fall through it to whatever is underneath,
+	// and the held trigger reaches the game like any other button. The game
+	// keeps playing; you just get to see the pads.
+	//
+	// It owns no state of its own. Everything it draws comes from
+	// g_app.padState and g_app.ledRegions, so a load / move / clear (from
+	// the picker, the web remote, or anywhere else) and every toypad LED
+	// change land on it at the same moment they land on the overlay.
+
+	HWND g_peekWindow = nullptr;
+	bool g_peekShown = false;   // window is up (possibly mid fade-out)
+	bool g_peekHiding = false;
+	DWORD g_peekFadeStart = 0;
+	// Screen-space geometry of the seven pads for the monitor the HUD is
+	// currently spread across; rebuilt on every show, so a resolution change
+	// or a move to another monitor is picked up automatically.
+	std::array<RECT, 7> g_peekCells{};
+
+	// The peek's layout is NOT a scaled copy of kPadCells: the overlay packs
+	// the toypad into a 900x610 panel, while the HUD pushes the two side
+	// sections down into the bottom corners and the centre pad up to the top
+	// edge, leaving the middle of the screen - where the game actually is -
+	// clear. Individual pad proportions still come from kPadCells so the
+	// shapes stay the real toypad's.
+	std::array<RECT, 7> ComputePeekCells(int width, int height)
+	{
+		const float scale = kPeekSizeScales[std::min(g_app.peekSizeChoice,
+			static_cast<size_t>(kPeekSizeChoiceCount - 1))];
+		// kPadCells' own pad height is the unit everything else is measured
+		// in, so a pad keeps its aspect ratio at any HUD size.
+		const float s = (height * kPeekPadHeightFraction * scale) / 136.0f;
+		const auto S = [s](float v) { return v * s; };
+		const float marginX = width * kPeekMarginXFraction;
+		const float marginY = height * kPeekMarginYFraction;
+		const float gutter = S(10.0f); // between the two lower pads of a section
+		const float vgap = S(24.0f);   // between a section's upper and lower row
+		const auto R = [](float x, float y, float w, float h) {
+			return RECT{static_cast<LONG>(std::lround(x)), static_cast<LONG>(std::lround(y)),
+				static_cast<LONG>(std::lround(x + w)), static_cast<LONG>(std::lround(y + h))};
+		};
+
+		std::array<RECT, 7> cells{};
+		const float lowerTop = height - marginY - S(136.0f);
+		const float upperTop = lowerTop - vgap - S(136.0f);
+
+		// Left section (pad 2): lower-left corner, upper pad stacked above
+		// the outer of the two lower ones.
+		cells[3] = R(marginX, lowerTop, S(136.0f), S(136.0f));
+		cells[4] = R(marginX + S(136.0f) + gutter, lowerTop, S(164.0f), S(136.0f));
+		cells[0] = R(marginX, upperTop, S(140.0f), S(136.0f));
+
+		// Right section (pad 3): the mirror image of the left one.
+		cells[6] = R(width - marginX - S(136.0f), lowerTop, S(136.0f), S(136.0f));
+		cells[5] = R(width - marginX - S(136.0f) - gutter - S(164.0f), lowerTop,
+			S(164.0f), S(136.0f));
+		cells[2] = R(width - marginX - S(140.0f), upperTop, S(140.0f), S(136.0f));
+
+		// Centre section (pad 1): the single circular pad, top-centre.
+		cells[1] = R((width - S(188.0f)) / 2.0f, marginY, S(188.0f), S(184.0f));
+		return cells;
+	}
+
+	bool PeekFadeActive()
+	{
+		return g_peekFadeStart != 0 &&
+			ElapsedFraction(g_peekFadeStart, g_peekHiding ? kPeekFadeOutMs : kPeekFadeInMs) < 1.0f;
+	}
+
+	// 0 = fully invisible, 1 = fully shown, following whichever fade is running.
+	float PeekShownFraction()
+	{
+		if (!g_peekShown)
+			return 0.0f;
+		if (g_peekFadeStart == 0)
+			return 1.0f;
+		const float t = EaseOutCubic(
+			ElapsedFraction(g_peekFadeStart, g_peekHiding ? kPeekFadeOutMs : kPeekFadeInMs));
+		return g_peekHiding ? 1.0f - t : t;
+	}
+
+	BYTE PeekAlpha()
+	{
+		// The HUD rides the same transparency setting as the overlay panel,
+		// so one slider controls how much of the game shows through both.
+		return static_cast<BYTE>(std::clamp(
+			static_cast<int>(TargetOverlayAlpha() * PeekShownFraction() + 0.5f), 0, 255));
+	}
+
+	// Starts a fade that is already `fromShownFraction` of the way there, so
+	// tapping the peek button on and off reverses the fade instead of
+	// restarting it from the far end.
+	void BeginPeekFade(bool out, float fromShownFraction)
+	{
+		g_peekHiding = out;
+		const DWORD duration = out ? kPeekFadeOutMs : kPeekFadeInMs;
+		const float done = out ? 1.0f - fromShownFraction : fromShownFraction;
+		// The fraction is post-easing; invert the ease so the fade resumes at
+		// the brightness it was actually showing rather than jumping.
+		const float linear = 1.0f - std::cbrt(std::clamp(1.0f - done, 0.0f, 1.0f));
+		g_peekFadeStart = GetTickCount() - static_cast<DWORD>(linear * duration);
+		if (g_peekFadeStart == 0)
+			g_peekFadeStart = 1;
+	}
+
+	void PaintPeekWindow(HWND window);
+
+	void ShowPeekWindow()
+	{
+		if (!g_peekWindow || g_app.peekSizeChoice == 0)
+			return;
+		if (g_peekShown && !g_peekHiding)
+			return;
+		if (g_peekShown && g_peekHiding)
+		{
+			// Caught mid-dismiss - turn the fade around in place; the window
+			// is already positioned and its cells are already built.
+			BeginPeekFade(false, PeekShownFraction());
+			PaintPeekWindow(g_peekWindow);
+			return;
+		}
+
+		// Spread across whatever monitor the game is on. The foreground
+		// window is the game in every case that matters here (the picker is
+		// hidden whenever the HUD is up), with the last known one and then
+		// the primary monitor as fallbacks.
+		HWND reference = GetForegroundWindow();
+		if (!reference || reference == g_mainWindow || reference == g_peekWindow)
+		{
+			reference = (g_app.previousForegroundWindow && IsWindow(g_app.previousForegroundWindow))
+				? g_app.previousForegroundWindow
+				: nullptr;
+		}
+		HMONITOR monitor = MonitorFromWindow(reference ? reference : g_peekWindow,
+			MONITOR_DEFAULTTOPRIMARY);
+		MONITORINFO info{};
+		info.cbSize = sizeof(info);
+		if (!GetMonitorInfoW(monitor, &info))
+			return;
+
+		const int width = info.rcMonitor.right - info.rcMonitor.left;
+		const int height = info.rcMonitor.bottom - info.rcMonitor.top;
+		if (width <= 0 || height <= 0)
+			return;
+
+		g_peekCells = ComputePeekCells(width, height);
+		SetWindowPos(g_peekWindow, HWND_TOPMOST, info.rcMonitor.left, info.rcMonitor.top,
+			width, height, SWP_NOACTIVATE);
+
+		g_peekShown = true;
+		BeginPeekFade(false, 0.0f);
+		// The first presented frame has to already be the faded-in one, so
+		// paint before showing rather than after.
+		PaintPeekWindow(g_peekWindow);
+		// SW_SHOWNA, never SW_SHOW: showing this window must not take
+		// activation away from the game.
+		ShowWindow(g_peekWindow, SW_SHOWNA);
+	}
+
+	// `immediate` skips the fade entirely - used when the picker overlay is
+	// coming up (two views of the same pads on screen at once would just look
+	// like a bug) and when the size setting changes underneath the HUD.
+	void HidePeekWindow(bool immediate)
+	{
+		if (!g_peekShown)
+			return;
+		if (immediate)
+		{
+			if (g_peekWindow)
+				ShowWindow(g_peekWindow, SW_HIDE);
+			g_peekShown = false;
+			g_peekHiding = false;
+			g_peekFadeStart = 0;
+			return;
+		}
+		if (g_peekHiding)
+			return;
+		BeginPeekFade(true, PeekShownFraction());
+		PaintPeekWindow(g_peekWindow);
+	}
+
+	// Driven from the tick, so the last frame of the fade is actually
+	// presented before the window disappears.
+	void FinishPeekHide()
+	{
+		if (!g_peekShown || !g_peekHiding || PeekFadeActive())
+			return;
+		HidePeekWindow(true);
+	}
+
+	// The HUD's whole frame: LED halos, the pad surfaces, the LED tint over
+	// them and the occupants on top - the same order, and the same helpers,
+	// the overlay's own pad screens use.
+	void PaintPeekWindow(HWND window)
+	{
+		if (!window)
+			return;
+		RECT client{};
+		GetClientRect(window, &client);
+		const int width = client.right - client.left;
+		const int height = client.bottom - client.top;
+		if (width <= 0 || height <= 0)
+			return;
+
+		// Same off-screen 32bpp top-down DIB + UpdateLayeredWindow present as
+		// Paint uses, and for the same reason: per-pixel alpha is what lets
+		// the pads sit on the game with soft edges and nothing else drawn.
+		// The buffer is kept across frames; at monitor size, rebuilding it
+		// every frame would be several megabytes of churn per second.
+		static HDC s_peekDC = nullptr;
+		static HBITMAP s_peekBitmap = nullptr;
+		static HGDIOBJ s_peekOldBitmap = nullptr;
+		static void* s_peekBits = nullptr;
+		static int s_peekW = 0;
+		static int s_peekH = 0;
+		if (!s_peekDC || s_peekW != width || s_peekH != height)
+		{
+			if (s_peekDC)
+			{
+				SelectObject(s_peekDC, s_peekOldBitmap);
+				DeleteObject(s_peekBitmap);
+				DeleteDC(s_peekDC);
+				s_peekDC = nullptr;
+			}
+			HDC screenDC = GetDC(nullptr);
+			BITMAPINFO info{};
+			info.bmiHeader.biSize = sizeof(info.bmiHeader);
+			info.bmiHeader.biWidth = width;
+			info.bmiHeader.biHeight = -height; // top-down, so row 0 is the top row
+			info.bmiHeader.biPlanes = 1;
+			info.bmiHeader.biBitCount = 32;
+			info.bmiHeader.biCompression = BI_RGB;
+			s_peekBits = nullptr;
+			s_peekDC = CreateCompatibleDC(screenDC);
+			s_peekBitmap = CreateDIBSection(screenDC, &info, DIB_RGB_COLORS, &s_peekBits, nullptr, 0);
+			ReleaseDC(nullptr, screenDC);
+			if (!s_peekDC || !s_peekBitmap)
+			{
+				if (s_peekBitmap)
+					DeleteObject(s_peekBitmap);
+				if (s_peekDC)
+					DeleteDC(s_peekDC);
+				s_peekDC = nullptr;
+				s_peekBitmap = nullptr;
+				s_peekBits = nullptr;
+				return;
+			}
+			s_peekOldBitmap = SelectObject(s_peekDC, s_peekBitmap);
+			s_peekW = width;
+			s_peekH = height;
+		}
+		if (!s_peekBits)
+			return;
+
+		std::memset(s_peekBits, 0, static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
+
+		Gdiplus::Bitmap frame(width, height, width * 4, PixelFormat32bppPARGB,
+			static_cast<BYTE*>(s_peekBits));
+		Gdiplus::Graphics g(&frame);
+		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+		if (g_app.ledMirrorEnabled)
+			DrawLedRegionGlows(g, g_peekCells, 1);
+
+		for (size_t index = 0; index < g_peekCells.size(); ++index)
+		{
+			const RECT& cell = g_peekCells[index];
+			const PadSlot& slot = g_app.padState[index];
+			// No selection or move-source states here: nothing is focused on
+			// a HUD nobody can navigate, so a pad is simply empty or loaded.
+			Gdiplus::Bitmap* pad = RenderPad(static_cast<int>(index), cell,
+				slot.occupied ? PadVisual::Occupied : PadVisual::Idle,
+				slot.occupied ? slot.ringColor : 0, g_app.ledMirrorEnabled);
+			if (pad)
+			{
+				g.DrawImage(pad, static_cast<int>(cell.left) - kPadGlowMargin,
+					static_cast<int>(cell.top) - kPadGlowMargin);
+			}
+		}
+
+		if (g_app.ledMirrorEnabled)
+			DrawLedRegionTint(g, g_peekCells);
+
+		for (size_t index = 0; index < g_peekCells.size(); ++index)
+		{
+			const PadSlot& slot = g_app.padState[index];
+			if (!slot.occupied)
+				continue;
+			const RECT& cell = g_peekCells[index];
+			const int cellWidth = cell.right - cell.left;
+			const int cellHeight = cell.bottom - cell.top;
+			// Same 80%-of-the-shorter-side portrait as the overlay's pads;
+			// the bounds are wider here because the HUD is sized off the
+			// monitor rather than a fixed 900x610 panel.
+			const int diameter = std::clamp(
+				static_cast<int>(std::min(cellWidth, cellHeight) * 0.80f), 32, 512);
+			Gdiplus::Bitmap* portrait = RenderPortrait(slot.portraitResourceId, slot.ringColor,
+				false, diameter);
+			if (portrait)
+			{
+				g.DrawImage(portrait,
+					static_cast<int>(cell.left) + (cellWidth - diameter) / 2 - kPortraitMargin,
+					static_cast<int>(cell.top) + (cellHeight - diameter) / 2 - kPortraitMargin);
+			}
+		}
+
+		POINT source{0, 0};
+		SIZE size{width, height};
+		BLENDFUNCTION blend{AC_SRC_OVER, 0, PeekAlpha(), AC_SRC_ALPHA};
+		UpdateLayeredWindow(window, nullptr, nullptr, &size, s_peekDC, &source,
+			0, &blend, ULW_ALPHA);
+	}
+
+	// Everything the HUD draws comes from pad + LED state, so one cheap
+	// signature over that state says whether a repaint would even look
+	// different. LED intensity is quantized to the same levels the cached
+	// halos use, so a fade only asks for a frame when it actually steps.
+	uint64_t PeekContentSignature()
+	{
+		uint64_t signature = 1469598103934665603ull;
+		const auto mix = [&signature](uint64_t value) {
+			signature = (signature ^ value) * 1099511628211ull;
+		};
+		for (const auto& slot : g_app.padState)
+		{
+			mix(slot.occupied ? 1u : 0u);
+			mix(static_cast<uint64_t>(slot.portraitResourceId));
+			mix(slot.ringColor);
+		}
+		for (const auto& led : g_app.ledRegions)
+		{
+			mix(static_cast<uint64_t>(led.mode));
+			mix((static_cast<uint64_t>(led.curR) << 16) |
+				(static_cast<uint64_t>(led.curG) << 8) | led.curB);
+			mix(static_cast<uint64_t>(std::clamp(
+				static_cast<int>(led.intensity * (kLedIntensityLevels - 1) + 0.5f),
+				0, kLedIntensityLevels - 1)));
+		}
+		mix(g_app.ledMirrorEnabled ? 1u : 0u);
+		return signature;
+	}
+
+	// Called from every controller poll with the buttons currently held down
+	// across all pads. The HUD is strictly a hold: it comes up while the
+	// binding is down and goes away when it is released, and it never
+	// competes with the picker - the overlay being up suppresses it entirely.
+	void UpdatePeekHold(bool anyConnected, ButtonMask heldButtons)
+	{
+		const bool wants = g_app.peekSizeChoice != 0 &&
+			g_app.buttonSneakPeek != 0 &&
+			anyConnected &&
+			!g_app.overlayVisible &&
+			!g_app.capturingShortcut &&
+			g_app.capturingBindingIndex < 0 &&
+			(heldButtons & g_app.buttonSneakPeek) == g_app.buttonSneakPeek;
+		if (wants)
+			ShowPeekWindow();
+		else
+			HidePeekWindow(false);
+	}
+
+	LRESULT CALLBACK PeekWindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+	{
+		// The frame is presented by UpdateLayeredWindow from PaintPeekWindow,
+		// not from a WM_PAINT device context, so painting here only has to
+		// validate the window and re-present the current state.
+		if (message == WM_PAINT)
+		{
+			PAINTSTRUCT paint{};
+			BeginPaint(window, &paint);
+			EndPaint(window, &paint);
+			if (g_peekShown)
+				PaintPeekWindow(window);
+			return 0;
+		}
+		// WS_EX_TRANSPARENT already makes the window click-through; answering
+		// HTTRANSPARENT as well means even a hit test that reaches here
+		// refuses to claim the cursor.
+		if (message == WM_NCHITTEST)
+			return HTTRANSPARENT;
+		return DefWindowProcW(window, message, wParam, lParam);
 	}
 
 	// Capsule menu floating above the selected pad (PadAction) or centered
@@ -7116,6 +7628,12 @@ void PollController(HWND window)
 			if (g_app.overlayVisible)
 				InvalidateRect(window, nullptr, FALSE);
 		}
+
+		// The sneak-peek HUD is a pure function of what is held down right
+		// now, so it is settled before any of the early returns below - in
+		// particular before the capture branches, which would otherwise
+		// leave it stuck on screen for as long as a capture lasts.
+		UpdatePeekHold(anyConnected, combinedButtons);
 
 		// -------------------------------------------------------------
 		// Shortcut capture takes over completely while active.
@@ -8713,6 +9231,29 @@ if (changed)
 				}
 			}
 
+			// The sneak-peek HUD paints on its own window and only when the
+			// frame would differ: while it fades, and otherwise whenever the
+			// pad or LED state it mirrors actually changed. An idle HUD over
+			// a running game therefore costs nothing per tick.
+			if (g_peekShown)
+			{
+				static DWORD lastPeekFrame = 0;
+				static uint64_t lastPeekSignature = 0;
+				const uint64_t signature = PeekContentSignature();
+				if (PeekFadeActive() || signature != lastPeekSignature)
+				{
+					constexpr DWORD kMinPeekFrameMs = 16; // never above ~60fps
+					const DWORD now = GetTickCount();
+					if (now - lastPeekFrame >= kMinPeekFrameMs)
+					{
+						lastPeekFrame = now;
+						lastPeekSignature = signature;
+						PaintPeekWindow(g_peekWindow);
+					}
+				}
+				FinishPeekHide();
+			}
+
 			// The dismiss fade lands here rather than in HideOverlay, so
 			// the last frame of it is actually presented before the
 			// window disappears.
@@ -8729,6 +9270,12 @@ if (changed)
 			return 0;
 		case WM_DESTROY:
 			StopTickThread();
+			if (g_peekWindow)
+			{
+				HidePeekWindow(true);
+				DestroyWindow(g_peekWindow);
+				g_peekWindow = nullptr;
+			}
 			StopUiSounds();
 			UnregisterHotKey(window, kToggleHotkeyId);
 			RemoveTrayIcon(window);
@@ -8881,6 +9428,22 @@ g_app.status = std::to_wstring(embeddedTags) +
 		return 1;
 	}
 	g_mainWindow = window;
+
+	// The sneak-peek HUD's own window. WS_EX_NOACTIVATE keeps it out of the
+	// activation chain (the game never loses focus to it), WS_EX_TRANSPARENT
+	// makes it click-through, and WS_EX_LAYERED is what UpdateLayeredWindow
+	// needs. It is created hidden and sized to a monitor on first use.
+	const wchar_t* peekClassName = L"LegoToypadPeekWindow";
+	WNDCLASSW peekClass{};
+	peekClass.hInstance = instance;
+	peekClass.lpfnWndProc = PeekWindowProcedure;
+	peekClass.lpszClassName = peekClassName;
+	RegisterClassW(&peekClass);
+	g_peekWindow = CreateWindowExW(
+		WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+		peekClassName, L"LEGO Dimensions Toypad Sneak Peek", WS_POPUP,
+		0, 0, 16, 16, nullptr, nullptr, instance, nullptr);
+
 	ApplyOverlayTransparency(window);
 	ApplyWindowCornerRadius(window);
 	AddTrayIcon(window);

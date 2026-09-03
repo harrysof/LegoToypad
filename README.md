@@ -26,6 +26,7 @@ LegoToypad needs an emulator build with the Toypad listener enabled. Grab the on
 - Full tag library built in: all 30 franchises, 78 characters, 240 vehicles
 - Controller-first UI, no mouse needed
 - True Toypad layout: 7 pad slots (3/1/3), with Load / Move / Clear per slot
+- Toypad sneak peek: hold a button to see the pads over the game without pausing it
 - Live Toypad LEDs mirrored from the emulator in real time (off by default)
 - Swappable pad art (skins)
 - Web remote: control the pads from your phone over LAN
@@ -38,6 +39,23 @@ LegoToypad needs an emulator build with the Toypad listener enabled. Grab the on
 2. Pick a pad, then **Load** a franchise/character, **Move** it, or **Clear** it.
 3. The **+** tile at the end of each roster captures a custom tag from the Center pad.
 
+### Toypad sneak peek
+
+Hold **LT** (rebindable) while playing and the seven pads fade in over the game -
+the two side sections in the bottom corners, the center pad up top, so the middle
+of the screen stays clear. Release and they fade away.
+
+Unlike opening the picker, the peek never takes focus and never takes the
+controller: the HUD window is click-through and is never activated, so the game
+keeps running and the held button still reaches it. It is the same pad state the
+picker shows, live - loads, moves, clears and mirrored Toypad LEDs all appear on
+it the moment they happen.
+
+Set it to Off / Small / Medium / Large from **Settings -> Sneak peek**, and rebind
+the hold button from **Settings -> Button - Sneak peek (hold)**. It needs the
+emulator running in windowed or borderless mode; a true exclusive-fullscreen
+window will cover it.
+
 ## Controls
 
 | Input | Action |
@@ -49,6 +67,7 @@ LegoToypad needs an emulator build with the Toypad listener enabled. Grab the on
 | X / M | Pick up the focused pad's figure to move it |
 | RB / L | Load a figure onto the focused pad |
 | LB / C | Clear the focused pad |
+| LT (hold) | Sneak peek: show the pads over the game |
 
 Every binding except the D-pad can be rebound from Settings.
 
