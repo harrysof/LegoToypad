@@ -263,6 +263,43 @@ body {
   z-index: 2;
 }
 
+/* Toypad LED mirror: a soft halo bleeding past the pad's own edges (like the
+   desktop overlay's glow), plus a tint washed over the pad surface itself.
+   Both are driven from JS via --led-color / --led-intensity, polled from
+   /api/leds - see pollLeds() in app.js. */
+.pad .padled {
+  position: absolute;
+  inset: -22%;
+  z-index: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: var(--led-intensity, 0);
+  background: radial-gradient(circle, var(--led-color, transparent) 0%, transparent 72%);
+  filter: blur(3px);
+  transition: opacity 90ms linear;
+  will-change: opacity;
+}
+
+.pad .padledtint {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: var(--led-intensity, 0);
+  background: var(--led-color, transparent);
+  mix-blend-mode: screen;
+  transition: opacity 90ms linear;
+  will-change: opacity;
+}
+
+.pad.center-pad .padled,
+.pad[data-slot="1"] .padled,
+.pad.center-pad .padledtint,
+.pad[data-slot="1"] .padledtint {
+  border-radius: 50% !important;
+}
+
 .pad .padportrait {
   position: absolute;
   left: 50%;

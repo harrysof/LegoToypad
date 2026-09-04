@@ -33,6 +33,14 @@ const PAD_CELLS_PORTRAIT = [
 // Media query that matches portrait orientation (width <= height)
 const portraitMQ = window.matchMedia('(max-aspect-ratio: 1/1)');
 
+// Toypad LED mirror: which pad slots each of the 3 physical LED regions
+// covers - must match kLedRegionSlots in main.cpp (0=left, 1=center, 2=right).
+const LED_REGION_SLOTS = [
+  [0, 3, 4], // left
+  [1],       // center
+  [2, 5, 6], // right
+];
+
 function getPadCells() {
   return portraitMQ.matches ? PAD_CELLS_PORTRAIT : PAD_CELLS_LANDSCAPE;
 }
@@ -183,9 +191,17 @@ function buildPads() {
     pad.style.height = c.h + '%';
     pad.dataset.slot = i;
 
+    const led = document.createElement('div');
+    led.className = 'padled';
+    pad.appendChild(led);
+
     const dot = document.createElement('div');
     dot.className = 'padcdot';
     pad.appendChild(dot);
+
+    const ledTint = document.createElement('div');
+    ledTint.className = 'padledtint';
+    pad.appendChild(ledTint);
 
     const portrait = document.createElement('img');
     portrait.className = 'padportrait';
@@ -633,6 +649,52 @@ async function getState() {
   }
 }
 
+// --- toypad LED mirror -----------------------------------------------------
+// Polled on its own faster loop (not the 3s /api/state one): Flash and Fade
+// need to read as motion, not a slideshow. Backs off to a slow idle check
+// while the desktop app's "Toypad LEDs" setting is off.
+let ledPollTimer = null;
+
+function applyLedState(state) {
+  const regions = (state && state.regions) || [];
+  for (let region = 0; region < LED_REGION_SLOTS.length; region++) {
+    const r = regions[region];
+    const on = state.enabled && r && r.mode !== 'off' && r.intensity > 0.004;
+    const color = on ? r.color : 'transparent';
+    const intensity = on ? r.intensity : 0;
+    for (const slot of LED_REGION_SLOTS[region]) {
+      const pad = pads[slot];
+      if (!pad) continue;
+      pad.style.setProperty('--led-color', color);
+      pad.style.setProperty('--led-intensity', String(intensity));
+    }
+  }
+}
+
+function clearLedState() {
+  for (const pad of pads) {
+    pad.style.setProperty('--led-color', 'transparent');
+    pad.style.setProperty('--led-intensity', '0');
+  }
+}
+
+async function pollLeds() {
+  let next = 2000; // idle check cadence while LEDs are off / unreachable
+  try {
+    const state = await api('/api/leds');
+    applyLedState(state);
+    if (state.enabled) next = 90; // smooth enough for Flash/Fade
+  } catch (e) {
+    clearLedState();
+  }
+  ledPollTimer = setTimeout(pollLeds, next);
+}
+
+function startLedPolling() {
+  if (ledPollTimer) return;
+  pollLeds();
+}
+
 async function post(path, body, successMsg) {
   try {
     const res = await fetch(path, {
@@ -749,6 +811,7 @@ async function boot() {
 
   setScreen('pad');
   await getState();
+  startLedPolling();
   setStatusMessage('Tap a pad to select, double-tap to browse characters');
   setTimeout(() => setLoading(false), 350);
   setInterval(getState, 3000);

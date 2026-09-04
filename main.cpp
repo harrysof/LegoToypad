@@ -103,7 +103,7 @@ constexpr int kOverlayWidth = 900;
 	constexpr DWORD kPeekFadeOutMs = 130;
 	constexpr int kOpacityFloorPercent = 20; // below this the window becomes hard to see
 	constexpr int kSettingsPercentStep = 15;
-	constexpr int kWindowCornerRadius = 6;
+	constexpr int kWindowCornerRadius = 20;
 	// kAppVersion itself now comes from GeneratedAssetTable (generated from
 	// generate_assets.py's APP_VERSION) so the web UI's version string can
 	// never drift from the exe's own FILEVERSION/ProductVersion again.
@@ -342,6 +342,13 @@ constexpr int kOverlayWidth = 900;
 		std::wstring franchise;
 		std::wstring name;
 		bool isVehicle = false;
+		// Which build of a multi-build vehicle this favorite pins - 0 means
+		// "unspecified": either a character (irrelevant), or a favorite
+		// saved before per-variant favoriting existed, which resolves to
+		// build 1 for backward compatibility. A specific vehicle favorited
+		// today always stores its real RosterEntry::buildNumber, so two
+		// builds of the same family can be favorited independently.
+		int buildNumber = 0;
 	};
 
 	struct AppState
@@ -378,10 +385,16 @@ bool swapConfirmBackButtons = false;
 		ButtonMask buttonMoveActive = XINPUT_GAMEPAD_X;
 		ButtonMask buttonQuickLoad = XINPUT_GAMEPAD_RIGHT_SHOULDER;
 		ButtonMask buttonQuickClear = XINPUT_GAMEPAD_LEFT_SHOULDER;
-		// Same physical default as buttonMoveActive (X / Square / Y) - no
-		// conflict, since this only fires on the RosterList screen and
-		// buttonMoveActive only fires on the PadViewer screen.
-		ButtonMask buttonFavorite = XINPUT_GAMEPAD_X;
+		// Same physical default as buttonSettings (Y / Triangle / Y) - no
+		// conflict, since this only fires on the RosterList/PlusPicker
+		// screens and buttonSettings only fires on PadViewer.
+		ButtonMask buttonFavorite = XINPUT_GAMEPAD_Y;
+		// Reorganize: picks a favorite/franchise tile up so the next
+		// navigation + confirm drops it in a new spot. Same physical default
+		// as buttonMoveActive (X / Square / X) - no conflict, disjoint
+		// screens from everything else already on X.
+		ButtonMask buttonReorganizeRoster = XINPUT_GAMEPAD_X;
+		ButtonMask buttonReorganizeFranchise = XINPUT_GAMEPAD_X;
 		// Held (not tapped) to summon the sneak-peek HUD over the game. The
 		// left trigger by default: nothing else in the picker is bound to it,
 		// and LEGO Dimensions itself only uses it for the shoulder-swap, so
@@ -480,6 +493,23 @@ bool swapConfirmBackButtons = false;
 		// True when the franchise grid's logical index 0 (the Favorites
 		// tile) is the focused/open tile, instead of kFranchises[franchiseIndex].
 		bool favoritesTileSelected = false;
+		// Reordering the Favorites roster: pick a tile up (source index into
+		// rosterSlots), navigate to a new spot, drop it there. Only ever
+		// active while browsing the Favorites roster itself.
+		bool reorganizingRoster = false;
+		size_t reorganizeRosterSourceIndex = 0;
+
+		// Custom franchise/world display order, indices into kFranchises.
+		// Defaults to [0, 1, ..., kFranchiseCount-1] (the catalog's own
+		// order); persisted by name under [FranchiseOrder], resolved back to
+		// indices on load - see LoadFranchiseOrderFromIni.
+		std::vector<size_t> franchiseDisplayOrder;
+		// Reordering the franchise grid: same pick-up/move/drop shape as
+		// reorganizingRoster above, but reorganizeFranchiseSourceIndex is a
+		// display slot (0-based over real franchises, the synthetic
+		// Favorites tile excluded).
+		bool reorganizingFranchise = false;
+		size_t reorganizeFranchiseSourceIndex = 0;
 	};
 
 	AppState g_app;
@@ -765,7 +795,7 @@ bool swapConfirmBackButtons = false;
 		return a.scope == b.scope;
 	}
 
-	constexpr std::array<BindableAction, 8> kBindableActions = {{
+	constexpr std::array<BindableAction, 10> kBindableActions = {{
 		{L"Confirm", L"ButtonConfirm", &AppState::buttonConfirm, true, Screen::PadViewer},
 		{L"Back", L"ButtonBack", &AppState::buttonBack, true, Screen::PadViewer},
 		{L"Settings", L"ButtonSettings", &AppState::buttonSettings, false, Screen::PadViewer},
@@ -773,6 +803,10 @@ bool swapConfirmBackButtons = false;
 		{L"Quick load", L"ButtonQuickLoad", &AppState::buttonQuickLoad, false, Screen::PadViewer},
 		{L"Quick clear", L"ButtonQuickClear", &AppState::buttonQuickClear, false, Screen::PadViewer},
 		{L"Add to favorites", L"ButtonFavorite", &AppState::buttonFavorite, false, Screen::RosterList},
+		{L"Reorganize favorites", L"ButtonReorganizeRoster", &AppState::buttonReorganizeRoster, false,
+			Screen::RosterList},
+		{L"Reorganize worlds", L"ButtonReorganizeFranchise", &AppState::buttonReorganizeFranchise, false,
+			Screen::FranchiseList},
 		{L"Sneak peek (hold)", L"ButtonSneakPeek", &AppState::buttonSneakPeek, false,
 			Screen::PadViewer, true},
 	}};
@@ -878,7 +912,7 @@ bool swapConfirmBackButtons = false;
 
 	struct WebJob
 	{
-		enum class Op { State, Catalog, Load, Move, Clear, ClearAll, FavoritesGet, FavoriteToggle } op = Op::State;
+		enum class Op { State, Leds, Catalog, Load, Move, Clear, ClearAll, FavoritesGet, FavoriteToggle } op = Op::State;
 		int a = 0; // slot index for Load/Clear; source slot for Move
 		int b = 0; // bin resource id for Load and FavoriteToggle; destination slot for Move
 		std::string result; // JSON response body, written on the UI thread
@@ -1348,6 +1382,11 @@ void UpdateInputOwnership(HWND window);
 	// bloom+core halo as the pad/tile selection glow (see RenderFocusGlow) so
 	// "you are about to move this" is unmistakable at a glance.
 	constexpr unsigned int kMoveSourceGlow = 0x00FF9D42; // RGB(66, 157, 255)
+	// Reorganize-source highlight: the favorite/franchise tile picked up to
+	// be dropped in a new spot. Yellow, matching the "Moved: ..." status
+	// toast's glow (see DrawStatusToast) so the picked-up tile and the
+	// message explaining it read as the same action.
+	constexpr unsigned int kReorganizeGlow = RGB(255, 210, 60);
 	constexpr unsigned int kPadBorderIdle = 0x00525A6A;
 	constexpr unsigned int kPadBorderOccupied = 0x0060B476;
 	// One selection colour for the pad grid and the franchise grid alike. The
@@ -1641,6 +1680,7 @@ void UpdateInputOwnership(HWND window);
 		RoundedPad,      // pad tiles (14px corners)
 		Circle,          // the round centre pad
 		RoundedTile,     // franchise tiles (12px corners)
+		Pill,            // fully rounded ends (radius = height / 2) - the status toast
 	};
 
 	// Which step of the breath the wall clock is on. Every focused element
@@ -1761,6 +1801,9 @@ void UpdateInputOwnership(HWND window);
 			break;
 		case FocusShape::RoundedPad:
 			AddRoundedRectPath(path, rect, 14.0f);
+			break;
+		case FocusShape::Pill:
+			AddRoundedRectPath(path, rect, std::min(shapeW, shapeH) / 2.0f);
 			break;
 		}
 
@@ -2261,7 +2304,7 @@ void UpdateInputOwnership(HWND window);
 			const Gdiplus::RectF dest((width - drawW) / 2.0f, (height - drawH) / 2.0f, drawW, drawH);
 			g.DrawImage(background, dest);
 		}
-		Gdiplus::SolidBrush overlay(Gdiplus::Color(96, 8, 10, 16));
+		Gdiplus::SolidBrush overlay(Gdiplus::Color(40, 8, 10, 16));
 		g.FillRectangle(&overlay, 0, 0, width, height);
 
 		g_glossCache[key] = bitmap;
@@ -2406,6 +2449,34 @@ void UpdateInputOwnership(HWND window);
 		return RGB(96, 180, 118);
 	}
 
+	// Small filled 5-point star marking an already-favorited tile - drawn as
+	// a vector path (no bundled asset needed) in the top-right corner of a
+	// roster/build-picker portrait.
+	void DrawFavoriteStar(Gdiplus::Graphics& g, float centerX, float centerY, float outerRadius)
+	{
+		constexpr float kInnerRatio = 0.42f;
+		Gdiplus::PointF points[10];
+		for (int i = 0; i < 10; ++i)
+		{
+			const float radius = (i % 2 == 0) ? outerRadius : outerRadius * kInnerRatio;
+			const float angle = -1.57079632679f + i * 3.14159265358979323846f / 5.0f;
+			points[i] = Gdiplus::PointF(centerX + radius * std::cos(angle), centerY + radius * std::sin(angle));
+		}
+		Gdiplus::GraphicsPath path;
+		path.AddPolygon(points, 10);
+		Gdiplus::SolidBrush outline(Gdiplus::Color(220, 20, 22, 28));
+		g.FillPath(&outline, &path); // slightly larger dark base for contrast, see scale below
+		Gdiplus::Matrix shrink;
+		shrink.Translate(centerX, centerY);
+		shrink.Scale(0.78f, 0.78f);
+		shrink.Translate(-centerX, -centerY);
+		Gdiplus::GraphicsPath innerPath;
+		innerPath.AddPolygon(points, 10);
+		innerPath.Transform(&shrink);
+		Gdiplus::SolidBrush star(Gdiplus::Color(255, 255, 205, 60));
+		g.FillPath(&star, &innerPath);
+	}
+
 	void DrawButtonBadge(Gdiplus::Graphics& g, const std::wstring& label,
 		float x, float y, float w, float h, float px)
 	{
@@ -2485,6 +2556,27 @@ void UpdateInputOwnership(HWND window);
 			first = false;
 		}
 		return cursor;
+	}
+
+	// One "<icon> Label" hint, right-aligned so its right edge lands at
+	// rightX - mirrors the built-in Settings hint's layout (see Paint), but
+	// draws the label with the UI font directly since there's no bundled
+	// text-image asset for these. Returns the total width used, so several
+	// hints can stack leftward from the same right edge.
+	float DrawButtonHint(Gdiplus::Graphics& g, ButtonMask mask, const std::wstring& label,
+		float rightX, float centerY, float h)
+	{
+		constexpr float kGap = 8.0f;
+		constexpr float kTextPx = 22.0f;
+		const float buttonW = DrawPadButtonMask(g, mask, 0.0f, 0.0f, h, false);
+		const float textW = MeasureTextWidth(g, label, kTextPx);
+		const float totalW = buttonW + kGap + textW;
+		const float originX = rightX - totalW;
+		DrawPadButtonMask(g, mask, originX, centerY - h / 2.0f, h, true);
+		DrawTextLineCentered(g, label, static_cast<int>(originX + buttonW + kGap),
+			static_cast<int>(centerY - h / 2.0f), static_cast<int>(textW) + 4, RGB(226, 232, 240),
+			static_cast<int>(h));
+		return totalW;
 	}
 
 	std::filesystem::path GetExecutableDirectory()
@@ -2615,7 +2707,11 @@ void UpdateInputOwnership(HWND window);
 			"ButtonMoveActive=16384\n"
 			"ButtonQuickLoad=512\n"
 			"ButtonQuickClear=256\n"
-			"ButtonFavorite=16384\n"
+			"ButtonFavorite=32768\n"
+			"; Reorganize picks a Favorites-roster or franchise-grid tile up so the\n"
+			"; next navigation + Confirm drops it in a new spot.\n"
+			"ButtonReorganizeRoster=16384\n"
+			"ButtonReorganizeFranchise=16384\n"
 			"; Held, not tapped: the sneak-peek HUD is up for exactly as long as\n"
 			"; this button is down. 65536 is LT.\n"
 			"ButtonSneakPeek=65536\n"
@@ -2964,9 +3060,12 @@ void UpdateInputOwnership(HWND window);
 	}
 
 	// Favorites persist as an indexed list under [Favorites]: Count, then
-	// Item0..ItemN-1 each "<0/1 isVehicle>|<franchise>|<name>". Indexed
-	// rather than one key per entry keyed by name, since favorites are
-	// added/removed at runtime and the section needs to shrink cleanly too.
+	// Item0..ItemN-1 each "<0/1 isVehicle>|<franchise>|<name>|<buildNumber>".
+	// Indexed rather than one key per entry keyed by name, since favorites
+	// are added/removed at runtime and the section needs to shrink cleanly
+	// too. buildNumber pins a specific build of a multi-build vehicle so two
+	// builds of the same family can be favorited independently; it's 0 for
+	// characters.
 	void SaveFavoritesToIni()
 	{
 		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
@@ -2980,7 +3079,8 @@ void UpdateInputOwnership(HWND window);
 			const auto& fav = g_app.favorites[i];
 			const std::wstring key = L"Item" + std::to_wstring(i);
 			const std::wstring value =
-				std::wstring(fav.isVehicle ? L"1|" : L"0|") + fav.franchise + L"|" + fav.name;
+				std::wstring(fav.isVehicle ? L"1|" : L"0|") + fav.franchise + L"|" + fav.name +
+				L"|" + std::to_wstring(fav.buildNumber);
 			WritePrivateProfileStringW(L"Favorites", key.c_str(), value.c_str(), iniPath.c_str());
 		}
 	}
@@ -3005,12 +3105,78 @@ void UpdateInputOwnership(HWND window);
 			const size_t secondBar = value.find(L'|', firstBar + 1);
 			if (secondBar == std::wstring::npos)
 				continue;
+			// The buildNumber segment is optional - an ini written before
+			// per-variant favoriting existed simply won't have it, and that
+			// entry resolves to build 1 (see FavoriteEntry::buildNumber).
+			const size_t thirdBar = value.find(L'|', secondBar + 1);
 			FavoriteEntry entry;
 			entry.isVehicle = value.substr(0, firstBar) == L"1";
 			entry.franchise = value.substr(firstBar + 1, secondBar - firstBar - 1);
-			entry.name = value.substr(secondBar + 1);
+			entry.name = thirdBar == std::wstring::npos
+				? value.substr(secondBar + 1)
+				: value.substr(secondBar + 1, thirdBar - secondBar - 1);
+			if (thirdBar != std::wstring::npos)
+			{
+				try { entry.buildNumber = std::stoi(value.substr(thirdBar + 1)); }
+				catch (...) { entry.buildNumber = 0; }
+			}
 			if (!entry.franchise.empty() && !entry.name.empty())
 				g_app.favorites.push_back(std::move(entry));
+		}
+	}
+
+	// Custom franchise/world display order, persisted the same shape as
+	// Favorites but under [FranchiseOrder], each value a franchise name (not
+	// an index - the generated catalog's own indices can shift when it's
+	// regenerated, names are stable). See AppState::franchiseDisplayOrder.
+	void SaveFranchiseOrderToIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		WritePrivateProfileStringW(L"FranchiseOrder", nullptr, nullptr, iniPath.c_str());
+		WritePrivateProfileStringW(L"FranchiseOrder", L"Count",
+			std::to_wstring(g_app.franchiseDisplayOrder.size()).c_str(), iniPath.c_str());
+		for (size_t i = 0; i < g_app.franchiseDisplayOrder.size(); ++i)
+		{
+			const size_t franchiseIndex = g_app.franchiseDisplayOrder[i];
+			if (franchiseIndex >= kFranchiseCount)
+				continue;
+			const std::wstring key = L"Item" + std::to_wstring(i);
+			WritePrivateProfileStringW(L"FranchiseOrder", key.c_str(),
+				kFranchises[franchiseIndex].name.c_str(), iniPath.c_str());
+		}
+	}
+
+	void LoadFranchiseOrderFromIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		g_app.franchiseDisplayOrder.clear();
+		std::vector<bool> used(kFranchiseCount, false);
+		const int count = static_cast<int>(
+			GetPrivateProfileIntW(L"FranchiseOrder", L"Count", 0, iniPath.c_str()));
+		std::array<wchar_t, 256> buffer{};
+		for (int i = 0; i < count; ++i)
+		{
+			const std::wstring key = L"Item" + std::to_wstring(i);
+			GetPrivateProfileStringW(L"FranchiseOrder", key.c_str(), L"", buffer.data(),
+				static_cast<DWORD>(buffer.size()), iniPath.c_str());
+			const std::wstring name = buffer.data();
+			if (name.empty())
+				continue;
+			for (size_t f = 0; f < kFranchiseCount; ++f)
+			{
+				if (used[f] || kFranchises[f].name != name)
+					continue;
+				used[f] = true;
+				g_app.franchiseDisplayOrder.push_back(f);
+				break;
+			}
+		}
+		// Anything not mentioned in the ini (a fresh install, or a franchise
+		// added since the order was saved) is appended in catalog order.
+		for (size_t f = 0; f < kFranchiseCount; ++f)
+		{
+			if (!used[f])
+				g_app.franchiseDisplayOrder.push_back(f);
 		}
 	}
 
@@ -3654,15 +3820,30 @@ void UpdateInputOwnership(HWND window);
 	constexpr size_t kFranchiseCols = 4;
 	constexpr size_t kFranchiseVisibleRows = 4;
 
+	// Display slot (0-based, real franchises only) that franchiseIndex
+	// currently occupies in the user's custom order. Linear search over ~30
+	// entries, called only on input.
+	size_t FindFranchiseDisplaySlot(size_t franchiseIndex)
+	{
+		for (size_t i = 0; i < g_app.franchiseDisplayOrder.size(); ++i)
+		{
+			if (g_app.franchiseDisplayOrder[i] == franchiseIndex)
+				return i;
+		}
+		return 0;
+	}
+
 	void MoveFranchiseSelection(int dx, int dy)
 	{
 		// Logical index 0 is the Favorites tile, prepended before the real
-		// franchises (logical i>=1 maps to kFranchises[i-1]); this keeps the
+		// franchises (logical i>=1 maps to the franchise at display slot
+		// i-1, i.e. kFranchises[franchiseDisplayOrder[i-1]]); this keeps the
 		// existing ragged-last-row wrap math untouched, just over one extra
 		// item.
 		const size_t logicalCount = kFranchiseCount + 1;
 		const size_t rows = (logicalCount + kFranchiseCols - 1) / kFranchiseCols;
-		size_t logicalIndex = g_app.favoritesTileSelected ? 0 : g_app.franchiseIndex + 1;
+		size_t logicalIndex = g_app.favoritesTileSelected
+			? 0 : 1 + FindFranchiseDisplaySlot(g_app.franchiseIndex);
 		size_t row = logicalIndex / kFranchiseCols;
 		size_t col = logicalIndex % kFranchiseCols;
 
@@ -3673,7 +3854,7 @@ void UpdateInputOwnership(HWND window);
 		logicalIndex = row * kFranchiseCols + col;
 		g_app.favoritesTileSelected = (logicalIndex == 0);
 		if (!g_app.favoritesTileSelected)
-			g_app.franchiseIndex = logicalIndex - 1;
+			g_app.franchiseIndex = g_app.franchiseDisplayOrder[logicalIndex - 1];
 
 		// Keep the focused row inside the visible viewport.
 		const int focusedRow = static_cast<int>(row);
@@ -3683,6 +3864,42 @@ void UpdateInputOwnership(HWND window);
 			++g_app.franchiseTopRow;
 		if (g_app.franchiseTopRow < 0)
 			g_app.franchiseTopRow = 0;
+	}
+
+	// Picks up the focused franchise tile so the next navigation + Confirm
+	// drops it in a new spot. The synthetic Favorites tile can't be moved.
+	void BeginFranchiseReorganize()
+	{
+		if (g_app.favoritesTileSelected)
+			return;
+		g_app.reorganizingFranchise = true;
+		g_app.reorganizeFranchiseSourceIndex = FindFranchiseDisplaySlot(g_app.franchiseIndex);
+		g_app.status = L"Reorganizing: " + kFranchises[g_app.franchiseIndex].name + L" - pick a new spot";
+	}
+
+	void DropFranchiseReorder()
+	{
+		const size_t from = g_app.reorganizeFranchiseSourceIndex;
+		const size_t to = g_app.favoritesTileSelected
+			? from : FindFranchiseDisplaySlot(g_app.franchiseIndex);
+		g_app.reorganizingFranchise = false;
+		if (from >= g_app.franchiseDisplayOrder.size() || to >= g_app.franchiseDisplayOrder.size() ||
+			from == to)
+			return;
+
+		const size_t movedFranchise = g_app.franchiseDisplayOrder[from];
+		const std::wstring name = kFranchises[movedFranchise].name;
+		g_app.franchiseDisplayOrder.erase(g_app.franchiseDisplayOrder.begin() + from);
+		g_app.franchiseDisplayOrder.insert(g_app.franchiseDisplayOrder.begin() + to, movedFranchise);
+		SaveFranchiseOrderToIni();
+		g_app.status = L"Moved: " + name;
+	}
+
+	void CancelFranchiseReorder()
+	{
+		g_app.reorganizingFranchise = false;
+		if (g_app.reorganizeFranchiseSourceIndex < g_app.franchiseDisplayOrder.size())
+			g_app.franchiseIndex = g_app.franchiseDisplayOrder[g_app.reorganizeFranchiseSourceIndex];
 	}
 
 	// Roster grid: variable row count, wrapped vertically. The viewport shows
@@ -3696,6 +3913,10 @@ void UpdateInputOwnership(HWND window);
 	constexpr int kRosterSeparatorW = 180;
 	constexpr int kRosterSeparatorH = 6;
 	constexpr int kRosterGridBottomLimit = kOverlayHeight - 28;
+	// Vertical panel/scrollbar margin above the first row and below the
+	// last one. Must clear kFocusGlowMargin (20px, defined further down)
+	// so a focused top- or bottom-row tile's halo stays inside the panel.
+	constexpr int kRosterPanelPadY = 26;
 
 	struct RosterMetrics
 	{
@@ -3708,6 +3929,11 @@ void UpdateInputOwnership(HWND window);
 
 	constexpr RosterMetrics kRosterNormalMetrics{160, 94, 60, 16, 30};
 	constexpr RosterMetrics kRosterCompactMetrics{148, 84, 56, 12, 24};
+	// A world with two full character rows plus a vehicle row (10+ characters
+	// and at least one vehicle) still overflowed the window even at compact
+	// metrics - e.g. DC's roster cut its vehicle row's labels off at the
+	// bottom edge. This tier trims further so that worst case always fits.
+	constexpr RosterMetrics kRosterExtraCompactMetrics{134, 72, 46, 8, 16};
 
 	// Size of the grid's first section - the one above the separator. It holds
 	// the world's characters, then that world's captured custom tags, then the
@@ -3751,6 +3977,19 @@ void UpdateInputOwnership(HWND window);
 		const size_t vehicleCount = g_app.rosterSlots.size() - characterCount;
 		const size_t vehicleRow = row - characterRows;
 		return std::min(kRosterCols, vehicleCount - vehicleRow * kRosterCols);
+	}
+
+	// Horizontal centering offset for one visual row: a row with fewer than
+	// kRosterCols items is centered under the (always full-width) panel
+	// rather than left-anchored - each row independently, since the
+	// character and vehicle sections can each have a different item count
+	// (e.g. 1 character above 2 vehicles), and left-anchoring both under a
+	// single shared offset left the narrower one looking off-center under
+	// the wider one instead of both centered on the panel.
+	int GetRosterRowColumnOffset(size_t row)
+	{
+		const size_t items = GetRosterVisualRowItemCount(row);
+		return static_cast<int>(kRosterCols - items) * kRosterPitchX / 2;
 	}
 
 	struct RosterVisualPosition { size_t row, col; };
@@ -3867,6 +4106,8 @@ void UpdateInputOwnership(HWND window);
 		if (IsRosterSeparatorVisible() &&
 			GetRosterContentBottom(g, kRosterNormalMetrics) > kRosterGridBottomLimit)
 		{
+			if (GetRosterContentBottom(g, kRosterCompactMetrics) > kRosterGridBottomLimit)
+				return kRosterExtraCompactMetrics;
 			return kRosterCompactMetrics;
 		}
 		return kRosterNormalMetrics;
@@ -3885,6 +4126,28 @@ void UpdateInputOwnership(HWND window);
 	int GetRosterContentBottom(Gdiplus::Graphics& g)
 	{
 		return GetRosterContentBottom(g, GetRosterMetrics(g));
+	}
+
+	// Extra top margin added on top of kRosterOriginY when the current
+	// roster's content doesn't need the full budget that constant was tuned
+	// for (a maxed-out 3-row page). Without this, a world with only a
+	// couple of figures still opens with its grid pinned right under the
+	// header - unused space just piles up at the bottom instead. Capped,
+	// and never negative, so a page that already fills the budget is
+	// completely unaffected.
+	constexpr int kRosterMaxOriginShift = 60;
+
+	int GetRosterOriginShift(Gdiplus::Graphics& g, const RosterMetrics& metrics)
+	{
+		const int contentHeight = GetRosterContentBottom(g, metrics) - kRosterOriginY;
+		const int available = kRosterGridBottomLimit - kRosterOriginY;
+		const int slack = available - contentHeight;
+		return std::min(kRosterMaxOriginShift, std::max(0, slack) / 2);
+	}
+
+	int GetRosterOriginShift(Gdiplus::Graphics& g)
+	{
+		return GetRosterOriginShift(g, GetRosterMetrics(g));
 	}
 
 	void MoveRosterSelection(int dx, int dy)
@@ -4131,7 +4394,23 @@ void UpdateInputOwnership(HWND window);
 			const VehicleGroup* group = FindVehicleGroupEntry(fav.franchise.c_str(), fav.name.c_str());
 			if (!group || group->builds.empty())
 				continue;
-			g_app.rosterSlots.push_back({RosterSlot::Kind::Vehicle, &group->builds.front(), group});
+			// buildNumber 0 is a legacy entry saved before per-variant
+			// favoriting existed - resolves to build 1, same as it always
+			// displayed before. Otherwise show the exact build favorited, so
+			// two builds of the same family can appear as separate tiles.
+			const RosterEntry* build = &group->builds.front();
+			if (fav.buildNumber != 0)
+			{
+				for (const auto& candidate : group->builds)
+				{
+					if (candidate.buildNumber == fav.buildNumber)
+					{
+						build = &candidate;
+						break;
+					}
+				}
+			}
+			g_app.rosterSlots.push_back({RosterSlot::Kind::Vehicle, build, group});
 		}
 	}
 
@@ -4198,15 +4477,28 @@ void UpdateInputOwnership(HWND window);
 		return false;
 	}
 
-	// Adds or removes one (franchise, name) favorite, validating it against
-	// the real library first so a bad request (stale ini entry, or a bogus
-	// web request) can never inject a favorite that doesn't resolve to
-	// anything. Returns false (favorites untouched) when validation fails;
+	// Whether (franchise, name, isVehicle, buildNumber) is currently
+	// favorited. Used both by ToggleFavorite's own lookup and by the roster/
+	// build-picker tiles to draw their favorited-star badge.
+	bool IsFavorited(const std::wstring& franchise, const std::wstring& name, bool isVehicle,
+		int buildNumber)
+	{
+		return std::find_if(g_app.favorites.begin(), g_app.favorites.end(), [&](const FavoriteEntry& f) {
+			return f.isVehicle == isVehicle && f.franchise == franchise && f.name == name &&
+				f.buildNumber == buildNumber;
+		}) != g_app.favorites.end();
+	}
+
+	// Adds or removes one (franchise, name, buildNumber) favorite, validating
+	// it against the real library first so a bad request (stale ini entry, or
+	// a bogus web request) can never inject a favorite that doesn't resolve
+	// to anything. Returns false (favorites untouched) when validation fails;
 	// otherwise toggles the entry, persists to the ini, and reports the new
 	// state via favoritedOut. Shared by the roster-screen button binding and
 	// the web remote's /api/favorite endpoint, so both stay in sync.
+	// buildNumber is ignored for characters (always stored as 0).
 	bool ToggleFavorite(const std::wstring& franchise, const std::wstring& name, bool isVehicle,
-		bool& favoritedOut)
+		int buildNumber, bool& favoritedOut)
 	{
 		if (isVehicle)
 		{
@@ -4215,13 +4507,15 @@ void UpdateInputOwnership(HWND window);
 		}
 		else
 		{
+			buildNumber = 0;
 			if (!FindCharacterEntry(franchise.c_str(), name.c_str()))
 				return false;
 		}
 
 		auto& favorites = g_app.favorites;
 		const auto it = std::find_if(favorites.begin(), favorites.end(), [&](const FavoriteEntry& f) {
-			return f.isVehicle == isVehicle && f.franchise == franchise && f.name == name;
+			return f.isVehicle == isVehicle && f.franchise == franchise && f.name == name &&
+				f.buildNumber == buildNumber;
 		});
 		if (it != favorites.end())
 		{
@@ -4230,7 +4524,7 @@ void UpdateInputOwnership(HWND window);
 		}
 		else
 		{
-			favorites.push_back({franchise, name, isVehicle});
+			favorites.push_back({franchise, name, isVehicle, buildNumber});
 			favoritedOut = true;
 		}
 		SaveFavoritesToIni();
@@ -4238,9 +4532,11 @@ void UpdateInputOwnership(HWND window);
 	}
 
 	// Toggles favorite status for whatever roster slot is currently focused.
-	// Characters favorite by name; vehicles favorite by the group's baseName
-	// so the whole multi-build family comes along, matching what the roster
-	// tile itself represents.
+	// Characters favorite by name. A single-build vehicle favorites that one
+	// build. A multi-build vehicle's roster tile ("+") is a no-op here - it
+	// represents the whole family, not one variant, so favoriting a specific
+	// build only happens from inside the build picker (see
+	// ToggleFavoriteForFocusedPlusBuild).
 	void ToggleFavoriteForFocusedRoster()
 	{
 		if (g_app.rosterIndex >= g_app.rosterSlots.size())
@@ -4250,6 +4546,7 @@ void UpdateInputOwnership(HWND window);
 		std::wstring franchise;
 		std::wstring name;
 		bool isVehicle = false;
+		int buildNumber = 0;
 		if (slot.kind == RosterSlot::Kind::Character && slot.entry)
 		{
 			if (!FindFranchiseForCharacter(slot.entry, franchise))
@@ -4258,10 +4555,21 @@ void UpdateInputOwnership(HWND window);
 		}
 		else if (slot.kind == RosterSlot::Kind::Vehicle && slot.group)
 		{
+			// While browsing the Favorites roster this tile already stands
+			// for one specific favorited build (see OpenFavoritesRoster), so
+			// it toggles that exact build even if the family has others.
+			// Anywhere else, a tile with more than one build is the "+"
+			// family tile and isn't favoritable directly.
+			if (slot.group->builds.size() > 1 && !g_app.favoritesTileSelected)
+			{
+				g_app.status = L"Open it to favorite a specific build.";
+				return;
+			}
 			if (!FindFranchiseForVehicleGroup(slot.group, franchise))
 				return;
 			name = slot.group->baseName;
 			isVehicle = true;
+			buildNumber = slot.entry ? slot.entry->buildNumber : 0;
 		}
 		else
 		{
@@ -4269,9 +4577,139 @@ void UpdateInputOwnership(HWND window);
 		}
 
 		bool favorited = false;
-		if (!ToggleFavorite(franchise, name, isVehicle, favorited))
+		if (!ToggleFavorite(franchise, name, isVehicle, buildNumber, favorited))
 			return;
 		g_app.status = (favorited ? L"Added to favorites: " : L"Removed from favorites: ") + name;
+	}
+
+	// Toggles favorite status for the build currently highlighted in the
+	// build picker (Screen::PlusPicker) - the only way to favorite one
+	// specific variant of a multi-build vehicle.
+	void ToggleFavoriteForFocusedPlusBuild()
+	{
+		if (!g_app.plusGroup || g_app.plusBuildIndex >= g_app.plusGroup->builds.size())
+			return;
+		std::wstring franchise;
+		if (!FindFranchiseForVehicleGroup(g_app.plusGroup, franchise))
+			return;
+		const RosterEntry& build = g_app.plusGroup->builds[g_app.plusBuildIndex];
+
+		bool favorited = false;
+		if (!ToggleFavorite(franchise, g_app.plusGroup->baseName, true, build.buildNumber, favorited))
+			return;
+		g_app.status = (favorited ? L"Added to favorites: " : L"Removed from favorites: ") +
+			EntryDisplayName(build);
+	}
+
+	// Identifies which FavoriteEntry a Favorites-roster slot came from, so
+	// reordering can find and move the underlying entry regardless of how
+	// characters/vehicles are interleaved in storage (see ReorderFavorite).
+	bool FavoriteIdentityForRosterSlot(size_t index, std::wstring& franchiseOut, std::wstring& nameOut,
+		bool& isVehicleOut, int& buildNumberOut)
+	{
+		if (index >= g_app.rosterSlots.size())
+			return false;
+		const RosterSlot& slot = g_app.rosterSlots[index];
+		if (slot.kind == RosterSlot::Kind::Character && slot.entry)
+		{
+			if (!FindFranchiseForCharacter(slot.entry, franchiseOut))
+				return false;
+			nameOut = slot.entry->name;
+			isVehicleOut = false;
+			buildNumberOut = 0;
+			return true;
+		}
+		if (slot.kind == RosterSlot::Kind::Vehicle && slot.group && slot.entry)
+		{
+			if (!FindFranchiseForVehicleGroup(slot.group, franchiseOut))
+				return false;
+			nameOut = slot.group->baseName;
+			isVehicleOut = true;
+			buildNumberOut = slot.entry->buildNumber;
+			return true;
+		}
+		return false;
+	}
+
+	// Moves the favorite shown at fromDisplayIndex to land where
+	// toDisplayIndex currently is, shifting the rest - by editing
+	// g_app.favorites directly via the entries' own identity (not by
+	// recomputed index), so it works no matter how characters/vehicles are
+	// interleaved in storage. The Favorites roster is rebuilt afterward.
+	void ReorderFavorite(size_t fromDisplayIndex, size_t toDisplayIndex)
+	{
+		if (fromDisplayIndex == toDisplayIndex)
+			return;
+
+		std::wstring fromFranchise, fromName, toFranchise, toName;
+		bool fromIsVehicle = false, toIsVehicle = false;
+		int fromBuild = 0, toBuild = 0;
+		if (!FavoriteIdentityForRosterSlot(fromDisplayIndex, fromFranchise, fromName, fromIsVehicle, fromBuild) ||
+			!FavoriteIdentityForRosterSlot(toDisplayIndex, toFranchise, toName, toIsVehicle, toBuild))
+			return;
+
+		auto matches = [](const FavoriteEntry& f, const std::wstring& franchise, const std::wstring& name,
+			bool isVehicle, int buildNumber) {
+			return f.isVehicle == isVehicle && f.franchise == franchise && f.name == name &&
+				f.buildNumber == buildNumber;
+		};
+
+		const auto fromIt = std::find_if(g_app.favorites.begin(), g_app.favorites.end(),
+			[&](const FavoriteEntry& f) { return matches(f, fromFranchise, fromName, fromIsVehicle, fromBuild); });
+		if (fromIt == g_app.favorites.end())
+			return;
+		const FavoriteEntry moved = *fromIt;
+		g_app.favorites.erase(fromIt);
+
+		const auto toIt = std::find_if(g_app.favorites.begin(), g_app.favorites.end(),
+			[&](const FavoriteEntry& f) { return matches(f, toFranchise, toName, toIsVehicle, toBuild); });
+		// Moving right/down lands the item just after its target, moving
+		// left/up lands it just before - either way it ends up occupying
+		// the target's display slot and pushes the rest along by one.
+		if (toIt == g_app.favorites.end())
+			g_app.favorites.push_back(moved);
+		else if (fromDisplayIndex < toDisplayIndex)
+			g_app.favorites.insert(toIt + 1, moved);
+		else
+			g_app.favorites.insert(toIt, moved);
+
+		OpenFavoritesRoster();
+		SaveFavoritesToIni();
+	}
+
+	// Picks up whatever roster tile is focused so the next navigation +
+	// Confirm drops it in a new spot. Only meaningful in the Favorites
+	// roster - a real franchise's roster order comes from the game data.
+	void BeginRosterReorganize()
+	{
+		if (!g_app.favoritesTileSelected || g_app.rosterIndex >= g_app.rosterSlots.size())
+			return;
+		g_app.reorganizingRoster = true;
+		g_app.reorganizeRosterSourceIndex = g_app.rosterIndex;
+		const RosterSlot& slot = g_app.rosterSlots[g_app.rosterIndex];
+		const std::wstring name = slot.entry ? slot.entry->name : L"item";
+		g_app.status = L"Reorganizing: " + name + L" - pick a new spot";
+	}
+
+	void DropRosterReorder()
+	{
+		const size_t from = g_app.reorganizeRosterSourceIndex;
+		const size_t to = g_app.rosterIndex;
+		g_app.reorganizingRoster = false;
+		if (from >= g_app.rosterSlots.size() || to >= g_app.rosterSlots.size())
+			return;
+		const RosterSlot& movedSlot = g_app.rosterSlots[from];
+		const std::wstring name = movedSlot.entry ? movedSlot.entry->name : L"item";
+		ReorderFavorite(from, to);
+		// The moved item now sits at the drop target's old display slot.
+		g_app.rosterIndex = std::min(to, g_app.rosterSlots.empty() ? 0 : g_app.rosterSlots.size() - 1);
+		g_app.status = L"Moved: " + name;
+	}
+
+	void CancelRosterReorder()
+	{
+		g_app.reorganizingRoster = false;
+		g_app.rosterIndex = g_app.reorganizeRosterSourceIndex;
 	}
 
 	// Story mode: the four starter-pack figures shown directly on the
@@ -4356,9 +4794,17 @@ void UpdateInputOwnership(HWND window);
 			}
 			break;
 		case Screen::FranchiseList:
-			OpenRosterList();
+			if (g_app.reorganizingFranchise)
+				DropFranchiseReorder();
+			else
+				OpenRosterList();
 			break;
 		case Screen::RosterList:
+			if (g_app.reorganizingRoster)
+			{
+				DropRosterReorder();
+				break;
+			}
 			if (g_app.rosterIndex >= g_app.rosterSlots.size())
 				break;
 			switch (g_app.rosterSlots[g_app.rosterIndex].kind)
@@ -4371,7 +4817,10 @@ void UpdateInputOwnership(HWND window);
 				// A multi-build vehicle shows only its default tile here; the
 				// alternates are revealed in the build picker, which loads the
 				// chosen build. A single-build vehicle loads straight away.
-				if (g_app.rosterSlots[g_app.rosterIndex].group &&
+				// While browsing the Favorites roster the tile already stands
+				// for one specific favorited build (see OpenFavoritesRoster),
+				// so it always loads directly instead of reopening the picker.
+				if (!g_app.favoritesTileSelected && g_app.rosterSlots[g_app.rosterIndex].group &&
 					g_app.rosterSlots[g_app.rosterIndex].group->builds.size() > 1)
 					OpenPlusPicker(*g_app.rosterSlots[g_app.rosterIndex].group);
 				else if (g_app.rosterSlots[g_app.rosterIndex].entry)
@@ -4429,9 +4878,17 @@ void UpdateInputOwnership(HWND window);
 			g_app.screen = Screen::PadViewer;
 			break;
 		case Screen::FranchiseList:
-			g_app.screen = Screen::PadViewer;
+			if (g_app.reorganizingFranchise)
+				CancelFranchiseReorder();
+			else
+				g_app.screen = Screen::PadViewer;
 			break;
 		case Screen::RosterList:
+			if (g_app.reorganizingRoster)
+			{
+				CancelRosterReorder();
+				break;
+			}
 			if (g_app.storyRosterActive)
 			{
 				// The story roster was opened straight from the pad viewer,
@@ -5993,8 +6450,11 @@ void UpdateInputOwnership(HWND window);
 	}
 
 	// Franchise grid layout: 4 columns of large logo tiles, scrolled vertically.
+	// Origin Y sits well clear of the persistent wordmark bar above it
+	// (kTopMargin + kTopBarH = 110) - it used to start at 106, before the
+	// header even ended, crowding the first row against the logo.
 	constexpr int kFranchiseOriginX = 40;
-	constexpr int kFranchiseOriginY = 106;
+	constexpr int kFranchiseOriginY = 128;
 	constexpr int kFranchisePitchX = 210;
 	constexpr int kFranchisePitchY = 108;
 	constexpr int kFranchiseTileW = 190;
@@ -6006,9 +6466,11 @@ void UpdateInputOwnership(HWND window);
 
 	// Right-edge vertical scroll bar (Scroll_Bar.png) shown on scrollable
 	// lists when their content overflows the visible rows. Kept inside the
-	// overlay's right margin, clear of the grid panels.
-	constexpr int kScrollBarW = 14;
-	constexpr int kScrollBarMarginX = 18;
+	// overlay's right margin, clear of the grid panels. Slim enough, and
+	// with enough margin, that it never overlaps the Settings panel's
+	// right edge (kSettingsPanelX mirrored, at kOverlayWidth - 30).
+	constexpr int kScrollBarW = 10;
+	constexpr int kScrollBarMarginX = 16;
 	constexpr int kScrollBarMinThumbH = 22;
 
 	// Capsule (pill) menus.
@@ -6750,6 +7212,11 @@ void UpdateInputOwnership(HWND window);
 			g.DrawImage(panel, panelX, panelY);
 		}
 
+		// One lookup for the whole picker, not per build - every build here
+		// belongs to the same VehicleGroup/franchise.
+		std::wstring franchise;
+		FindFranchiseForVehicleGroup(g_app.plusGroup, franchise);
+
 		const int cell0X = panelX + kPanelPadX;   // left edge of the first cell
 		for (size_t i = 0; i < count; ++i)
 		{
@@ -6765,6 +7232,11 @@ void UpdateInputOwnership(HWND window);
 			// of centre by diam/2 and no longer lines up with its label.
 			if (visual)
 				g.DrawImage(visual, centerX - kPortraitMargin - diam / 2, circleY - kPortraitMargin);
+			if (!franchise.empty() && IsFavorited(franchise, g_app.plusGroup->baseName, true, build.buildNumber))
+			{
+				DrawFavoriteStar(g, static_cast<float>(centerX + diam / 2 - 6),
+					static_cast<float>(circleY + 6), 11.0f);
+			}
 			// The label is centred in its cell (same width the height was
 			// measured at), so it hugs the circle and stays inside the panel.
 			DrawTextWrappedCenteredFit(g, EntryDisplayName(build),
@@ -6803,7 +7275,8 @@ void UpdateInputOwnership(HWND window);
 	void DrawFranchiseGrid(Gdiplus::Graphics& g)
 	{
 		// Logical index 0 is the Favorites tile (custom_bin.png), prepended
-		// before the real franchises; logical i>=1 maps to kFranchises[i-1].
+		// before the real franchises; logical i>=1 maps to the franchise at
+		// display slot i-1 (g_app.franchiseDisplayOrder[i-1]).
 		const size_t logicalCount = kFranchiseCount + 1;
 		const size_t totalRows = (logicalCount + kFranchiseCols - 1) / kFranchiseCols;
 		for (size_t row = 0; row < kFranchiseVisibleRows; ++row)
@@ -6819,10 +7292,12 @@ void UpdateInputOwnership(HWND window);
 				const bool isFavoritesTile = index == 0;
 				const bool focused = isFavoritesTile
 					? g_app.favoritesTileSelected
-					: (!g_app.favoritesTileSelected && (index - 1) == g_app.franchiseIndex);
+					: (!g_app.favoritesTileSelected && g_app.franchiseDisplayOrder[index - 1] == g_app.franchiseIndex);
+				const bool isReorganizeSource = g_app.reorganizingFranchise && !isFavoritesTile &&
+					(index - 1) == g_app.reorganizeFranchiseSourceIndex;
 				const int logoResourceId = isFavoritesTile
 					? kCustomBinIconResourceId
-					: kFranchises[index - 1].logoResourceId;
+					: kFranchises[g_app.franchiseDisplayOrder[index - 1]].logoResourceId;
 				const float scale = focused ? SelectionTapScale() : 1.0f;
 				const float cx = x + kFranchiseTileW / 2.0f;
 				const float cy = y + kFranchiseTileH / 2.0f;
@@ -6832,6 +7307,16 @@ void UpdateInputOwnership(HWND window);
 						kFranchiseTileW, kFranchiseTileH, FocusShape::RoundedTile, kSelectionGlow);
 					DrawImageScaledAbout(g, glow, static_cast<float>(x - kFocusGlowMargin),
 						static_cast<float>(y - kFocusGlowMargin), cx, cy, scale, SelectionGlowAlpha());
+				}
+				// The tile picked up to be reorganized keeps its own yellow
+				// halo at its original spot, same idea as the pad-move
+				// source highlight, while the gold cursor glow above shows
+				// where it would land if dropped now.
+				if (isReorganizeSource)
+				{
+					Gdiplus::Bitmap* glow = RenderFocusGlow(
+						kFranchiseTileW, kFranchiseTileH, FocusShape::RoundedTile, kReorganizeGlow);
+					g.DrawImage(glow, x - kFocusGlowMargin, y - kFocusGlowMargin);
 				}
 				Gdiplus::Bitmap* tile = RenderFranchiseTile(logoResourceId, focused);
 				if (tile)
@@ -6870,7 +7355,7 @@ void UpdateInputOwnership(HWND window);
 
 		const int gridW = static_cast<int>(kRosterCols) * kRosterPitchX;
 		const int x = kRosterOriginX + (gridW - kRosterSeparatorW) / 2;
-		const int y = GetRosterSeparatorY(g, metrics);
+		const int y = GetRosterSeparatorY(g, metrics) + GetRosterOriginShift(g, metrics);
 		DrawRoundedSeparator(g, x, y, kRosterSeparatorW, kRosterSeparatorH);
 	}
 
@@ -6887,6 +7372,11 @@ void UpdateInputOwnership(HWND window);
 		const size_t characterRows = GetRosterCharacterRows();
 		const RosterMetrics metrics = GetRosterMetrics(g);
 		const int vehicleSectionOffset = GetRosterVehicleSectionOffset(g, metrics);
+		// Shift it down when this roster's content is shorter than the
+		// full 3-row budget kRosterOriginY assumes, so a short roster isn't
+		// left pinned right under the header with all the slack dumped at
+		// the bottom.
+		const int originShift = GetRosterOriginShift(g, metrics);
 		DrawRosterCategorySeparator(g, metrics);
 		for (size_t row = 0; row < visibleRows; ++row)
 		{
@@ -6897,8 +7387,9 @@ void UpdateInputOwnership(HWND window);
 					break;
 				const size_t slotIndex = GetRosterIndexAtVisualPosition(visualRow, col);
 				const RosterSlot& slot = g_app.rosterSlots[slotIndex];
-				const int x = kRosterOriginX + static_cast<int>(col) * kRosterPitchX;
-				int y = kRosterOriginY + static_cast<int>(row) * metrics.pitchY;
+				const int x = kRosterOriginX + GetRosterRowColumnOffset(visualRow)
+					+ static_cast<int>(col) * kRosterPitchX;
+				int y = kRosterOriginY + originShift + static_cast<int>(row) * metrics.pitchY;
 				if (visualRow >= characterRows && characterRows > static_cast<size_t>(g_app.rosterTopRow))
 					y += vehicleSectionOffset;
 				const bool focused = slotIndex == g_app.rosterIndex;
@@ -6925,8 +7416,30 @@ void UpdateInputOwnership(HWND window);
 
 				const int circleX = x + (kRosterPitchX - metrics.portraitDiameter) / 2;
 				const int circleY = y;
+				// The tile picked up to be reorganized keeps its own yellow
+				// halo at its original spot while the cursor (gold, drawn as
+				// part of RenderPortrait/RenderPlusTile's own focus state)
+				// shows where it would land if dropped now.
+				if (g_app.reorganizingRoster && slotIndex == g_app.reorganizeRosterSourceIndex)
+				{
+					Gdiplus::Bitmap* glow = RenderFocusGlow(
+						metrics.portraitDiameter, metrics.portraitDiameter, FocusShape::Circle, kReorganizeGlow);
+					g.DrawImage(glow, circleX - kFocusGlowMargin, circleY - kFocusGlowMargin);
+				}
 				if (visual)
 					g.DrawImage(visual, circleX - kPortraitMargin, circleY - kPortraitMargin);
+
+				// Favorited-star badge: only useful while browsing a real
+				// franchise's roster (every tile in the Favorites roster is
+				// trivially favorited already, so it's skipped there).
+				if (!g_app.favoritesTileSelected && slot.kind != RosterSlot::Kind::Plus && slot.entry &&
+					IsFavorited(kFranchises[g_app.franchiseIndex].name,
+						slot.kind == RosterSlot::Kind::Vehicle && slot.group ? slot.group->baseName : slot.entry->name,
+						slot.kind == RosterSlot::Kind::Vehicle, slot.entry->buildNumber))
+				{
+					DrawFavoriteStar(g, static_cast<float>(circleX + metrics.portraitDiameter - 6),
+						static_cast<float>(circleY + 6), 11.0f);
+				}
 
 				const int labelX = x + (kRosterPitchX - kRosterLabelW) / 2;
 				DrawTextWrappedCenteredFit(g, label, labelX, y + metrics.portraitDiameter + 8, kRosterLabelW, metrics.labelH,
@@ -6934,8 +7447,8 @@ void UpdateInputOwnership(HWND window);
 			}
 		}
 
-		const int trackTop = kRosterOriginY - 14;
-		const int trackBottom = GetRosterContentBottom(g, metrics);
+		const int trackTop = kRosterOriginY + originShift - kRosterPanelPadY;
+		const int trackBottom = GetRosterContentBottom(g, metrics) + originShift;
 		DrawScrollBar(g, trackTop, trackBottom, totalRows, kRosterVisibleRows, g_app.rosterTopRow);
 	}
 
@@ -6947,6 +7460,22 @@ void UpdateInputOwnership(HWND window);
 		if (g_app.favoritesTileSelected)
 			return kCustomBinIconResourceId;
 		return kFranchises[g_app.franchiseIndex].logoResourceId;
+	}
+
+	// What kind of thing g_app.status just reported, classified from the
+	// message text itself rather than a separate field - every message this
+	// applies to is a literal string set right alongside it (ToggleFavorite/
+	// ToggleFavoriteForFocused*, DropRosterReorder/DropFranchiseReorder), so
+	// this deliberately doesn't touch the dozens of other g_app.status
+	// call sites - they keep rendering as plain Neutral toasts, unchanged.
+	enum class StatusTone { Neutral, Added, Removed, Moved };
+	StatusTone ClassifyStatusTone(const std::wstring& status)
+	{
+		if (status.rfind(L"Added to favorites:", 0) == 0) return StatusTone::Added;
+		if (status.rfind(L"Removed from favorites:", 0) == 0) return StatusTone::Removed;
+		if (status.rfind(L"Moved:", 0) == 0) return StatusTone::Moved;
+		if (status.rfind(L"Reorganizing:", 0) == 0) return StatusTone::Moved;
+		return StatusTone::Neutral;
 	}
 
 	// The transient "Added to favorites: X" style banner - see
@@ -6973,12 +7502,40 @@ void UpdateInputOwnership(HWND window);
 		const float boxY = height - kToastBottomInset - kToastH;
 		const Gdiplus::RectF box(boxX, boxY, boxW, kToastH);
 
+		const StatusTone tone = ClassifyStatusTone(g_app.status);
+		unsigned int borderColor = RGB(96, 200, 255); // today's plain blue, unchanged for Neutral/Added
+		switch (tone)
+		{
+		case StatusTone::Removed: borderColor = RGB(230, 70, 70); break;
+		case StatusTone::Moved: borderColor = RGB(230, 190, 60); break;
+		default: break;
+		}
+
+		// A genuine soft glow (not just a colored border) for the three
+		// "something happened" tones, same two-pass bloom+core halo as
+		// every other focus glow in the app. Neutral toasts keep today's
+		// plain border-only look - zero visual change for the other status
+		// messages this doesn't apply to.
+		if (tone != StatusTone::Neutral)
+		{
+			// Quantized so a session's worth of differently-sized toasts
+			// doesn't grow the glow bitmap cache one entry per pixel width.
+			constexpr float kWidthBucket = 20.0f;
+			const int glowW = static_cast<int>(std::ceil(boxW / kWidthBucket)) * static_cast<int>(kWidthBucket);
+			Gdiplus::Bitmap* glow = RenderFocusGlow(glowW, static_cast<int>(kToastH), FocusShape::Pill, borderColor);
+			DrawImageWithAlpha(g, glow,
+				Gdiplus::RectF(boxX + (boxW - glowW) / 2.0f - kFocusGlowMargin, boxY - kFocusGlowMargin,
+					static_cast<float>(glow->GetWidth()), static_cast<float>(glow->GetHeight())),
+				alpha);
+		}
+
 		Gdiplus::GraphicsPath path;
 		AddRoundedRectPath(path, box, kToastH / 2.0f);
 
 		Gdiplus::SolidBrush fill(Gdiplus::Color(static_cast<BYTE>(214.0f * alpha), 14, 20, 28));
 		g.FillPath(&fill, &path);
-		Gdiplus::Pen border(Gdiplus::Color(static_cast<BYTE>(150.0f * alpha), 96, 200, 255), 1.5f);
+		Gdiplus::Pen border(Gdiplus::Color(static_cast<BYTE>(150.0f * alpha),
+			GetRValue(borderColor), GetGValue(borderColor), GetBValue(borderColor)), 1.5f);
 		g.DrawPath(&border, &path);
 
 		Gdiplus::Font font = MakeUIFont(kToastFontPx);
@@ -7172,13 +7729,20 @@ case Screen::RosterList:
 			// characters_tile.png: one large translucent panel behind the
 			// whole portrait grid, spanning the roster grid's bounding box
 			// plus a margin on each side. Drawn before the grid so the
-			// portraits sit on top of it.
+			// portraits sit on top of it. The vertical margin (kRosterPanelPadY)
+			// has to clear kFocusGlowMargin (20px) on both edges, or a focused
+			// tile in the first/last row spills its halo past the panel border.
+			// originShift pushes the whole panel down when this roster is
+			// shorter than the full 3-row budget, so it doesn't stay pinned
+			// right under the header (LEGO TOYPAD wordmark) with the leftover
+			// space dumped entirely at the bottom.
+			const int originShift = GetRosterOriginShift(g);
 			const int gridRight = kRosterOriginX + static_cast<int>(kRosterCols) * kRosterPitchX;
-			const int gridBottom = GetRosterContentBottom(g);
+			const int gridBottom = GetRosterContentBottom(g) + originShift;
 			const int panelX = kRosterOriginX - 16;
-			const int panelY = kRosterOriginY - 14;
+			const int panelY = kRosterOriginY + originShift - kRosterPanelPadY;
 			const Gdiplus::RectF panelRect(static_cast<float>(panelX), static_cast<float>(panelY),
-				static_cast<float>(gridRight - panelX + 16), static_cast<float>(gridBottom - panelY + 14));
+				static_cast<float>(gridRight - panelX + 16), static_cast<float>(gridBottom - panelY + kRosterPanelPadY));
 			if (Gdiplus::Bitmap* panel = RenderScaledAsset(
 				kCharactersTileResourceId, static_cast<int>(panelRect.Width), static_cast<int>(panelRect.Height), 14))
 			{
@@ -7229,14 +7793,18 @@ case Screen::RosterList:
 			const int panelW = width - kSettingsPanelX * 2;
 			const size_t visibleRows =
 				std::min(kSettingsVisibleRows, rows.size() - static_cast<size_t>(g_app.settingsTopRow));
-			const int panelH = static_cast<int>(visibleRows) * kSettingsPitch + 24;
+			// 18px of breathing room above the first row and below the last
+			// one (symmetric), rather than the cramped 12px that used to let
+			// the last row's text sit almost on top of the panel's bottom edge.
+			constexpr int kSettingsPanelPad = 18;
+			const int panelH = static_cast<int>(visibleRows) * kSettingsPitch + kSettingsPanelPad * 2;
 			// settings_tile.png if it was bundled; the roster panel art
 			// otherwise, so a build without the new asset still has a panel.
 			const int settingsPanelResource =
 				kSettingsTileResourceId != 0 ? kSettingsTileResourceId : kCharactersTileResourceId;
 			if (Gdiplus::Bitmap* panel = RenderScaledAsset(settingsPanelResource, panelW, panelH, 14))
 			{
-				g.DrawImage(panel, kSettingsPanelX, kSettingsTop - 12);
+				g.DrawImage(panel, kSettingsPanelX, kSettingsTop - kSettingsPanelPad);
 			}
 
 			for (size_t visible = 0; visible < visibleRows; ++visible)
@@ -7380,6 +7948,36 @@ case Screen::RosterList:
 					g.DrawImage(cachedText, textX, hintCenterY - kHintTextH / 2.0f);
 				}
 			}
+		}
+
+		// Roster: "Y  Favorite" hint, same bottom-right corner as the
+		// Settings hint above, with "X  Organize" stacked to its left while
+		// browsing the Favorites roster - the only roster whose order can
+		// be changed (a real franchise's order comes from the game data).
+		if (g_app.screen == Screen::RosterList)
+		{
+			constexpr float kHintBottomInset = 18.0f;
+			constexpr float kHintButtonH = 40.0f;
+			constexpr float kHintStackGap = 20.0f;
+			const float hintCenterY = height - kHintBottomInset - kHintButtonH / 2.0f;
+			float rightEdge = width - kTopMargin;
+			rightEdge -= DrawButtonHint(g, g_app.buttonFavorite, L"Favorite", rightEdge, hintCenterY, kHintButtonH);
+			if (g_app.favoritesTileSelected)
+			{
+				rightEdge -= kHintStackGap;
+				DrawButtonHint(g, g_app.buttonReorganizeRoster, L"Organize", rightEdge, hintCenterY, kHintButtonH);
+			}
+		}
+		// Franchise grid: "X  Organize" hint for reordering worlds, skipped
+		// while the synthetic Favorites tile is focused (nothing to
+		// reorganize from there).
+		else if (g_app.screen == Screen::FranchiseList && !g_app.favoritesTileSelected)
+		{
+			constexpr float kHintBottomInset = 18.0f;
+			constexpr float kHintButtonH = 40.0f;
+			const float hintCenterY = height - kHintBottomInset - kHintButtonH / 2.0f;
+			DrawButtonHint(g, g_app.buttonReorganizeFranchise, L"Organize",
+				width - kTopMargin, hintCenterY, kHintButtonH);
 		}
 
 		DrawStatusToast(g, width, height);
@@ -7806,12 +8404,40 @@ void PollController(HWND window)
 			}
 		}
 
-		// X / Square / Y by default: favorite the focused character or
+		// Y / Triangle / Y by default: favorite the focused character or
 		// vehicle while browsing a roster (including the Favorites roster
-		// itself, so it also doubles as the way to unfavorite something).
-		if (g_app.screen == Screen::RosterList && (combinedPressed & g_app.buttonFavorite))
+		// itself, so it also doubles as the way to unfavorite something), or
+		// the highlighted build while inside the build picker - the only
+		// place a specific variant of a multi-build vehicle can be favorited
+		// (see ToggleFavoriteForFocusedPlusBuild).
+		if (combinedPressed & g_app.buttonFavorite)
 		{
-			ToggleFavoriteForFocusedRoster();
+			if (g_app.screen == Screen::RosterList && !g_app.reorganizingRoster)
+			{
+				ToggleFavoriteForFocusedRoster();
+				changed = true;
+			}
+			else if (g_app.screen == Screen::PlusPicker)
+			{
+				ToggleFavoriteForFocusedPlusBuild();
+				changed = true;
+			}
+		}
+
+		// X / Square / X by default: pick the focused tile up so the next
+		// navigation + Confirm drops it in a new spot. Only meaningful for
+		// the Favorites roster (a real franchise's roster order comes from
+		// the game data) and for real franchise tiles in the world grid.
+		if ((combinedPressed & g_app.buttonReorganizeRoster) && g_app.screen == Screen::RosterList &&
+			g_app.favoritesTileSelected && !g_app.reorganizingRoster)
+		{
+			BeginRosterReorganize();
+			changed = true;
+		}
+		if ((combinedPressed & g_app.buttonReorganizeFranchise) && g_app.screen == Screen::FranchiseList &&
+			!g_app.favoritesTileSelected && !g_app.reorganizingFranchise)
+		{
+			BeginFranchiseReorganize();
 			changed = true;
 		}
 
@@ -8420,6 +9046,38 @@ if (changed)
 		job.ok = true;
 	}
 
+	// The live LED glow for the three pad regions (left/center/right), read
+	// straight off g_app.ledRegions - AdvanceLedAnimation keeps curR/G/B and
+	// intensity current every tick regardless of whether the overlay window
+	// is visible, so this is never stale. Polled far more often than
+	// /api/state (see Web/app.js): Flash and Fade need to read as smooth
+	// motion, not a slideshow.
+	void BuildLedsJson(WebJob& job)
+	{
+		static const char* kLedModeNames[] = { "off", "solid", "flash", "fade" };
+		std::string out = "{\"enabled\":";
+		out += g_app.ledMirrorEnabled ? "true" : "false";
+		out += ",\"regions\":[";
+		for (size_t region = 0; region < g_app.ledRegions.size(); ++region)
+		{
+			if (region != 0)
+				out += ",";
+			const LedRegion& led = g_app.ledRegions[region];
+			char hex[16];
+			::snprintf(hex, sizeof hex, "#%02X%02X%02X", led.curR, led.curG, led.curB);
+			char intensity[16];
+			::snprintf(intensity, sizeof intensity, "%.3f",
+				led.mode == LedMode::Off ? 0.0f : led.intensity);
+			out += "{\"region\":" + std::to_string(region) + ",";
+			out += "\"mode\":\"" + std::string(kLedModeNames[static_cast<size_t>(led.mode)]) + "\",";
+			out += "\"color\":\"" + std::string(hex) + "\",";
+			out += "\"intensity\":" + std::string(intensity) + "}";
+		}
+		out += "]}";
+		job.result = out;
+		job.ok = true;
+	}
+
 	const RosterEntry* FindEntryByBinResource(int binResourceId)
 	{
 		for (size_t franchiseIndex = 0; franchiseIndex < kFranchiseCount; ++franchiseIndex)
@@ -8445,10 +9103,10 @@ if (changed)
 	// the web remote's pad state already carries for whatever is loaded on a
 	// pad, so the "Favorite" button next to Clear can favorite "whatever is
 	// on this pad" without the client needing to separately know its
-	// franchise/name. A vehicle resolves to its whole build group (baseName),
-	// same as everywhere else favorites are keyed.
+	// franchise/name. A vehicle resolves to the exact build loaded
+	// (buildNumberOut), same as everywhere else a specific variant is keyed.
 	bool ResolveFavoriteTargetFromBin(int binResourceId, std::wstring& franchiseOut, std::wstring& nameOut,
-		bool& isVehicleOut)
+		bool& isVehicleOut, int& buildNumberOut)
 	{
 		for (size_t franchiseIndex = 0; franchiseIndex < kFranchiseCount; ++franchiseIndex)
 		{
@@ -8459,6 +9117,7 @@ if (changed)
 					franchiseOut = kFranchises[franchiseIndex].name;
 					nameOut = character.name;
 					isVehicleOut = false;
+					buildNumberOut = 0;
 					return true;
 				}
 			}
@@ -8471,6 +9130,7 @@ if (changed)
 						franchiseOut = kFranchises[franchiseIndex].name;
 						nameOut = vehicle.baseName;
 						isVehicleOut = true;
+						buildNumberOut = build.buildNumber;
 						return true;
 					}
 				}
@@ -8487,6 +9147,9 @@ if (changed)
 		{
 		case WebJob::Op::State:
 			BuildStateJson(job);
+			break;
+		case WebJob::Op::Leds:
+			BuildLedsJson(job);
 			break;
 		case WebJob::Op::Catalog:
 			if (!g_catalogBuilt)
@@ -8559,9 +9222,10 @@ if (changed)
 			std::wstring franchise;
 			std::wstring name;
 			bool isVehicle = false;
+			int buildNumber = 0;
 			bool favorited = false;
-			if (!ResolveFavoriteTargetFromBin(job.b, franchise, name, isVehicle) ||
-				!ToggleFavorite(franchise, name, isVehicle, favorited))
+			if (!ResolveFavoriteTargetFromBin(job.b, franchise, name, isVehicle, buildNumber) ||
+				!ToggleFavorite(franchise, name, isVehicle, buildNumber, favorited))
 			{
 				job.result = ErrJson(L"Nothing on this pad to favorite.");
 				break;
@@ -8683,6 +9347,11 @@ if (changed)
 			else if (request.path == "/api/state")
 			{
 				const std::string body = DispatchWebJob(window, WebJob::Op::State, 0, 0);
+				SendHttpResponse(socket, 200, "OK", body, "application/json; charset=utf-8", false);
+			}
+			else if (request.path == "/api/leds")
+			{
+				const std::string body = DispatchWebJob(window, WebJob::Op::Leds, 0, 0);
 				SendHttpResponse(socket, 200, "OK", body, "application/json; charset=utf-8", false);
 			}
 			else if (request.path == "/api/favorites")
@@ -9383,6 +10052,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	LoadWindowSettingsFromIni();
 	LoadWebSettingsFromIni();
 	LoadFavoritesFromIni();
+	LoadFranchiseOrderFromIni();
 
 	size_t embeddedTags = 0;
 	for (size_t i = 0; i < kFranchiseCount; ++i)
