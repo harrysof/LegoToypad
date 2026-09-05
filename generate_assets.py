@@ -585,6 +585,24 @@ def generate(root: Path, out_dir: Path) -> int:
         else:
             warnings.append("missing action-bar asset: %s" % name)
 
+    # ---- franchise-sort badges ---------------------------------------------
+    # Word-art name plates shown at top-centre of the browse screens, one per
+    # sort mode (Default / User / Starter). Favorites has no name plate - that
+    # roster shows the app wordmark enlarged instead (see DrawSortBadge in
+    # main.cpp).
+    sort_default  = pick_named({"default_sort"}, "default sort badge")
+    sort_user     = pick_named({"user_sort"},    "user sort badge")
+    sort_starter  = pick_named({"starter_sort"}, "starter sort badge")
+    sort_default_sym = symbols.allocate("ASSET_SORT_DEFAULT", sort_default) if sort_default else None
+    sort_user_sym    = symbols.allocate("ASSET_SORT_USER",    sort_user)    if sort_user    else None
+    sort_starter_sym = symbols.allocate("ASSET_SORT_STARTER", sort_starter) if sort_starter else None
+    for name, asset in [("default_sort", sort_default), ("user_sort", sort_user),
+                        ("starter_sort", sort_starter)]:
+        if asset:
+            ascii_ok([str(asset)], warnings)
+        else:
+            warnings.append("missing sort badge asset: %s" % name)
+
     # ---- custom-bin icon ---------------------------------------------------
     # Portrait art stamped on every captured custom tag (Assets/custombins).
     custom_bin_icon = pick_named({"custom_bin", "custombin"}, "custom bin icon")
@@ -888,6 +906,9 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kByHarrysofResourceId;")
     header.append("extern const int kYButtonResourceId;")
     header.append("extern const int kSettingsTextResourceId;")
+    header.append("extern const int kSortDefaultResourceId;")
+    header.append("extern const int kSortUserResourceId;")
+    header.append("extern const int kSortStarterResourceId;")
     header.append("// Single source of truth for the app version shown in the UI (web")
     header.append("// catalog's \"version\" field) - kept in lockstep with APP_VERSION")
     header.append("// below, which also stamps the exe's own FILEVERSION/ProductVersion.")
@@ -939,6 +960,9 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kByHarrysofResourceId = %s;" % (by_harrysof_sym["name"] if by_harrysof_sym else "0"))
     cpp.append("const int kYButtonResourceId = %s;" % (y_button_sym["name"] if y_button_sym else "0"))
     cpp.append("const int kSettingsTextResourceId = %s;" % (settings_text_sym["name"] if settings_text_sym else "0"))
+    cpp.append("const int kSortDefaultResourceId = %s;" % (sort_default_sym["name"] if sort_default_sym else "0"))
+    cpp.append("const int kSortUserResourceId = %s;" % (sort_user_sym["name"] if sort_user_sym else "0"))
+    cpp.append("const int kSortStarterResourceId = %s;" % (sort_starter_sym["name"] if sort_starter_sym else "0"))
     cpp.append("const wchar_t kAppVersion[] = L\"%s\";" % APP_VERSION)
     cpp.append("")
     cpp.append("const int kControllerIconResourceIds[%d][%d] = {"

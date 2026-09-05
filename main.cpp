@@ -373,10 +373,6 @@ constexpr int kOverlayWidth = 900;
 bool swapConfirmBackButtons = false;
 		size_t backgroundIndex = 0;
 		bool capturingShortcut = false;
-		// Story mode: picking a figure skips the series grid entirely and
-		// shows only the starter-pack roster (Batman, Gandalf The Grey,
-		// Wyldstyle, Batmobile), like the game's own story campaign.
-		bool storyMode = false;
 		// Controller bindings for the picker's own actions. Single-button
 		// masks, remappable from the Settings screen, persisted in [Input].
 		ButtonMask buttonConfirm = XINPUT_GAMEPAD_A;
@@ -510,6 +506,19 @@ bool swapConfirmBackButtons = false;
 		// Favorites tile excluded).
 		bool reorganizingFranchise = false;
 		size_t reorganizeFranchiseSourceIndex = 0;
+
+		// How the franchise grid is sorted/filtered on the franchise page.
+		// Cycled with the shoulder buttons (RB/LB, R1/L1, R/L) so the user can
+		// browse all-series / custom / story in real time without touching
+		// Settings. Favorites is reserved for a future mode.
+		enum class FranchiseSort { Default, User, Story, Favorites };
+		FranchiseSort franchiseSort = FranchiseSort::Default;
+		// Effective grid content for the current sort: franchise indices in
+		// display order, excluding the optional Favorites tile. Rebuilt by
+		// RebuildFranchiseDisplay(); franchiseDisplayOrder stays the user's
+		// persisted custom order (used only when sort == User).
+		std::vector<size_t> franchiseDisplayList;
+		bool showFavoritesTile = true;
 	};
 
 	AppState g_app;
@@ -838,7 +847,6 @@ bool swapConfirmBackButtons = false;
 		LedMirror,
 		SoundEffects,
 		SoundVolume,
-		StoryMode,
 		ClearAllPads,
 		WebRemote,
 		ResetDefaults,
@@ -941,6 +949,9 @@ bool swapConfirmBackButtons = false;
 void UpdateInputOwnership(HWND window);
 	void Paint(HWND window);
 	void HideOverlay(HWND window);
+	void OpenBrowseScreen();
+	void OpenStoryRoster();
+	void OpenFavoritesRoster();
 	void BeginShortcutCapture();
 	void CancelShortcutCapture();
 	void BeginBindingCapture(size_t actionIndex);
@@ -2579,6 +2590,27 @@ void UpdateInputOwnership(HWND window);
 		return totalW;
 	}
 
+	// "<LB> <RB> Sort" hint on the left side of the screen, so it stays clear
+	// of the right-aligned Favorite/Organize hints. Both shoulder buttons are
+	// drawn side by side and share a single label, left-aligned at leftX.
+	float DrawButtonHintLeft(Gdiplus::Graphics& g, ButtonMask mask1, ButtonMask mask2,
+		const std::wstring& label, float leftX, float centerY, float h)
+	{
+		constexpr float kIconGap = 5.0f;
+		constexpr float kGap = 8.0f;
+		constexpr float kTextPx = 22.0f;
+		float cursor = leftX;
+		cursor += DrawPadButtonMask(g, mask1, cursor, centerY - h / 2.0f, h, true);
+		cursor += kIconGap;
+		cursor += DrawPadButtonMask(g, mask2, cursor, centerY - h / 2.0f, h, true);
+		cursor += kGap;
+		const float textW = MeasureTextWidth(g, label, kTextPx);
+		DrawTextLineCentered(g, label, static_cast<int>(cursor),
+			static_cast<int>(centerY - h / 2.0f), static_cast<int>(textW) + 4, RGB(226, 232, 240),
+			static_cast<int>(h));
+		return cursor - leftX;
+	}
+
 	std::filesystem::path GetExecutableDirectory()
 	{
 		std::array<wchar_t, 32768> path{};
@@ -2693,9 +2725,10 @@ void UpdateInputOwnership(HWND window);
 			"; is drawn transparent between the UI elements so the game shows through),\n"
 			"; and 2 upwards are the remaining bundled Assets/Wallpapers images.\n"
 			"BackgroundIndex=0\n"
-			"; StoryMode = 1 shows only the starter pack (Batman, Gandalf The Grey,\n"
-			"; Wyldstyle, Batmobile) when picking a figure, skipping the series grid.\n"
-			"StoryMode=0\n"
+			"; FranchiseSort = 0 Default (all worlds, alphabetical), 1 User (custom\n"
+			"; order), 2 Story (starter pack characters/vehicles), 3 Favorites.\n"
+			"; Browsed with the shoulder buttons (RB/LB) on the world screen.\n"
+			"FranchiseSort=0\n"
 			"; Controller bindings for the picker's own actions, as raw XInput button\n"
 			"; values (A=4096, B=8192, X=16384, Y=32768, LB=256, RB=512, LT=65536,\n"
 			"; RT=131072, Start=16, Back=32, stick clicks=64/128). One button per\n"
@@ -2857,11 +2890,6 @@ void UpdateInputOwnership(HWND window);
 		return DescribeControllerMask(confirm);
 	}
 
-	std::wstring DescribeStoryMode()
-	{
-		return g_app.storyMode ? L"Story (starter pack only)" : L"All series";
-	}
-
 	std::wstring DescribeButtonStyle()
 	{
 		if (g_app.buttonStyleChoice != 0)
@@ -2976,8 +3004,8 @@ void UpdateInputOwnership(HWND window);
 			g_app.swapConfirmBackButtons ? L"1" : L"0", iniPath.c_str());
 		WritePrivateProfileStringW(L"Input", L"BackgroundIndex",
 			std::to_wstring(ClampBackgroundIndex(g_app.backgroundIndex)).c_str(), iniPath.c_str());
-		WritePrivateProfileStringW(L"Input", L"StoryMode",
-			g_app.storyMode ? L"1" : L"0", iniPath.c_str());
+		WritePrivateProfileStringW(L"Input", L"FranchiseSort",
+			std::to_wstring(static_cast<int>(g_app.franchiseSort)).c_str(), iniPath.c_str());
 		WritePrivateProfileStringW(L"Input", L"ButtonStyle",
 			ButtonStyleIniValue(g_app.buttonStyleChoice), iniPath.c_str());
 		WritePrivateProfileStringW(L"Input", L"ToypadLeds",
@@ -3005,8 +3033,15 @@ void UpdateInputOwnership(HWND window);
 			GetPrivateProfileIntW(L"Input", L"SwapConfirmBackButtons", 0, iniPath.c_str()) != 0;
 		g_app.backgroundIndex = ClampBackgroundIndex(static_cast<size_t>(
 			GetPrivateProfileIntW(L"Input", L"BackgroundIndex", 0, iniPath.c_str())));
-		g_app.storyMode =
-			GetPrivateProfileIntW(L"Input", L"StoryMode", 0, iniPath.c_str()) != 0;
+		// Franchise grid sort. Clamp into the valid range so a stale/bogus ini
+		// value can never index out of the sort enum.
+		{
+			const int sortVal = GetPrivateProfileIntW(
+				L"Input", L"FranchiseSort", 0, iniPath.c_str());
+			const int maxSort = static_cast<int>(AppState::FranchiseSort::Favorites);
+			g_app.franchiseSort = static_cast<AppState::FranchiseSort>(
+				std::clamp(sortVal, 0, maxSort));
+		}
 		std::array<wchar_t, 32> styleBuffer{};
 		GetPrivateProfileStringW(L"Input", L"ButtonStyle", L"Auto", styleBuffer.data(),
 			static_cast<DWORD>(styleBuffer.size()), iniPath.c_str());
@@ -3178,13 +3213,6 @@ void UpdateInputOwnership(HWND window);
 			if (!used[f])
 				g_app.franchiseDisplayOrder.push_back(f);
 		}
-	}
-
-	void ToggleStoryMode()
-	{
-		g_app.storyMode = !g_app.storyMode;
-		SaveInputSettingsToIni();
-		g_app.status = L"Character selection: " + DescribeStoryMode();
 	}
 
 	void CycleButtonStyle(int direction)
@@ -3578,18 +3606,11 @@ void UpdateInputOwnership(HWND window);
 	// the web remote passes false so it never yanks the desktop UI around.
 	void LoadEntryToSlot(const RosterEntry& entry, size_t slotIndex, bool updateUi)
 	{
-		// A tag is one object: if it's already occupying a different pad,
-		// loading it again relocates it there (a MOVE) instead of silently
-		// duplicating it onto two pads at once.
-		for (size_t i = 0; i < kSlots.size(); ++i)
-		{
-			if (i != slotIndex && g_app.padState[i].occupied &&
-				g_app.padState[i].binResourceId == entry.binResourceId)
-			{
-				MoveSlotToSlot(i, slotIndex, updateUi);
-				return;
-			}
-		}
+		// Always send a plain LOAD, even if the same tag is already tracked on
+		// another pad. Some tags can occupy multiple pads at once, so loading
+		// an already-placed tag duplicates it onto the chosen pad rather than
+		// relocating it there. The listener clears the destination before a
+		// LOAD anyway, so this still overwrites whatever is on that pad.
 
 		std::wstring error;
 		if (!SendLoadResourceToSlot(entry.binResourceId, slotIndex, error))
@@ -3820,14 +3841,105 @@ void UpdateInputOwnership(HWND window);
 	constexpr size_t kFranchiseCols = 4;
 	constexpr size_t kFranchiseVisibleRows = 4;
 
+	// Franchise grid sorting --------------------------------------------------
+	// The grid shows an *effective* display list (franchiseDisplayList) that
+	// depends on the current FranchiseSort, plus a synthetic Favorites tile in
+	// the modes where it makes sense. The user's persisted custom order is kept
+	// separately in franchiseDisplayOrder and only used for the "User" sort.
+	bool IsStarterPackFranchiseName(const std::wstring& name)
+	{
+		return name == L"DC Comics" || name == L"The Lord of the Rings" ||
+			name == L"The LEGO Movie";
+	}
+
+	void RebuildFranchiseDisplay()
+	{
+		g_app.franchiseDisplayList.clear();
+		switch (g_app.franchiseSort)
+		{
+		case AppState::FranchiseSort::User:
+			// The user's own reordered list.
+			g_app.franchiseDisplayList = g_app.franchiseDisplayOrder;
+			g_app.showFavoritesTile = true;
+			break;
+		case AppState::FranchiseSort::Story:
+			// Starter pack only (Batman, Gandalf, Wyldstyle); no Favorites tile.
+			for (size_t i = 0; i < kFranchiseCount; ++i)
+				if (IsStarterPackFranchiseName(kFranchises[i].name))
+					g_app.franchiseDisplayList.push_back(i);
+			g_app.showFavoritesTile = false;
+			break;
+		case AppState::FranchiseSort::Favorites:
+			// Reserved for a later "favorite franchises only" mode; falls back
+			// to the catalog order until that is added.
+			for (size_t i = 0; i < kFranchiseCount; ++i)
+				g_app.franchiseDisplayList.push_back(i);
+			g_app.showFavoritesTile = true;
+			break;
+		case AppState::FranchiseSort::Default:
+		default:
+			// All series, alphabetical (the catalog's own order).
+			for (size_t i = 0; i < kFranchiseCount; ++i)
+				g_app.franchiseDisplayList.push_back(i);
+			g_app.showFavoritesTile = true;
+			break;
+		}
+	}
+
+	std::wstring DescribeFranchiseSort()
+	{
+		switch (g_app.franchiseSort)
+		{
+		case AppState::FranchiseSort::User: return L"User";
+		case AppState::FranchiseSort::Story: return L"Story";
+		case AppState::FranchiseSort::Favorites: return L"Favorites";
+		case AppState::FranchiseSort::Default:
+		default: return L"Default";
+		}
+	}
+
+	// True while the screen is one of the "browse" views that the shoulder
+	// buttons sort: the franchise tile grid, or the Story/Favorites roster.
+	bool IsFranchiseSortBrowseActive()
+	{
+		if (g_app.screen == Screen::FranchiseList)
+			return true;
+		if (g_app.screen == Screen::RosterList)
+			return g_app.storyRosterActive ||
+				(g_app.favoritesTileSelected && g_app.franchiseSort == AppState::FranchiseSort::Favorites);
+		return false;
+	}
+
+	// Cycle the franchise-grid sort. Rebuilds the browse view (grid or the
+	// story/favorites roster) and keeps the focused selection valid.
+	void CycleFranchiseSort(int direction)
+	{
+		const auto modes = {
+			AppState::FranchiseSort::Default,
+			AppState::FranchiseSort::User,
+			AppState::FranchiseSort::Story,
+			AppState::FranchiseSort::Favorites,
+		};
+		const int count = static_cast<int>(modes.size());
+		int idx = 0;
+		for (int i = 0; i < count; ++i)
+			if (*(modes.begin() + i) == g_app.franchiseSort)
+				idx = i;
+		idx = (idx + direction + count) % count;
+		g_app.franchiseSort = *(modes.begin() + idx);
+		SaveInputSettingsToIni();
+		OpenBrowseScreen();
+		g_app.status = L"Sort: " + DescribeFranchiseSort();
+	}
+
 	// Display slot (0-based, real franchises only) that franchiseIndex
-	// currently occupies in the user's custom order. Linear search over ~30
-	// entries, called only on input.
+	// currently occupies in the effective display list. Linear search over
+	// ~30 entries, called only on input.
 	size_t FindFranchiseDisplaySlot(size_t franchiseIndex)
 	{
-		for (size_t i = 0; i < g_app.franchiseDisplayOrder.size(); ++i)
+		for (size_t i = 0; i < g_app.franchiseDisplayList.size(); ++i)
 		{
-			if (g_app.franchiseDisplayOrder[i] == franchiseIndex)
+			if (g_app.franchiseDisplayList[i] == franchiseIndex)
 				return i;
 		}
 		return 0;
@@ -3835,15 +3947,18 @@ void UpdateInputOwnership(HWND window);
 
 	void MoveFranchiseSelection(int dx, int dy)
 	{
-		// Logical index 0 is the Favorites tile, prepended before the real
-		// franchises (logical i>=1 maps to the franchise at display slot
-		// i-1, i.e. kFranchises[franchiseDisplayOrder[i-1]]); this keeps the
-		// existing ragged-last-row wrap math untouched, just over one extra
-		// item.
-		const size_t logicalCount = kFranchiseCount + 1;
+		// The grid shows the effective display list (franchiseDisplayList) plus
+		// an optional Favorites tile at logical index 0. Keeping the existing
+		// ragged-last-row wrap math untouched, just over the extra item when the
+		// tile is present.
+		const size_t realCount = g_app.franchiseDisplayList.size();
+		if (realCount == 0)
+			return;
+		const size_t logicalCount = realCount + (g_app.showFavoritesTile ? 1 : 0);
 		const size_t rows = (logicalCount + kFranchiseCols - 1) / kFranchiseCols;
-		size_t logicalIndex = g_app.favoritesTileSelected
-			? 0 : 1 + FindFranchiseDisplaySlot(g_app.franchiseIndex);
+		size_t logicalIndex = g_app.showFavoritesTile
+			? (g_app.favoritesTileSelected ? 0 : 1 + FindFranchiseDisplaySlot(g_app.franchiseIndex))
+			: FindFranchiseDisplaySlot(g_app.franchiseIndex);
 		size_t row = logicalIndex / kFranchiseCols;
 		size_t col = logicalIndex % kFranchiseCols;
 
@@ -3852,9 +3967,22 @@ void UpdateInputOwnership(HWND window);
 		col = (col + static_cast<size_t>(dx) + lastCol + 1) % (lastCol + 1);
 
 		logicalIndex = row * kFranchiseCols + col;
-		g_app.favoritesTileSelected = (logicalIndex == 0);
-		if (!g_app.favoritesTileSelected)
-			g_app.franchiseIndex = g_app.franchiseDisplayOrder[logicalIndex - 1];
+		if (g_app.showFavoritesTile)
+		{
+			g_app.favoritesTileSelected = (logicalIndex == 0);
+			if (!g_app.favoritesTileSelected)
+			{
+				const size_t slot = logicalIndex - 1;
+				if (slot < g_app.franchiseDisplayList.size())
+					g_app.franchiseIndex = g_app.franchiseDisplayList[slot];
+			}
+		}
+		else
+		{
+			g_app.favoritesTileSelected = false;
+			if (logicalIndex < g_app.franchiseDisplayList.size())
+				g_app.franchiseIndex = g_app.franchiseDisplayList[logicalIndex];
+		}
 
 		// Keep the focused row inside the visible viewport.
 		const int focusedRow = static_cast<int>(row);
@@ -3872,6 +4000,13 @@ void UpdateInputOwnership(HWND window);
 	{
 		if (g_app.favoritesTileSelected)
 			return;
+		// Reordering only makes sense in the custom-order view; in the other
+		// sorts the grid order is fixed, so guide the user instead.
+		if (g_app.franchiseSort != AppState::FranchiseSort::User)
+		{
+			g_app.status = L"Switch to \"Custom order\" (RB/LB) to reorganize worlds.";
+			return;
+		}
 		g_app.reorganizingFranchise = true;
 		g_app.reorganizeFranchiseSourceIndex = FindFranchiseDisplaySlot(g_app.franchiseIndex);
 		g_app.status = L"Reorganizing: " + kFranchises[g_app.franchiseIndex].name + L" - pick a new spot";
@@ -3892,6 +4027,9 @@ void UpdateInputOwnership(HWND window);
 		g_app.franchiseDisplayOrder.erase(g_app.franchiseDisplayOrder.begin() + from);
 		g_app.franchiseDisplayOrder.insert(g_app.franchiseDisplayOrder.begin() + to, movedFranchise);
 		SaveFranchiseOrderToIni();
+		// The active display list is a copy of the user order; refresh it so the
+		// grid reflects the drop immediately.
+		RebuildFranchiseDisplay();
 		g_app.status = L"Moved: " + name;
 	}
 
@@ -4325,12 +4463,43 @@ void UpdateInputOwnership(HWND window);
 
 	void OpenFranchiseList()
 	{
-		g_app.franchiseIndex = 0;
-		// The Favorites tile is logical index 0 in the grid (see
+		RebuildFranchiseDisplay();
+		g_app.franchiseTopRow = 0;
+		if (!g_app.franchiseDisplayList.empty())
+			g_app.franchiseIndex = g_app.franchiseDisplayList[0];
+		// The Favorites tile is logical index 0 in the grid when shown (see
 		// MoveFranchiseSelection/DrawFranchiseGrid) - it's the first tile
 		// shown, so it should also be the one initially focused.
-		g_app.favoritesTileSelected = true;
+		g_app.favoritesTileSelected = g_app.showFavoritesTile;
+		g_app.storyRosterActive = false;
 		g_app.screen = Screen::FranchiseList;
+	}
+
+	// Opens whatever the current franchise sort should show. Default/User show
+	// the franchise tile grid; Story and Favorites show their roster of
+	// characters/vehicles directly instead of tiles.
+	void OpenBrowseScreen()
+	{
+		switch (g_app.franchiseSort)
+		{
+		case AppState::FranchiseSort::Story:
+			OpenStoryRoster();
+			return;
+		case AppState::FranchiseSort::Favorites:
+			g_app.storyRosterActive = false;
+			g_app.favoritesTileSelected = true;
+			OpenFavoritesRoster();
+			g_app.rosterIndex = 0;
+			g_app.rosterTopRow = 0;
+			g_app.plusGroup = nullptr;
+			g_app.screen = Screen::RosterList;
+			return;
+		case AppState::FranchiseSort::Default:
+		case AppState::FranchiseSort::User:
+		default:
+			OpenFranchiseList();
+			return;
+		}
 	}
 
 	const RosterEntry* FindCharacterEntry(const wchar_t* franchiseName, const wchar_t* characterName)
@@ -4772,10 +4941,7 @@ void UpdateInputOwnership(HWND window);
 			switch (static_cast<PadActionKind>(g_app.padActionIndex))
 			{
 			case PadActionKind::Load:
-				if (g_app.storyMode)
-					OpenStoryRoster();
-				else
-					OpenFranchiseList();
+				OpenBrowseScreen();
 				break;
 			case PadActionKind::Clear:
 				ClearSelectedPad();
@@ -4889,11 +5055,13 @@ void UpdateInputOwnership(HWND window);
 				CancelRosterReorder();
 				break;
 			}
-			if (g_app.storyRosterActive)
+			if (g_app.storyRosterActive ||
+				(g_app.favoritesTileSelected && g_app.franchiseSort == AppState::FranchiseSort::Favorites))
 			{
-				// The story roster was opened straight from the pad viewer,
-				// so Back skips the franchise grid on the way out too.
+				// A browse roster (Story / Favorites sort) was opened straight
+				// from the pad viewer, so Back skips the franchise grid.
 				g_app.storyRosterActive = false;
+				g_app.favoritesTileSelected = false;
 				g_app.screen = Screen::PadViewer;
 			}
 			else
@@ -5204,7 +5372,8 @@ void UpdateInputOwnership(HWND window);
 		g_app.shortcutKeyCode = defaults.shortcutKeyCode;
 		g_app.swapConfirmBackButtons = defaults.swapConfirmBackButtons;
 		g_app.backgroundIndex = defaults.backgroundIndex;
-		g_app.storyMode = defaults.storyMode;
+		g_app.franchiseSort = defaults.franchiseSort;
+		RebuildFranchiseDisplay();
 		g_app.buttonStyleChoice = defaults.buttonStyleChoice;
 		g_app.soundEffects = defaults.soundEffects;
 		g_app.padSkinIndex = defaults.padSkinIndex;
@@ -6304,9 +6473,6 @@ void UpdateInputOwnership(HWND window);
 			ToneForSwitch(g_app.soundEffects && soundsAvailable));
 		row(SettingAction::SoundVolume, L"Sound volume", DescribeSoundVolume());
 
-		heading(L"Library");
-		row(SettingAction::StoryMode, L"Character selection", DescribeStoryMode());
-
 		heading(L"Controls");
 		if (g_app.shortcutType == ShortcutType::Controller)
 			row(SettingAction::Shortcut, L"Toggle shortcut", {}, SettingValueTone::Neutral,
@@ -6430,7 +6596,6 @@ void UpdateInputOwnership(HWND window);
 		case SettingAction::LedMirror: ToggleLedMirror(); break;
 		case SettingAction::SoundEffects: ToggleSoundEffects(); break;
 		case SettingAction::SoundVolume: CycleSoundVolume(direction); break;
-		case SettingAction::StoryMode: ToggleStoryMode(); break;
 		case SettingAction::WebRemote: ToggleWebRemote(); break;
 		}
 	}
@@ -7274,10 +7439,13 @@ void UpdateInputOwnership(HWND window);
 
 	void DrawFranchiseGrid(Gdiplus::Graphics& g)
 	{
-		// Logical index 0 is the Favorites tile (custom_bin.png), prepended
-		// before the real franchises; logical i>=1 maps to the franchise at
-		// display slot i-1 (g_app.franchiseDisplayOrder[i-1]).
-		const size_t logicalCount = kFranchiseCount + 1;
+		// Logical index 0 is the Favorites tile (custom_bin.png) when shown;
+		// logical i>=1 (or i>=0 without the tile) maps to the franchise at
+		// display slot of the current sort's franchiseDisplayList.
+		const size_t realCount = g_app.franchiseDisplayList.size();
+		const size_t logicalCount = realCount + (g_app.showFavoritesTile ? 1 : 0);
+		if (logicalCount == 0)
+			return;
 		const size_t totalRows = (logicalCount + kFranchiseCols - 1) / kFranchiseCols;
 		for (size_t row = 0; row < kFranchiseVisibleRows; ++row)
 		{
@@ -7289,15 +7457,18 @@ void UpdateInputOwnership(HWND window);
 					break;
 				const int x = kFranchiseOriginX + static_cast<int>(col) * kFranchisePitchX;
 				const int y = kFranchiseOriginY + static_cast<int>(row) * kFranchisePitchY;
-				const bool isFavoritesTile = index == 0;
+				const bool isFavoritesTile = g_app.showFavoritesTile && index == 0;
+				const size_t slot = g_app.showFavoritesTile ? (index - 1) : index;
+				const bool inRange = slot < g_app.franchiseDisplayList.size();
 				const bool focused = isFavoritesTile
 					? g_app.favoritesTileSelected
-					: (!g_app.favoritesTileSelected && g_app.franchiseDisplayOrder[index - 1] == g_app.franchiseIndex);
+					: (!g_app.favoritesTileSelected && inRange &&
+						g_app.franchiseDisplayList[slot] == g_app.franchiseIndex);
 				const bool isReorganizeSource = g_app.reorganizingFranchise && !isFavoritesTile &&
-					(index - 1) == g_app.reorganizeFranchiseSourceIndex;
+					inRange && slot == g_app.reorganizeFranchiseSourceIndex;
 				const int logoResourceId = isFavoritesTile
 					? kCustomBinIconResourceId
-					: kFranchises[g_app.franchiseDisplayOrder[index - 1]].logoResourceId;
+					: kFranchises[g_app.franchiseDisplayList[slot]].logoResourceId;
 				const float scale = focused ? SelectionTapScale() : 1.0f;
 				const float cx = x + kFranchiseTileW / 2.0f;
 				const float cy = y + kFranchiseTileH / 2.0f;
@@ -7547,6 +7718,105 @@ void UpdateInputOwnership(HWND window);
 		g.DrawString(g_app.status.c_str(), -1, &font, box, &format, &textBrush);
 	}
 
+	// The franchise-sort name badge at top-centre of the browse screens, sitting
+	// inline with the LEGO TOYPAD wordmark (top-left) and the "by harrysof"
+	// credit (top-right). Default/User/Story draw their sort name as word-art
+	// inside a high-radius pill with a coloured glow and a matching outline -
+	// white for Default, red for User, blue for the Story (starter) roster.
+	// Favorites has no name art, so that roster shows the custom_bin icon
+	// (custom_bin.png) enlarged instead of a name plate.
+	void DrawSortBadge(Gdiplus::Graphics& g, int width)
+	{
+		constexpr float kBadgeH = 62.0f;
+		constexpr float kBadgePadX = 26.0f;
+		constexpr float kBadgePadY = 8.0f;
+		constexpr float kMaxBadgeW = 300.0f;
+		// Top-aligned in the header band (same y as the world logo it replaces),
+		// with the pill bottom clear of the roster panel that starts at y=94.
+		constexpr float kBadgeTop = 24.0f;
+
+		// Favorites: no name plate - show the custom_bin icon enlarged, centred.
+		// This roster can be reached either by cycling to the Favorites sort or
+		// by confirming the Favorites tile on the grid, so the check is on the
+		// roster screen state rather than the sort value. The story roster
+		// never shows it (its name plate is "Starter"), and `favoritesTileSelected`
+		// can be stale there, so the story guard wins.
+		if (g_app.screen == Screen::RosterList && g_app.favoritesTileSelected && !g_app.storyRosterActive)
+		{
+			Gdiplus::Bitmap* favLogo = GetAssetBitmap(kCustomBinIconResourceId);
+			if (!favLogo)
+				return;
+			const Gdiplus::RectF box((width - 90.0f) / 2.0f, kBadgeTop, 90.0f, 66.0f);
+			const float scale = std::min(
+				box.Width / favLogo->GetWidth(), box.Height / favLogo->GetHeight());
+			const int drawW = static_cast<int>(favLogo->GetWidth() * scale);
+			const int drawH = static_cast<int>(favLogo->GetHeight() * scale);
+			if (Gdiplus::Bitmap* cached = RenderScaledAsset(
+				kCustomBinIconResourceId, drawW, drawH, 0))
+				g.DrawImage(cached, box.X + (box.Width - drawW) / 2.0f,
+					box.Y + (box.Height - drawH) / 2.0f);
+			return;
+		}
+
+		int nameResId = 0;
+		unsigned int glowColor = 0;
+		switch (g_app.franchiseSort)
+		{
+		case AppState::FranchiseSort::User:
+			nameResId = kSortUserResourceId;
+			glowColor = RGB(255, 64, 64);   // red
+			break;
+		case AppState::FranchiseSort::Story:
+			nameResId = kSortStarterResourceId;
+			glowColor = RGB(66, 157, 255);  // blue
+			break;
+		case AppState::FranchiseSort::Default:
+		default:
+			nameResId = kSortDefaultResourceId;
+			glowColor = RGB(240, 244, 250); // white
+			break;
+		}
+
+		Gdiplus::Bitmap* nameArt = GetAssetBitmap(nameResId);
+		if (!nameArt)
+			return;
+
+		const float scale = std::min(
+			(kMaxBadgeW - kBadgePadX * 2.0f) / nameArt->GetWidth(),
+			(kBadgeH - kBadgePadY * 2.0f) / nameArt->GetHeight());
+		const float artW = nameArt->GetWidth() * scale;
+		const float artH = nameArt->GetHeight() * scale;
+		const float badgeW = artW + kBadgePadX * 2.0f;
+		const float badgeX = (width - badgeW) / 2.0f;
+		const float badgeY = kBadgeTop;
+		const Gdiplus::RectF badge(badgeX, badgeY, badgeW, kBadgeH);
+
+		// Soft halo of the pill outline in the sort's own colour.
+		if (Gdiplus::Bitmap* glow = RenderFocusGlow(
+			static_cast<int>(badgeW), static_cast<int>(kBadgeH), FocusShape::Pill, glowColor))
+		{
+			g.DrawImage(glow, badgeX - kFocusGlowMargin, badgeY - kFocusGlowMargin);
+		}
+
+		// Translucent pill body.
+		Gdiplus::GraphicsPath path;
+		AddRoundedRectPath(path, badge, kBadgeH / 2.0f);
+		Gdiplus::SolidBrush fill(Gdiplus::Color(214, 14, 20, 28));
+		g.FillPath(&fill, &path);
+
+		// Crisp outline in the sort's colour.
+		Gdiplus::Pen border(Gdiplus::Color(235, GetRValue(glowColor),
+			GetGValue(glowColor), GetBValue(glowColor)), 2.5f);
+		g.DrawPath(&border, &path);
+
+		// The sort name word-art, centred inside the pill.
+		if (Gdiplus::Bitmap* cachedArt = RenderScaledAsset(
+			nameResId, static_cast<int>(artW), static_cast<int>(artH), 0))
+		{
+			g.DrawImage(cachedArt, badgeX + kBadgePadX, badgeY + (kBadgeH - artH) / 2.0f);
+		}
+	}
+
 	void Paint(HWND window)
 	{
 		// Top-left wordmark and the "by harrysof" marker (top-right) share a
@@ -7703,12 +7973,23 @@ void UpdateInputOwnership(HWND window);
 			break;
 		case Screen::FranchiseList:
 			DrawFranchiseGrid(g);
+			DrawSortBadge(g, width);
 			break;
-case Screen::RosterList:
+		case Screen::RosterList:
 		{
 			// The current world's logo at top-center, above the roster grid.
-			// The story roster spans several worlds, so it has no logo header.
-			if (!g_app.storyRosterActive)
+			// The story roster spans several worlds, so it shows the "Starter"
+			// sort badge instead; the Favorites roster shows the app wordmark
+			// enlarged (both via DrawSortBadge).
+			if (g_app.storyRosterActive)
+			{
+				DrawSortBadge(g, width);
+			}
+			else if (g_app.favoritesTileSelected)
+			{
+				DrawSortBadge(g, width);
+			}
+			else
 			{
 				const Gdiplus::RectF box((width - 360.0f) / 2.0f, 24.0f, 360.0f, 62.0f);
 				Gdiplus::Bitmap* worldLogo = GetAssetBitmap(CurrentRosterWorldLogoResourceId());
@@ -7967,17 +8248,28 @@ case Screen::RosterList:
 				rightEdge -= kHintStackGap;
 				DrawButtonHint(g, g_app.buttonReorganizeRoster, L"Organize", rightEdge, hintCenterY, kHintButtonH);
 			}
+			// Story/Favorites browse rosters can also change the sort; the sort
+			// hint sits on the left so it stays clear of Favorite/Organize.
+			if (IsFranchiseSortBrowseActive())
+				DrawButtonHintLeft(g, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER,
+					L"Sort", kTopMargin, hintCenterY, kHintButtonH);
 		}
-		// Franchise grid: "X  Organize" hint for reordering worlds, skipped
-		// while the synthetic Favorites tile is focused (nothing to
-		// reorganize from there).
-		else if (g_app.screen == Screen::FranchiseList && !g_app.favoritesTileSelected)
+		// Franchise grid: "X  Organize" hint on the right (only in the custom
+		// order view; the synthetic Favorites tile has nothing to reorganize
+		// from), with the "LB/RB  Sort" hint on the left.
+		else if (g_app.screen == Screen::FranchiseList)
 		{
 			constexpr float kHintBottomInset = 18.0f;
 			constexpr float kHintButtonH = 40.0f;
 			const float hintCenterY = height - kHintBottomInset - kHintButtonH / 2.0f;
-			DrawButtonHint(g, g_app.buttonReorganizeFranchise, L"Organize",
-				width - kTopMargin, hintCenterY, kHintButtonH);
+			DrawButtonHintLeft(g, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER,
+				L"Sort", kTopMargin, hintCenterY, kHintButtonH);
+			if (g_app.franchiseSort == AppState::FranchiseSort::User && !g_app.favoritesTileSelected)
+			{
+				const float rightEdge = width - kTopMargin;
+				DrawButtonHint(g, g_app.buttonReorganizeFranchise, L"Organize",
+					rightEdge, hintCenterY, kHintButtonH);
+			}
 		}
 
 		DrawStatusToast(g, width, height);
@@ -8373,6 +8665,14 @@ void PollController(HWND window)
 			changed = true;
 		}
 
+		// True for the rest of this tick once Quick load has just opened the
+		// browse screen. Quick load uses the same shoulder button that cycles
+		// the sort on the browse screen (RB by default), so without this guard
+		// a single press would both open the browse view AND jump the sort
+		// forward in the same tick. Quick load should only open the browse
+		// view; sorting stays a separate press while already browsing.
+		bool quickLoadJustOpened = false;
+
 		// One-press pad shortcuts, all acting on the focused (active) pad
 		// cell of the pad viewer. Suppressed while a Move destination is
 		// being picked so they can't yank that flow out from underneath.
@@ -8387,10 +8687,8 @@ void PollController(HWND window)
 			if (combinedPressed & g_app.buttonQuickLoad)
 			{
 				// RB by default: straight into figure selection for this cell.
-				if (g_app.storyMode)
-					OpenStoryRoster();
-				else
-					OpenFranchiseList();
+				OpenBrowseScreen();
+				quickLoadJustOpened = true;
 				changed = true;
 			}
 			if (combinedPressed & g_app.buttonQuickClear)
@@ -8439,6 +8737,26 @@ void PollController(HWND window)
 		{
 			BeginFranchiseReorganize();
 			changed = true;
+		}
+
+		// Shoulder buttons on the browse screen cycle the sort mode
+		// (RB/LB on Xbox, R1/L1 on PS, R/L on Switch). Quick load/clear only
+		// run on the pad viewer, so both shoulders are free here. Works on the
+		// franchise grid AND the Story/Favorites browse rosters. Skipped in
+		// the same tick a Quick load just opened the browse screen, so that
+		// press only navigates and never also advances the sort.
+		if (IsFranchiseSortBrowseActive() && !g_app.reorganizingFranchise && !quickLoadJustOpened)
+		{
+			if (combinedPressed & XINPUT_GAMEPAD_RIGHT_SHOULDER)
+			{
+				CycleFranchiseSort(+1);
+				changed = true;
+			}
+			else if (combinedPressed & XINPUT_GAMEPAD_LEFT_SHOULDER)
+			{
+				CycleFranchiseSort(-1);
+				changed = true;
+			}
 		}
 
 		// Screens navigated in two dimensions.
@@ -9622,12 +9940,7 @@ if (changed)
 				break;
 			case 'L':
 				if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
-				{
-					if (g_app.storyMode)
-						OpenStoryRoster();
-					else
-						OpenFranchiseList();
-				}
+					OpenBrowseScreen();
 				break;
 			case 'C':
 				if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
@@ -10053,6 +10366,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	LoadWebSettingsFromIni();
 	LoadFavoritesFromIni();
 	LoadFranchiseOrderFromIni();
+	RebuildFranchiseDisplay();
 
 	size_t embeddedTags = 0;
 	for (size_t i = 0; i < kFranchiseCount; ++i)

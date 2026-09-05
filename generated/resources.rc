@@ -5,8 +5,8 @@
 // RCDATA payloads below are the embedded asset payloads.
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,5,0,0
- PRODUCTVERSION 1,5,0,0
+ FILEVERSION 1,8,0,0
+ PRODUCTVERSION 1,8,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -18,12 +18,12 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "HarrysofXD"
-            VALUE "FileDescription", "Controller-driven LEGO Dimensions Toypad companion for Cemu and Rpcs3"
-            VALUE "FileVersion", "1.5.0"
+            VALUE "FileDescription", "Controller-driven LEGO Dimensions Toypad companion for Cemu, RPCS3, shadPS4 and Xenia"
+            VALUE "FileVersion", "1.8.0"
             VALUE "InternalName", "LegoToypad"
             VALUE "OriginalFilename", "LegoToypad.exe"
             VALUE "ProductName", "LegoToypad"
-            VALUE "ProductVersion", "1.5.0"
+            VALUE "ProductVersion", "1.8.0"
         END
     END
     BLOCK "VarFileInfo"
@@ -744,6 +744,9 @@ ASSET_SCROLL_BAR RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\Leg
 ASSET_BY_HARRYSOF RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\Branding\\by_harrysof.png"
 ASSET_Y_BUTTON RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\Buttons\\Y_button.png"
 ASSET_SETTINGS_TEXT RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\Buttons\\Settings_text.png"
+ASSET_SORT_DEFAULT RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\Branding\\Default_sort.png"
+ASSET_SORT_USER RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\Branding\\User_sort.png"
+ASSET_SORT_STARTER RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\Branding\\Starter_sort.png"
 ASSET_CUSTOM_BIN_ICON RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\custombins\\custom_bin.png"
 ASSET_SFX_NAVIGATE RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\SFX\\Navigate.wav"
 ASSET_SFX_SELECT RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\SFX\\Select.wav"
