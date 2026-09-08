@@ -35,7 +35,7 @@ LegoToypad needs an emulator build with the Toypad listener enabled. Grab the on
 
 ## Using the app
 
-1. Launch the exe - it sits in the tray until you toggle it (default: controller **Back**).
+1. Launch the exe - it sits in the tray until you toggle it (default: **Ctrl+L**, so it works with no controller plugged in).
 2. Pick a pad, then **Load** a franchise/character, **Move** it, or **Clear** it.
 
 ### Toypad sneak peek
@@ -66,9 +66,32 @@ window will cover it.
 | X / M | Pick up the focused pad's figure to move it |
 | RB / L | Load a figure onto the focused pad |
 | LB / C | Clear the focused pad |
+| RB / LB | Cycle the franchise sort (world grid / browse rosters) |
 | LT (hold) | Sneak peek: show the pads over the game |
 
 Every binding except the D-pad can be rebound from Settings.
+
+### Keyboard controls
+
+The whole picker is usable with just a keyboard - no controller required. Open
+**Settings -> Keyboard layout** for a visual diagram of every key.
+
+| Key | Action |
+|---|---|
+| **Ctrl + L** | Show / hide the picker (global toggle, always active) |
+| Arrow keys | Move selection |
+| Enter | Confirm |
+| Esc | Back |
+| S | Settings |
+| M | Move the focused pad's figure |
+| L | Load a figure onto the focused pad |
+| C | Clear the focused pad |
+| G | Toggle the LED demo |
+| `[` / `]` | Previous / next franchise sort (on the world grid / browse rosters) |
+
+Ctrl+L is the default toggle and stays active even after you set a controller
+shortcut, so both work at once. Change the toggle from **Settings -> Toggle
+shortcut**.
 
 ## Setup
 

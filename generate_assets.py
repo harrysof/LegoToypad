@@ -91,6 +91,54 @@ def ring_color_for(resource_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Display-name overrides
+# ---------------------------------------------------------------------------
+# Maps the name as it appears in the source data (the character .bin stem, or
+# the vehicle build / family name parsed from the file stem or vehicles.csv) to
+# the name shown in the app. Applied to both the character/vehicle build names
+# and the vehicle group base (family) so the roster, build picker, favorites
+# and the web catalog all agree. Resource ids are unchanged - these only alter
+# the label text, never the tag payloads.
+NAME_OVERRIDES = {
+    # Characters
+    "Finn the Human": "Finn",
+    "Jake the Dog": "Jake",
+    "Marceline the Vampire Queen": "Marceline",
+    "Beetle Juice": "Betelgeuse",
+    "Joker": "The Joker",
+    "Twelfth Doctor": "The Doctor",
+    "Lord Voldemort": "Voldemort",
+    "Owen Grady": "Owen",
+    "Gandalf The Grey": "Gandalf",
+    "Unkitty": "Unikitty",
+    "Wicked Witch of the West": "Wicked Witch",
+    # Vehicles / gadgets
+    "Phychic Submarine": "Psychic Submarine",
+    "Dogmo": "DOGMO",
+    "Snakemo": "SNAKEMO",
+    "Flyin Time Train": "Flying Time Train",
+    "Saturns Sandworm": "Saturn's Sandworm",
+    "Bane's Drill Diver": "Drill Driver",
+    "The Joker's Lock 'n' Laser Jet": "Lock 'n' Laser Jet",
+    "Superman's Hover Pod": "Hover Pod",
+    "Ktypton Striker": "Krypton Striker",
+    "Wonderwoman's Invisible Jet": "Invisible Jet",
+    "Ghost Stun 'm' Trap": "Ghost Stun 'n' Trap",
+    "Blue Typhon": "Blue Typhoon",
+    "One Eyed Willy Pirate Ship": "One-Eyed Willy's Pirate Ship",
+    "Benny Spaceship": "Benny's Spaceship",
+    "Emmet Excavator": "Emmet's Excavator",
+    "Destruct-O-Mech": "Destruct-o-Mech",
+    "Taunt-O-Vision": "Taunt-o-Vision",
+    "Canon Bike": "Cannon Bike",
+}
+
+
+def display_name(name: str) -> str:
+    return NAME_OVERRIDES.get(name, name)
+
+
+# ---------------------------------------------------------------------------
 # Resource naming
 # ---------------------------------------------------------------------------
 
@@ -348,7 +396,7 @@ def generate(root: Path, out_dir: Path) -> int:
             if portrait:
                 ascii_ok([str(binary), str(portrait)], warnings)
             characters.append({
-                "name": binary.stem,
+                "name": display_name(binary.stem),
                 "bin": bin_sym,
                 "png": png_sym,
                 "build": 0,
@@ -380,10 +428,10 @@ def generate(root: Path, out_dir: Path) -> int:
             group_key = (owner_key, family.casefold())
             group = veh_groups.get(group_key)
             if group is None:
-                group = {"character": owner or "", "base": family, "builds": []}
+                group = {"character": owner or "", "base": display_name(family), "builds": []}
                 veh_groups[group_key] = group
             group["builds"].append({
-                "name": name, "bin": bin_sym, "png": png_sym, "build": build,
+                "name": display_name(name), "bin": bin_sym, "png": png_sym, "build": build,
             })
 
         vehicles = []
@@ -587,17 +635,22 @@ def generate(root: Path, out_dir: Path) -> int:
 
     # ---- franchise-sort badges ---------------------------------------------
     # Word-art name plates shown at top-centre of the browse screens, one per
-    # sort mode (Default / User / Starter). Favorites has no name plate - that
-    # roster shows the app wordmark enlarged instead (see DrawSortBadge in
-    # main.cpp).
+    # sort mode (Default / User / Starter / Year 1 / Year 2). Favorites has no
+    # name plate - that roster shows the app wordmark enlarged instead (see
+    # DrawSortBadge in main.cpp).
     sort_default  = pick_named({"default_sort"}, "default sort badge")
     sort_user     = pick_named({"user_sort"},    "user sort badge")
     sort_starter  = pick_named({"starter_sort"}, "starter sort badge")
+    sort_year1    = pick_named({"year1_sort"},   "year 1 sort badge")
+    sort_year2    = pick_named({"year2_sort"},   "year 2 sort badge")
     sort_default_sym = symbols.allocate("ASSET_SORT_DEFAULT", sort_default) if sort_default else None
     sort_user_sym    = symbols.allocate("ASSET_SORT_USER",    sort_user)    if sort_user    else None
     sort_starter_sym = symbols.allocate("ASSET_SORT_STARTER", sort_starter) if sort_starter else None
+    sort_year1_sym   = symbols.allocate("ASSET_SORT_YEAR1",   sort_year1)   if sort_year1   else None
+    sort_year2_sym   = symbols.allocate("ASSET_SORT_YEAR2",   sort_year2)   if sort_year2   else None
     for name, asset in [("default_sort", sort_default), ("user_sort", sort_user),
-                        ("starter_sort", sort_starter)]:
+                        ("starter_sort", sort_starter), ("year1_sort", sort_year1),
+                        ("year2_sort", sort_year2)]:
         if asset:
             ascii_ok([str(asset)], warnings)
         else:
@@ -909,6 +962,8 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kSortDefaultResourceId;")
     header.append("extern const int kSortUserResourceId;")
     header.append("extern const int kSortStarterResourceId;")
+    header.append("extern const int kSortYear1ResourceId;")
+    header.append("extern const int kSortYear2ResourceId;")
     header.append("// Single source of truth for the app version shown in the UI (web")
     header.append("// catalog's \"version\" field) - kept in lockstep with APP_VERSION")
     header.append("// below, which also stamps the exe's own FILEVERSION/ProductVersion.")
@@ -963,6 +1018,8 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kSortDefaultResourceId = %s;" % (sort_default_sym["name"] if sort_default_sym else "0"))
     cpp.append("const int kSortUserResourceId = %s;" % (sort_user_sym["name"] if sort_user_sym else "0"))
     cpp.append("const int kSortStarterResourceId = %s;" % (sort_starter_sym["name"] if sort_starter_sym else "0"))
+    cpp.append("const int kSortYear1ResourceId = %s;" % (sort_year1_sym["name"] if sort_year1_sym else "0"))
+    cpp.append("const int kSortYear2ResourceId = %s;" % (sort_year2_sym["name"] if sort_year2_sym else "0"))
     cpp.append("const wchar_t kAppVersion[] = L\"%s\";" % APP_VERSION)
     cpp.append("")
     cpp.append("const int kControllerIconResourceIds[%d][%d] = {"

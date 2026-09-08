@@ -258,6 +258,7 @@ constexpr int kOverlayWidth = 900;
 		RosterList,    // that world's characters + vehicles as circular portraits
 		PlusPicker,    // capsule listing a multi-build vehicle's builds by number
 		Settings,
+		KeyboardLayout, // static reference: which keyboard keys do what
 	};
 
 	// The 3 actions in the selected pad's bottom action bar.
@@ -366,10 +367,13 @@ constexpr int kOverlayWidth = 900;
 		bool overlayVisible = false;
 		HWND previousForegroundWindow = nullptr;
 
-		ShortcutType shortcutType = ShortcutType::Controller;
+		// Defaults to a keyboard toggle (Ctrl+L) so the overlay is usable with
+		// no controller plugged in; a controller user can switch it back to a
+		// controller combo. The default controller mask stays Back for that.
+		ShortcutType shortcutType = ShortcutType::Keyboard;
 		ButtonMask shortcutControllerMask = XINPUT_GAMEPAD_BACK;
-		UINT shortcutKeyModifiers = 0;
-		UINT shortcutKeyCode = 0;
+		UINT shortcutKeyModifiers = MOD_CONTROL;
+		UINT shortcutKeyCode = 'L';
 bool swapConfirmBackButtons = false;
 		size_t backgroundIndex = 0;
 		bool capturingShortcut = false;
@@ -509,9 +513,9 @@ bool swapConfirmBackButtons = false;
 
 		// How the franchise grid is sorted/filtered on the franchise page.
 		// Cycled with the shoulder buttons (RB/LB, R1/L1, R/L) so the user can
-		// browse all-series / custom / story in real time without touching
-		// Settings. Favorites is reserved for a future mode.
-		enum class FranchiseSort { Default, User, Story, Favorites };
+		// browse all-series / custom / story / year-by-year in real time
+		// without touching Settings. Favorites is reserved for a future mode.
+		enum class FranchiseSort { Default, User, Story, Favorites, Year1, Year2 };
 		FranchiseSort franchiseSort = FranchiseSort::Default;
 		// Effective grid content for the current sort: franchise indices in
 		// display order, excluding the optional Favorites tile. Rebuilt by
@@ -849,6 +853,7 @@ bool swapConfirmBackButtons = false;
 		SoundVolume,
 		ClearAllPads,
 		WebRemote,
+		KeyboardLayout, // opens the keyboard-layout reference screen
 		ResetDefaults,
 	};
 
@@ -2700,8 +2705,9 @@ void UpdateInputOwnership(HWND window);
 			"; shortcut from the in-app Settings screen, so you normally never need to\n"
 			"; edit it by hand. Shown here for reference / manual tweaking.\n"
 			"[Shortcut]\n"
-			"; Type = Controller | Keyboard\n"
-			"Type=Controller\n"
+			"; Type = Controller | Keyboard. Defaults to a keyboard toggle (Ctrl+L) so\n"
+			"; the picker works with no controller plugged in.\n"
+			"Type=Keyboard\n"
 			"; Controller: raw XInput button bitmask (Back = 32), plus LT = 65536 and\n"
 			"; RT = 131072 for the analog triggers. Combine buttons for a chord by\n"
 			"; adding their values, e.g. LB (256) + RB (512) = 768.\n"
@@ -2710,11 +2716,11 @@ void UpdateInputOwnership(HWND window);
 			"ControllerMask=32\n"
 			"; Keyboard: modifier bitmask (Alt=1, Ctrl=2, Shift=4, Win=8) and a virtual-key\n"
 			"; code. Must include at least one modifier, or the key would be stolen from\n"
-			"; every other program while this app is running. Easiest to leave both at 0\n"
-			"; and set the keyboard shortcut from the Settings screen instead of\n"
-			"; computing VK codes by hand.\n"
-			"KeyModifiers=0\n"
-			"KeyCode=0\n"
+			"; every other program while this app is running. Easiest to set it from the\n"
+			"; in-app Settings screen instead of computing VK codes by hand. Ctrl+L is\n"
+			"; the default (Ctrl=2, L=76).\n"
+			"KeyModifiers=2\n"
+			"KeyCode=76\n"
 			"\n"
 			"[Input]\n"
 			"; SwapConfirmBackButtons = 0 uses A to enter and B to go back (RPCS3 style).\n"
@@ -2726,8 +2732,9 @@ void UpdateInputOwnership(HWND window);
 			"; and 2 upwards are the remaining bundled Assets/Wallpapers images.\n"
 			"BackgroundIndex=0\n"
 			"; FranchiseSort = 0 Default (all worlds, alphabetical), 1 User (custom\n"
-			"; order), 2 Story (starter pack characters/vehicles), 3 Favorites.\n"
-			"; Browsed with the shoulder buttons (RB/LB) on the world screen.\n"
+			"; order), 2 Story (starter pack characters/vehicles), 3 Favorites,\n"
+			"; 4 Year 1 (2015 wave), 5 Year 2 (2016 wave). Browsed with the\n"
+			"; shoulder buttons (RB/LB) on the world screen.\n"
 			"FranchiseSort=0\n"
 			"; Controller bindings for the picker's own actions, as raw XInput button\n"
 			"; values (A=4096, B=8192, X=16384, Y=32768, LB=256, RB=512, LT=65536,\n"
@@ -3038,7 +3045,7 @@ void UpdateInputOwnership(HWND window);
 		{
 			const int sortVal = GetPrivateProfileIntW(
 				L"Input", L"FranchiseSort", 0, iniPath.c_str());
-			const int maxSort = static_cast<int>(AppState::FranchiseSort::Favorites);
+			const int maxSort = static_cast<int>(AppState::FranchiseSort::Year2);
 			g_app.franchiseSort = static_cast<AppState::FranchiseSort>(
 				std::clamp(sortVal, 0, maxSort));
 		}
@@ -3287,6 +3294,15 @@ void UpdateInputOwnership(HWND window);
 			GetPrivateProfileIntW(L"Shortcut", L"KeyModifiers", 0, iniPath.c_str()));
 		g_app.shortcutKeyCode = static_cast<UINT>(
 			GetPrivateProfileIntW(L"Shortcut", L"KeyCode", 0, iniPath.c_str()));
+		// The keyboard toggle always defaults to Ctrl+L and always stays active
+		// (see RegisterToggleHotkeyIfNeeded), so an install that predates the
+		// keyboard default (key code left at 0) still gets a working Ctrl+L
+		// rather than silently having no keyboard toggle at all.
+		if (g_app.shortcutKeyCode == 0)
+		{
+			g_app.shortcutKeyModifiers = MOD_CONTROL;
+			g_app.shortcutKeyCode = 'L';
+		}
 	}
 
 	// ---------------------------------------------------------------------
@@ -3632,9 +3648,14 @@ void UpdateInputOwnership(HWND window);
 		g_app.status = L"LOAD sent: " + name + L" -> " + kSlots[slotIndex].label;
 		if (updateUi)
 		{
+			// Loading a figure is the one action that means "I'm done with the
+			// picker" - the tag is on the pad and the game is ready for it, so
+			// close the overlay and drop straight back into the game instead of
+			// making the user close it manually.
 			g_app.storyRosterActive = false;
 			g_app.screen = Screen::PadViewer;
 			InvalidateRect(g_mainWindow, nullptr, FALSE);
+			HideOverlay(g_mainWindow);
 		}
 	}
 
@@ -3815,7 +3836,7 @@ void UpdateInputOwnership(HWND window);
 	struct PadNeighbors { int up, down, left, right; };
 	constexpr std::array<PadNeighbors, 7> kPadNeighbors = {{
 		/* 0 Left - upper         */ {-1,  3, -1,  1},
-		/* 1 Center               */ {-1, -1,  0,  2},
+		/* 1 Center               */ {-1,  4,  0,  2},
 		/* 2 Right - upper        */ {-1,  6,  1, -1},
 		/* 3 Left - lower left    */ { 0, -1, -1,  4},
 		/* 4 Left - lower right   */ { 0, -1,  3,  5},
@@ -3848,8 +3869,40 @@ void UpdateInputOwnership(HWND window);
 	// separately in franchiseDisplayOrder and only used for the "User" sort.
 	bool IsStarterPackFranchiseName(const std::wstring& name)
 	{
-		return name == L"DC Comics" || name == L"The Lord of the Rings" ||
+		return name == L"DC Comics" || name == L"Lord of the Rings" ||
 			name == L"The LEGO Movie";
+	}
+
+	// The two release waves. Year 1 is the 2015 launch line-up, Year 2 the 2016
+	// wave. The exact set of worlds is what the game shipped per year, and a
+	// couple of series (e.g. DC Comics) appear in both.
+	bool IsYear1FranchiseName(const std::wstring& name)
+	{
+		static const std::array<const wchar_t*, 14> kYear1 = {
+			L"DC Comics", L"The LEGO Movie", L"Lord of the Rings", L"Back to the Future",
+			L"Portal 2", L"The Simpsons", L"Jurassic World", L"Scooby-Doo!",
+			L"Legends of Chima", L"The Wizard of Oz", L"Doctor Who", L"Ninjago",
+			L"Ghostbusters", L"Midway Arcade",
+		};
+		for (const wchar_t* yearName : kYear1)
+			if (name == yearName)
+				return true;
+		return false;
+	}
+
+	bool IsYear2FranchiseName(const std::wstring& name)
+	{
+		static const std::array<const wchar_t*, 17> kYear2 = {
+			L"DC Comics", L"Ghostbusters 2016", L"Adventure Time", L"Mission Impossible",
+			L"Harry Potter", L"The A-Team", L"Fantastic Beasts and Where to Find Them",
+			L"Sonic the Hedgehog", L"Gremlins", L"E.T. the Extra-Terrestrial",
+			L"The LEGO Batman Movie", L"Knight Rider", L"The Goonies", L"LEGO City Undercover",
+			L"The Powerpuff Girls", L"Teen Titans Go!", L"Beetlejuice",
+		};
+		for (const wchar_t* yearName : kYear2)
+			if (name == yearName)
+				return true;
+		return false;
 	}
 
 	void RebuildFranchiseDisplay()
@@ -3876,12 +3929,29 @@ void UpdateInputOwnership(HWND window);
 				g_app.franchiseDisplayList.push_back(i);
 			g_app.showFavoritesTile = true;
 			break;
+		case AppState::FranchiseSort::Year1:
+			// The 2015 launch wave only. No Favorites tile - that lives on the
+			// User sort (custom order) and the Favorites roster.
+			for (size_t i = 0; i < kFranchiseCount; ++i)
+				if (IsYear1FranchiseName(kFranchises[i].name))
+					g_app.franchiseDisplayList.push_back(i);
+			g_app.showFavoritesTile = false;
+			break;
+		case AppState::FranchiseSort::Year2:
+			// The 2016 wave only. No Favorites tile (see Year 1).
+			for (size_t i = 0; i < kFranchiseCount; ++i)
+				if (IsYear2FranchiseName(kFranchises[i].name))
+					g_app.franchiseDisplayList.push_back(i);
+			g_app.showFavoritesTile = false;
+			break;
 		case AppState::FranchiseSort::Default:
 		default:
-			// All series, alphabetical (the catalog's own order).
+			// All series, alphabetical (the catalog's own order). No Favorites
+			// tile - favorites are reached from the User sort or the Favorites
+			// roster.
 			for (size_t i = 0; i < kFranchiseCount; ++i)
 				g_app.franchiseDisplayList.push_back(i);
-			g_app.showFavoritesTile = true;
+			g_app.showFavoritesTile = false;
 			break;
 		}
 	}
@@ -3893,6 +3963,8 @@ void UpdateInputOwnership(HWND window);
 		case AppState::FranchiseSort::User: return L"User";
 		case AppState::FranchiseSort::Story: return L"Story";
 		case AppState::FranchiseSort::Favorites: return L"Favorites";
+		case AppState::FranchiseSort::Year1: return L"Year 1";
+		case AppState::FranchiseSort::Year2: return L"Year 2";
 		case AppState::FranchiseSort::Default:
 		default: return L"Default";
 		}
@@ -3918,6 +3990,8 @@ void UpdateInputOwnership(HWND window);
 			AppState::FranchiseSort::Default,
 			AppState::FranchiseSort::User,
 			AppState::FranchiseSort::Story,
+			AppState::FranchiseSort::Year1,
+			AppState::FranchiseSort::Year2,
 			AppState::FranchiseSort::Favorites,
 		};
 		const int count = static_cast<int>(modes.size());
@@ -4428,6 +4502,9 @@ void UpdateInputOwnership(HWND window);
 		case Screen::Settings:
 			MoveSettingsSelection(direction);
 			break;
+		case Screen::KeyboardLayout:
+			// Static reference screen: nothing to move.
+			break;
 		}
 	}
 
@@ -4890,7 +4967,7 @@ void UpdateInputOwnership(HWND window);
 
 		constexpr struct { const wchar_t* franchise; const wchar_t* name; } kStoryCharacters[] = {
 			{L"DC Comics", L"Batman"},
-			{L"Lord of the Rings", L"Gandalf The Grey"},
+			{L"Lord of the Rings", L"Gandalf"},
 			{L"The LEGO Movie", L"Wyldstyle"},
 		};
 		for (const auto& character : kStoryCharacters)
@@ -5005,6 +5082,9 @@ void UpdateInputOwnership(HWND window);
 		case Screen::Settings:
 			ActivateSettingsEntry();
 			break;
+		case Screen::KeyboardLayout:
+			// Reference screen: confirm does nothing here.
+			break;
 		}
 	}
 
@@ -5081,6 +5161,9 @@ void UpdateInputOwnership(HWND window);
 			break;
 		case Screen::Settings:
 			g_app.screen = Screen::PadViewer;
+			break;
+		case Screen::KeyboardLayout:
+			g_app.screen = Screen::Settings;
 			break;
 		}
 	}
@@ -5282,7 +5365,10 @@ void UpdateInputOwnership(HWND window);
 	void RegisterToggleHotkeyIfNeeded(HWND window)
 	{
 		UnregisterHotKey(window, kToggleHotkeyId);
-		if (g_app.shortcutType != ShortcutType::Keyboard || g_app.shortcutKeyCode == 0)
+		// The keyboard toggle is always active, whatever the shortcut type is
+		// set to (Controller or Keyboard). That way Ctrl+L works even for
+		// people who prefer a controller combo - the two toggles coexist.
+		if (g_app.shortcutKeyCode == 0)
 			return;
 
 		// A modifier-less hotkey registers as a truly global key grab, which
@@ -6481,6 +6567,7 @@ void UpdateInputOwnership(HWND window);
 			row(SettingAction::Shortcut, L"Toggle shortcut", DescribeShortcut());
 		row(SettingAction::ConfirmStyle, L"Confirm button", DescribeConfirmButtonMode());
 		row(SettingAction::ButtonStyle, L"Button labels", DescribeButtonStyle());
+		row(SettingAction::KeyboardLayout, L"Keyboard layout", {});
 
 		heading(L"Button bindings");
 		for (size_t i = 0; i < kBindableActions.size(); ++i)
@@ -6585,6 +6672,7 @@ void UpdateInputOwnership(HWND window);
 		case SettingAction::Shortcut: if (allowAction) BeginShortcutCapture(); break;
 		case SettingAction::Binding: if (allowAction) BeginBindingCapture(entry.bindingIndex); break;
 		case SettingAction::ClearAllPads: if (allowAction) ClearAllPads(true); break;
+		case SettingAction::KeyboardLayout: if (allowAction) g_app.screen = Screen::KeyboardLayout; break;
 		case SettingAction::ResetDefaults: if (allowAction) ResetSettingsToDefaults(); break;
 		case SettingAction::ConfirmStyle: ToggleConfirmButtonMode(); break;
 		case SettingAction::ButtonStyle: CycleButtonStyle(direction); break;
@@ -7770,6 +7858,14 @@ void UpdateInputOwnership(HWND window);
 			nameResId = kSortStarterResourceId;
 			glowColor = RGB(66, 157, 255);  // blue
 			break;
+		case AppState::FranchiseSort::Year1:
+			nameResId = kSortYear1ResourceId;
+			glowColor = RGB(126, 217, 87);  // green
+			break;
+		case AppState::FranchiseSort::Year2:
+			nameResId = kSortYear2ResourceId;
+			glowColor = RGB(255, 158, 74);  // orange
+			break;
 		case AppState::FranchiseSort::Default:
 		default:
 			nameResId = kSortDefaultResourceId;
@@ -7815,6 +7911,108 @@ void UpdateInputOwnership(HWND window);
 		{
 			g.DrawImage(cachedArt, badgeX + kBadgePadX, badgeY + (kBadgeH - artH) / 2.0f);
 		}
+	}
+
+	// One keyboard keycap on the layout screen: a rounded rect with the key
+	// label centred and the action caption underneath. `accent` highlights the
+	// global toggle key.
+	void DrawKeycap(Gdiplus::Graphics& g, float x, float y, float w, float h,
+		const std::wstring& label, const std::wstring& caption, bool accent)
+	{
+		Gdiplus::GraphicsPath path;
+		AddRoundedRectPath(path, Gdiplus::RectF(x, y, w, h), 10.0f);
+		Gdiplus::SolidBrush body(Gdiplus::Color(235, 24, 30, 42));
+		g.FillPath(&body, &path);
+		Gdiplus::Pen border(Gdiplus::Color(accent ? 255 : 150,
+			accent ? 120 : 90, accent ? 217 : 120, accent ? 87 : 150), 1.6f);
+		g.DrawPath(&border, &path);
+		if (!label.empty())
+		{
+			Gdiplus::Font font = MakeUIFont(label.size() > 3 ? 20.0f : 24.0f);
+			Gdiplus::SolidBrush labelBrush(ToGdiPlusColor(RGB(240, 244, 250)));
+			Gdiplus::StringFormat fmt(Gdiplus::StringFormatFlagsNoWrap);
+			fmt.SetAlignment(Gdiplus::StringAlignmentCenter);
+			fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+			g.DrawString(label.c_str(), -1, &font, Gdiplus::RectF(x, y, w, h), &fmt, &labelBrush);
+		}
+		if (!caption.empty())
+		{
+			// A smaller face than the key label so the full action name fits
+			// without the ellipsis truncation that 22px caused on narrow keys.
+			Gdiplus::Font capFont = MakeUIFont(15.0f);
+			Gdiplus::SolidBrush capBrush(ToGdiPlusColor(RGB(214, 220, 230)));
+			Gdiplus::StringFormat capFmt(Gdiplus::StringFormatFlagsNoWrap);
+			capFmt.SetAlignment(Gdiplus::StringAlignmentCenter);
+			capFmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+			g.DrawString(caption.c_str(), -1, &capFont, Gdiplus::RectF(x, y + h + 2, w, 20), &capFmt, &capBrush);
+		}
+	}
+
+	// The keyboard-layout reference screen: a static diagram of every key the
+	// picker reacts to and what it does, aimed at people using the app without
+	// a controller. Back returns to Settings.
+	void DrawKeyboardLayout(Gdiplus::Graphics& g, int width, int height)
+	{
+		constexpr int kPanelX = 40;
+		constexpr int kPanelY = 128;
+		const int panelW = width - kPanelX * 2;
+		constexpr int kPanelH = 384;
+		const int panelResource =
+			kSettingsTileResourceId != 0 ? kSettingsTileResourceId : kCharactersTileResourceId;
+		if (Gdiplus::Bitmap* panel = RenderScaledAsset(panelResource, panelW, kPanelH, 14))
+			g.DrawImage(panel, kPanelX, kPanelY);
+
+		DrawTextLineCentered(g, L"Keyboard layout", kPanelX, kPanelY + 14, panelW, RGB(255, 204, 51), 34);
+
+		constexpr float kKeyW = 90.0f;
+		constexpr float kKeyH = 54.0f;
+		constexpr float kArrowW = 90.0f;
+		constexpr float kGapX = 12.0f;
+		constexpr float kGapY = 18.0f;
+		constexpr float kCaptionH = 24.0f;
+
+		struct KbKey { const wchar_t* label; const wchar_t* caption; };
+		const KbKey row1[] = {
+			{L"Esc", L"Back"}, {L"S", L"Settings"}, {L"M", L"Move pad"},
+			{L"L", L"Quick load"}, {L"C", L"Quick clear"}, {L"G", L"LED demo"},
+			{L"[", L"Prev sort"}, {L"]", L"Next sort"},
+		};
+		const int row1Count = static_cast<int>(sizeof(row1) / sizeof(row1[0]));
+		const float row1W = row1Count * kKeyW + (row1Count - 1) * kGapX;
+		const float row1X = kPanelX + (panelW - row1W) / 2.0f;
+		const float row1Y = kPanelY + 62.0f;
+		for (int i = 0; i < row1Count; ++i)
+		{
+			DrawKeycap(g, row1X + i * (kKeyW + kGapX), row1Y, kKeyW, kKeyH,
+				row1[i].label, row1[i].caption, false);
+		}
+
+		const float row2Y = row1Y + kKeyH + kCaptionH + kGapY;
+		// Arrow cluster + Enter.
+		const std::array<const wchar_t*, 4> arrows = {L"Up", L"Down", L"Left", L"Right"};
+		const float arrowsW = 4 * kArrowW + 3 * kGapX;
+		const float enterW = kKeyW;
+		const float navW = arrowsW + 40.0f + enterW;
+		const float navX = kPanelX + (panelW - navW) / 2.0f;
+		for (int i = 0; i < 4; ++i)
+		{
+			DrawKeycap(g, navX + i * (kArrowW + kGapX), row2Y, kArrowW, kKeyH, arrows[i], L"", false);
+		}
+		DrawTextLineCentered(g, L"Navigate", static_cast<int>(navX),
+			static_cast<int>(row2Y + kKeyH + 4), static_cast<int>(arrowsW), RGB(214, 220, 230),
+			static_cast<int>(kCaptionH));
+		DrawKeycap(g, navX + arrowsW + 40.0f, row2Y, enterW, kKeyH, L"Enter", L"Confirm", false);
+
+		const float row3Y = row2Y + kKeyH + kCaptionH + kGapY;
+		const std::wstring toggleLabel = g_app.shortcutKeyCode != 0
+			? DescribeKeyboardKey(g_app.shortcutKeyModifiers, g_app.shortcutKeyCode)
+			: std::wstring(L"Ctrl + L");
+		const float toggleW = 200.0f;
+		DrawKeycap(g, kPanelX + (panelW - toggleW) / 2.0f, row3Y, toggleW, kKeyH,
+			toggleLabel, L"Toggle overlay", true);
+
+		DrawTextLineCentered(g, L"Esc  returns to Settings", kPanelX,
+			kPanelY + kPanelH - 26, panelW, RGB(226, 232, 240), 24);
 	}
 
 	void Paint(HWND window)
@@ -8174,6 +8372,9 @@ void UpdateInputOwnership(HWND window);
 			}
 			break;
 		}
+		case Screen::KeyboardLayout:
+			DrawKeyboardLayout(g, width, height);
+			break;
 		}
 
 		// The focused occupied pad's occupant name, drawn after the pads and
@@ -9954,6 +10155,16 @@ if (changed)
 			case 'G':
 				if (g_app.screen == Screen::PadViewer)
 					ToggleLedDemo();
+				break;
+			// Keyboard equivalents of the LB/RB sort cycling on the franchise
+			// grid / browse rosters.
+			case VK_OEM_4: // '[' - previous sort
+				if (IsFranchiseSortBrowseActive())
+					CycleFranchiseSort(-1);
+				break;
+			case VK_OEM_6: // ']' - next sort
+				if (IsFranchiseSortBrowseActive())
+					CycleFranchiseSort(+1);
 				break;
 			}
 			InvalidateRect(window, nullptr, FALSE);
