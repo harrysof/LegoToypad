@@ -402,6 +402,11 @@ bool swapConfirmBackButtons = false;
 		ButtonMask buttonSneakPeek = kTriggerLeftButton;
 		// Sneak peek size, 0 = off. Index into kPeekSizeScales.
 		size_t peekSizeChoice = kDefaultPeekSizeChoice;
+		// Held (not tapped) to show the focused character/vehicle's abilities
+		// as a small card - RosterList, PlusPicker, or PadViewer over an
+		// occupied pad. The right trigger by default: kTriggerRightButton was
+		// already tracked by every controller poll but unbound to anything.
+		ButtonMask buttonAbilitiesPeek = kTriggerRightButton;
 		// Index into kBindableActions while capturing a new button for one
 		// of them from Settings; -1 when no binding capture is running.
 		int capturingBindingIndex = -1;
@@ -515,7 +520,7 @@ bool swapConfirmBackButtons = false;
 		// Cycled with the shoulder buttons (RB/LB, R1/L1, R/L) so the user can
 		// browse all-series / custom / story / year-by-year in real time
 		// without touching Settings. Favorites is reserved for a future mode.
-		enum class FranchiseSort { Default, User, Story, Favorites, Year1, Year2 };
+		enum class FranchiseSort { Default, User, Story, Favorites, Year1, Year2, Abilities };
 		FranchiseSort franchiseSort = FranchiseSort::Default;
 		// Effective grid content for the current sort: franchise indices in
 		// display order, excluding the optional Favorites tile. Rebuilt by
@@ -523,6 +528,18 @@ bool swapConfirmBackButtons = false;
 		// persisted custom order (used only when sort == User).
 		std::vector<size_t> franchiseDisplayList;
 		bool showFavoritesTile = true;
+
+		// Abilities browse mode (FranchiseSort::Abilities): the franchise grid
+		// is replaced by a grid of enlarged ability icons (see DrawAbilityGrid/
+		// MoveAbilityGridSelection), and confirming one opens the same
+		// RosterList screen filtered to every character/vehicle with that
+		// ability (see OpenAbilityRoster). abilityRosterActive parallels
+		// storyRosterActive/favoritesTileSelected: it tells RosterList-side
+		// code (header, hints, Back) that the roster it's showing was built
+		// this way rather than from one franchise.
+		size_t abilityGridIndex = 0;
+		bool abilityRosterActive = false;
+		size_t abilityRosterFilter = 0; // index into kAbilities, valid while abilityRosterActive
 	};
 
 	AppState g_app;
@@ -808,7 +825,7 @@ bool swapConfirmBackButtons = false;
 		return a.scope == b.scope;
 	}
 
-	constexpr std::array<BindableAction, 10> kBindableActions = {{
+	constexpr std::array<BindableAction, 11> kBindableActions = {{
 		{L"Confirm", L"ButtonConfirm", &AppState::buttonConfirm, true, Screen::PadViewer},
 		{L"Back", L"ButtonBack", &AppState::buttonBack, true, Screen::PadViewer},
 		{L"Settings", L"ButtonSettings", &AppState::buttonSettings, false, Screen::PadViewer},
@@ -822,6 +839,13 @@ bool swapConfirmBackButtons = false;
 			Screen::FranchiseList},
 		{L"Sneak peek (hold)", L"ButtonSneakPeek", &AppState::buttonSneakPeek, false,
 			Screen::PadViewer, true},
+		// Unlike Sneak peek, this fires while the picker is visible (RosterList,
+		// PlusPicker, and PadViewer over an occupied pad) - scope is pinned to
+		// PadViewer purely so ActionsCanConflict has one screen to check
+		// against; kTriggerRightButton has no other default binding to
+		// collide with anyway. See UpdateAbilitiesPeekHold.
+		{L"Show abilities (hold)", L"ButtonAbilitiesPeek", &AppState::buttonAbilitiesPeek, false,
+			Screen::PadViewer},
 	}};
 
 	// ---------------------------------------------------------------------
@@ -1024,6 +1048,7 @@ void UpdateInputOwnership(HWND window);
 		PlusTile,     // "+" tile
 		Placeholder,  // circular letter plate for entries without a portrait
 		FranchiseTile,
+		AbilityTile,
 		Pill,         // capsule menu background
 		PillRow,      // capsule focus highlight row
 		Background,   // full-window starfield + dark overlay
@@ -2178,6 +2203,111 @@ void UpdateInputOwnership(HWND window);
 			// Same double stroke as a focused pad, in the same colour: the
 			// two grids are the same kind of "pick one of these", so they now
 			// look the same when you do.
+			Gdiplus::Pen wide(Gdiplus::Color(80, GetRValue(kSelectionGlow),
+				GetGValue(kSelectionGlow), GetBValue(kSelectionGlow)), 6.5f);
+			wide.SetLineJoin(Gdiplus::LineJoinRound);
+			g.DrawPath(&wide, &path);
+			Gdiplus::Pen crisp(Gdiplus::Color(225, GetRValue(kSelectionGlow),
+				GetGValue(kSelectionGlow), GetBValue(kSelectionGlow)), 2.2f);
+			crisp.SetLineJoin(Gdiplus::LineJoinRound);
+			g.DrawPath(&crisp, &path);
+		}
+		else
+		{
+			Gdiplus::Pen borderPen(Gdiplus::Color(200, GetRValue(kPadBorderIdle),
+				GetGValue(kPadBorderIdle), GetBValue(kPadBorderIdle)), 1.5f);
+			borderPen.SetLineJoin(Gdiplus::LineJoinRound);
+			g.DrawPath(&borderPen, &path);
+		}
+
+		g_glossCache[key] = bitmap;
+		return bitmap;
+	}
+
+	void DrawTextWrappedCenteredFit(Gdiplus::Graphics& g, const std::wstring& text, int x, int y, int width, int height, COLORREF color);
+
+	// Ability tile: the Abilities.png panel (falls back to characters_tile.png
+	// - see kAbilitiesTileResourceId in generate_assets.py) with the ability's
+	// icon and short name on top, same focus outline as a franchise tile.
+	// Unlike a franchise logo, an ability icon alone isn't self-explanatory,
+	// so - unlike RenderFranchiseTile - this always draws a text label too.
+	// Keyed by abilityIndex rather than the icon resource id, since more than
+	// one ability can share resId 0 (no icon yet) or even the same
+	// deterministic ring colour in principle; the index is always unique.
+	Gdiplus::Bitmap* RenderAbilityTile(size_t abilityIndex, bool focused)
+	{
+		if (abilityIndex >= kAbilityCount)
+			return nullptr;
+		const Ability& ability = kAbilities[abilityIndex];
+
+		constexpr int tileW = 190;
+		constexpr int tileH = 100;
+		constexpr int margin = 6;
+		const int w = tileW + margin * 2;
+		const int h = tileH + margin * 2;
+		const int variant = focused ? 1 : 0;
+		const GlossKey key{GlossKind::AbilityTile, variant, static_cast<int>(abilityIndex), 0, w, h};
+		const auto cached = g_glossCache.find(key);
+		if (cached != g_glossCache.end())
+			return cached->second;
+
+		Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
+		Gdiplus::Graphics g(bitmap);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+
+		const Gdiplus::RectF rect(static_cast<float>(margin), static_cast<float>(margin),
+			static_cast<float>(tileW), static_cast<float>(tileH));
+		Gdiplus::GraphicsPath path;
+		AddRoundedRectPath(path, rect, 12.0f);
+
+		const int tileBgResId = kAbilitiesTileResourceId != 0 ? kAbilitiesTileResourceId : kCharactersTileResourceId;
+		Gdiplus::Bitmap* tileBase = GetAssetBitmap(tileBgResId);
+		if (tileBase)
+		{
+			const float scale = std::max(rect.Width / tileBase->GetWidth(), rect.Height / tileBase->GetHeight());
+			const float drawW = tileBase->GetWidth() * scale;
+			const float drawH = tileBase->GetHeight() * scale;
+			const Gdiplus::RectF dest(rect.X + (rect.Width - drawW) / 2.0f,
+				rect.Y + (rect.Height - drawH) / 2.0f, drawW, drawH);
+			Gdiplus::Region clip(&path);
+			g.SetClip(&clip);
+			g.DrawImage(tileBase, dest);
+			g.ResetClip();
+		}
+
+		// Icon in the upper band, short name in the lower band.
+		constexpr float iconAreaH = 56.0f;
+		constexpr float labelAreaH = 30.0f;
+		const Gdiplus::RectF iconBox(margin + 8.0f, margin + 4.0f, tileW - 16.0f, iconAreaH);
+		Gdiplus::Bitmap* icon = ability.iconResourceId != 0 ? GetAssetBitmap(ability.iconResourceId) : nullptr;
+		if (icon)
+		{
+			const float scale = std::min(iconBox.Width / icon->GetWidth(), iconBox.Height / icon->GetHeight());
+			const float drawW = icon->GetWidth() * scale;
+			const float drawH = icon->GetHeight() * scale;
+			const Gdiplus::RectF dest(iconBox.X + (iconBox.Width - drawW) / 2.0f,
+				iconBox.Y + (iconBox.Height - drawH) / 2.0f, drawW, drawH);
+			Gdiplus::Region clip(&path);
+			g.SetClip(&clip);
+			g.DrawImage(icon, dest);
+			g.ResetClip();
+		}
+		else if (Gdiplus::Bitmap* placeholder = RenderPlaceholder(
+			ability.name.empty() ? L'?' : ability.name[0], ability.ringColor, focused, 44))
+		{
+			const float pw = static_cast<float>(placeholder->GetWidth());
+			const float ph = static_cast<float>(placeholder->GetHeight());
+			g.DrawImage(placeholder, iconBox.X + (iconBox.Width - pw) / 2.0f,
+				iconBox.Y + (iconBox.Height - ph) / 2.0f, pw, ph);
+		}
+
+		DrawTextWrappedCenteredFit(g, ability.name, margin, static_cast<int>(margin + iconAreaH + 6.0f),
+			tileW, static_cast<int>(labelAreaH), RGB(230, 236, 246));
+
+		if (focused)
+		{
+			// Same double stroke as a focused franchise tile / pad.
 			Gdiplus::Pen wide(Gdiplus::Color(80, GetRValue(kSelectionGlow),
 				GetGValue(kSelectionGlow), GetBValue(kSelectionGlow)), 6.5f);
 			wide.SetLineJoin(Gdiplus::LineJoinRound);
@@ -3869,7 +3999,7 @@ void UpdateInputOwnership(HWND window);
 	// separately in franchiseDisplayOrder and only used for the "User" sort.
 	bool IsStarterPackFranchiseName(const std::wstring& name)
 	{
-		return name == L"DC Comics" || name == L"Lord of the Rings" ||
+		return name == L"DC Comics" || name == L"The Lord of the Rings" ||
 			name == L"The LEGO Movie";
 	}
 
@@ -3879,7 +4009,7 @@ void UpdateInputOwnership(HWND window);
 	bool IsYear1FranchiseName(const std::wstring& name)
 	{
 		static const std::array<const wchar_t*, 14> kYear1 = {
-			L"DC Comics", L"The LEGO Movie", L"Lord of the Rings", L"Back to the Future",
+			L"DC Comics", L"The LEGO Movie", L"The Lord of the Rings", L"Back to the Future",
 			L"Portal 2", L"The Simpsons", L"Jurassic World", L"Scooby-Doo!",
 			L"Legends of Chima", L"The Wizard of Oz", L"Doctor Who", L"Ninjago",
 			L"Ghostbusters", L"Midway Arcade",
@@ -3944,6 +4074,14 @@ void UpdateInputOwnership(HWND window);
 					g_app.franchiseDisplayList.push_back(i);
 			g_app.showFavoritesTile = false;
 			break;
+		case AppState::FranchiseSort::Abilities:
+			// The franchise grid isn't shown at all in this sort (see
+			// DrawAbilityGrid/MoveAbilityGridSelection, which browse kAbilities
+			// directly) - left empty defensively so nothing that still reads
+			// franchiseDisplayList while this sort is active mistakes it for
+			// Default's full catalog.
+			g_app.showFavoritesTile = false;
+			break;
 		case AppState::FranchiseSort::Default:
 		default:
 			// All series, alphabetical (the catalog's own order). No Favorites
@@ -3965,6 +4103,7 @@ void UpdateInputOwnership(HWND window);
 		case AppState::FranchiseSort::Favorites: return L"Favorites";
 		case AppState::FranchiseSort::Year1: return L"Year 1";
 		case AppState::FranchiseSort::Year2: return L"Year 2";
+		case AppState::FranchiseSort::Abilities: return L"Abilities";
 		case AppState::FranchiseSort::Default:
 		default: return L"Default";
 		}
@@ -3993,6 +4132,7 @@ void UpdateInputOwnership(HWND window);
 			AppState::FranchiseSort::Year1,
 			AppState::FranchiseSort::Year2,
 			AppState::FranchiseSort::Favorites,
+			AppState::FranchiseSort::Abilities,
 		};
 		const int count = static_cast<int>(modes.size());
 		int idx = 0;
@@ -4059,6 +4199,44 @@ void UpdateInputOwnership(HWND window);
 		}
 
 		// Keep the focused row inside the visible viewport.
+		const int focusedRow = static_cast<int>(row);
+		while (focusedRow < g_app.franchiseTopRow)
+			--g_app.franchiseTopRow;
+		while (focusedRow >= g_app.franchiseTopRow + static_cast<int>(kFranchiseVisibleRows))
+			++g_app.franchiseTopRow;
+		if (g_app.franchiseTopRow < 0)
+			g_app.franchiseTopRow = 0;
+	}
+
+	// kAbilityCount is never truly 0 (generate_assets.py emits one inert
+	// empty-name sentinel rather than an empty array when abilities.csv is
+	// missing/empty) - this is the "really zero" count the ability grid/roster
+	// code treats as empty.
+	size_t AbilityGridCount()
+	{
+		if (kAbilityCount == 1 && kAbilities[0].name.empty())
+			return 0;
+		return kAbilityCount;
+	}
+
+	// Same ragged-grid wrap shape as MoveFranchiseSelection, simpler: no
+	// Favorites tile, no display-order indirection - just a flat walk over
+	// kAbilities.
+	void MoveAbilityGridSelection(int dx, int dy)
+	{
+		const size_t count = AbilityGridCount();
+		if (count == 0)
+			return;
+		const size_t rows = (count + kFranchiseCols - 1) / kFranchiseCols;
+		size_t row = g_app.abilityGridIndex / kFranchiseCols;
+		size_t col = g_app.abilityGridIndex % kFranchiseCols;
+
+		row = (row + static_cast<size_t>(dy) + rows) % rows;
+		const size_t lastCol = std::min(kFranchiseCols, count - row * kFranchiseCols) - 1;
+		col = (col + static_cast<size_t>(dx) + lastCol + 1) % (lastCol + 1);
+
+		g_app.abilityGridIndex = row * kFranchiseCols + col;
+
 		const int focusedRow = static_cast<int>(row);
 		while (focusedRow < g_app.franchiseTopRow)
 			--g_app.franchiseTopRow;
@@ -4421,6 +4599,7 @@ void UpdateInputOwnership(HWND window);
 		signature = signature * 131 + g_app.slotIndex;
 		signature = signature * 131 + g_app.padActionIndex;
 		signature = signature * 131 + g_app.franchiseIndex;
+		signature = signature * 131 + g_app.abilityGridIndex;
 		signature = signature * 131 + (g_app.favoritesTileSelected ? 1 : 0);
 		signature = signature * 131 + g_app.rosterIndex;
 		signature = signature * 131 + g_app.plusBuildIndex;
@@ -4457,7 +4636,10 @@ void UpdateInputOwnership(HWND window);
 			NavigatePadGrid(dx, dy);
 			break;
 		case Screen::FranchiseList:
-			MoveFranchiseSelection(dx, dy);
+			if (g_app.franchiseSort == AppState::FranchiseSort::Abilities)
+				MoveAbilityGridSelection(dx, dy);
+			else
+				MoveFranchiseSelection(dx, dy);
 			break;
 		case Screen::RosterList:
 			MoveRosterSelection(dx, dy);
@@ -4552,6 +4734,20 @@ void UpdateInputOwnership(HWND window);
 		g_app.screen = Screen::FranchiseList;
 	}
 
+	// Abilities sort: the franchise grid (Screen::FranchiseList) is reused to
+	// show enlarged ability icons instead (see DrawAbilityGrid). Reuses
+	// franchiseTopRow as the scroll position too - the two grids are never
+	// shown at once, so one scroll-row field covers whichever is current.
+	void OpenAbilityGrid()
+	{
+		g_app.franchiseTopRow = 0;
+		if (g_app.abilityGridIndex >= kAbilityCount)
+			g_app.abilityGridIndex = 0;
+		g_app.favoritesTileSelected = false;
+		g_app.storyRosterActive = false;
+		g_app.screen = Screen::FranchiseList;
+	}
+
 	// Opens whatever the current franchise sort should show. Default/User show
 	// the franchise tile grid; Story and Favorites show their roster of
 	// characters/vehicles directly instead of tiles.
@@ -4564,12 +4760,16 @@ void UpdateInputOwnership(HWND window);
 			return;
 		case AppState::FranchiseSort::Favorites:
 			g_app.storyRosterActive = false;
+			g_app.abilityRosterActive = false;
 			g_app.favoritesTileSelected = true;
 			OpenFavoritesRoster();
 			g_app.rosterIndex = 0;
 			g_app.rosterTopRow = 0;
 			g_app.plusGroup = nullptr;
 			g_app.screen = Screen::RosterList;
+			return;
+		case AppState::FranchiseSort::Abilities:
+			OpenAbilityGrid();
 			return;
 		case AppState::FranchiseSort::Default:
 		case AppState::FranchiseSort::User:
@@ -4589,6 +4789,34 @@ void UpdateInputOwnership(HWND window);
 			{
 				if (character.name == characterName)
 					return &character;
+			}
+		}
+		return nullptr;
+	}
+
+	// Resolves a loaded pad's occupant back to its real RosterEntry (and so to
+	// its abilityIndices) from the .bin resource id PadSlot stores - PadSlot
+	// itself only keeps the display name/resource ids, not a pointer back
+	// into kFranchises. Used only by the abilities peek on PadViewer, so a
+	// linear scan over the ~350-entry catalog per hold-start is cheap.
+	const RosterEntry* FindRosterEntryByBinResourceId(int binResourceId)
+	{
+		if (binResourceId == 0)
+			return nullptr;
+		for (size_t i = 0; i < kFranchiseCount; ++i)
+		{
+			for (const auto& character : kFranchises[i].characters)
+			{
+				if (character.binResourceId == binResourceId)
+					return &character;
+			}
+			for (const auto& vehicle : kFranchises[i].vehicles)
+			{
+				for (const auto& build : vehicle.builds)
+				{
+					if (build.binResourceId == binResourceId)
+						return &build;
+				}
 			}
 		}
 		return nullptr;
@@ -4660,6 +4888,52 @@ void UpdateInputOwnership(HWND window);
 		}
 	}
 
+	// Builds the roster grid from every character/vehicle build that has the
+	// given ability (kAbilities[abilityIndex]) - same two-pass, all-Characters-
+	// then-all-Vehicles shape as OpenFavoritesRoster, for the same reason
+	// (every roster-grid layout/navigation path assumes that ordering).
+	// Abilities are per BUILD, not per vehicle family (see abilities.csv), so
+	// a family can appear more than once here if more than one of its builds
+	// has this ability - each shown as its own tile, same as the Favorites
+	// roster already allows for two favorited builds of one family.
+	void OpenAbilityRoster(size_t abilityIndex)
+	{
+		g_app.rosterSlots.clear();
+		if (abilityIndex < kAbilityCount)
+		{
+			const int wanted = static_cast<int>(abilityIndex);
+			for (size_t i = 0; i < kFranchiseCount; ++i)
+			{
+				for (const auto& character : kFranchises[i].characters)
+				{
+					const auto& indices = character.abilityIndices;
+					if (std::find(indices.begin(), indices.end(), wanted) != indices.end())
+						g_app.rosterSlots.push_back({RosterSlot::Kind::Character, &character, nullptr});
+				}
+			}
+			for (size_t i = 0; i < kFranchiseCount; ++i)
+			{
+				for (const auto& vehicle : kFranchises[i].vehicles)
+				{
+					for (const auto& build : vehicle.builds)
+					{
+						const auto& indices = build.abilityIndices;
+						if (std::find(indices.begin(), indices.end(), wanted) != indices.end())
+							g_app.rosterSlots.push_back({RosterSlot::Kind::Vehicle, &build, &vehicle});
+					}
+				}
+			}
+		}
+		g_app.rosterIndex = 0;
+		g_app.rosterTopRow = 0;
+		g_app.plusGroup = nullptr;
+		g_app.storyRosterActive = false;
+		g_app.favoritesTileSelected = false;
+		g_app.abilityRosterActive = true;
+		g_app.abilityRosterFilter = abilityIndex;
+		g_app.screen = Screen::RosterList;
+	}
+
 	void OpenRosterList()
 	{
 		if (g_app.favoritesTileSelected)
@@ -4684,6 +4958,7 @@ void UpdateInputOwnership(HWND window);
 		g_app.rosterTopRow = 0;
 		g_app.plusGroup = nullptr;
 		g_app.storyRosterActive = false;
+		g_app.abilityRosterActive = false;
 		g_app.screen = Screen::RosterList;
 	}
 
@@ -4967,7 +5242,7 @@ void UpdateInputOwnership(HWND window);
 
 		constexpr struct { const wchar_t* franchise; const wchar_t* name; } kStoryCharacters[] = {
 			{L"DC Comics", L"Batman"},
-			{L"Lord of the Rings", L"Gandalf"},
+			{L"The Lord of the Rings", L"Gandalf"},
 			{L"The LEGO Movie", L"Wyldstyle"},
 		};
 		for (const auto& character : kStoryCharacters)
@@ -4987,6 +5262,7 @@ void UpdateInputOwnership(HWND window);
 		g_app.rosterTopRow = 0;
 		g_app.plusGroup = nullptr;
 		g_app.storyRosterActive = true;
+		g_app.abilityRosterActive = false;
 		g_app.screen = Screen::RosterList;
 	}
 
@@ -5039,6 +5315,11 @@ void UpdateInputOwnership(HWND window);
 		case Screen::FranchiseList:
 			if (g_app.reorganizingFranchise)
 				DropFranchiseReorder();
+			else if (g_app.franchiseSort == AppState::FranchiseSort::Abilities)
+			{
+				if (g_app.abilityGridIndex < AbilityGridCount())
+					OpenAbilityRoster(g_app.abilityGridIndex);
+			}
 			else
 				OpenRosterList();
 			break;
@@ -5062,8 +5343,13 @@ void UpdateInputOwnership(HWND window);
 				// chosen build. A single-build vehicle loads straight away.
 				// While browsing the Favorites roster the tile already stands
 				// for one specific favorited build (see OpenFavoritesRoster),
-				// so it always loads directly instead of reopening the picker.
-				if (!g_app.favoritesTileSelected && g_app.rosterSlots[g_app.rosterIndex].group &&
+				// so it always loads directly instead of reopening the picker -
+				// same for an Abilities roster (OpenAbilityRoster), where the
+				// tile stands for the one build that actually has the filtered
+				// ability, not necessarily build 1; opening the picker there
+				// would let you wander onto a sibling build without it.
+				if (!g_app.favoritesTileSelected && !g_app.abilityRosterActive &&
+					g_app.rosterSlots[g_app.rosterIndex].group &&
 					g_app.rosterSlots[g_app.rosterIndex].group->builds.size() > 1)
 					OpenPlusPicker(*g_app.rosterSlots[g_app.rosterIndex].group);
 				else if (g_app.rosterSlots[g_app.rosterIndex].entry)
@@ -6911,6 +7197,29 @@ void UpdateInputOwnership(HWND window);
 	// the picker, the web remote, or anywhere else) and every toypad LED
 	// change land on it at the same moment they land on the overlay.
 
+	// Abilities peek: a small card listing the focused character/vehicle's
+	// abilities, shown while buttonAbilitiesPeek is held on RosterList,
+	// PlusPicker, or PadViewer over an occupied pad. Unlike the sneak-peek
+	// HUD above, this draws inline as an ordinary Paint() layer (see
+	// DrawAbilitiesPeekPanel) rather than a separate click-through window -
+	// it only ever needs to be visible while the picker itself already is -
+	// so it only needs its own fade timer, the same two-DWORD-plus-bool shape
+	// as g_peekFadeStart/g_peekHiding above, not a whole second window.
+	bool g_abilitiesPeekHeld = false;   // true only while the button is actually down right now
+	bool g_abilitiesPeekShown = false; // true from fade-in start until fade-out fully completes -
+	                                    // deliberately a separate flag from g_abilitiesPeekHeld (see
+	                                    // AbilitiesPeekShownFraction): the fade-out has to keep
+	                                    // reporting the real in-flight fraction after release, which
+	                                    // it can't do if release also clears the flag it reads.
+	bool g_abilitiesPeekHiding = false;
+	DWORD g_abilitiesPeekFadeStart = 0;
+	// The entry currently shown/fading - a stable pointer into kFranchises,
+	// so nothing needs re-resolving each frame. Left stale (not nulled) once
+	// a hold ends: only ever read while AbilitiesPeekShownFraction() > 0.
+	const RosterEntry* g_abilitiesPeekEntry = nullptr;
+	constexpr DWORD kAbilitiesPeekFadeInMs = 90;
+	constexpr DWORD kAbilitiesPeekFadeOutMs = 130;
+
 	HWND g_peekWindow = nullptr;
 	bool g_peekShown = false;   // window is up (possibly mid fade-out)
 	bool g_peekHiding = false;
@@ -7242,6 +7551,111 @@ void UpdateInputOwnership(HWND window);
 		}
 		mix(g_app.ledMirrorEnabled ? 1u : 0u);
 		return signature;
+	}
+
+	bool AbilitiesPeekFadeActive()
+	{
+		return g_abilitiesPeekFadeStart != 0 &&
+			ElapsedFraction(g_abilitiesPeekFadeStart,
+				g_abilitiesPeekHiding ? kAbilitiesPeekFadeOutMs : kAbilitiesPeekFadeInMs) < 1.0f;
+	}
+
+	// 0 = fully invisible, 1 = fully shown, following whichever fade is
+	// running. Gated on g_abilitiesPeekShown, NOT g_abilitiesPeekHeld: this
+	// has to keep returning the real in-flight fraction for the whole
+	// fade-OUT, which runs entirely after the button has already been
+	// released (g_abilitiesPeekHeld already false by then).
+	float AbilitiesPeekShownFraction()
+	{
+		if (!g_abilitiesPeekShown)
+			return 0.0f;
+		if (g_abilitiesPeekFadeStart == 0)
+			return 1.0f;
+		const float t = EaseOutCubic(ElapsedFraction(g_abilitiesPeekFadeStart,
+			g_abilitiesPeekHiding ? kAbilitiesPeekFadeOutMs : kAbilitiesPeekFadeInMs));
+		return g_abilitiesPeekHiding ? 1.0f - t : t;
+	}
+
+	// Same reversible-fade math as BeginPeekFade above: starts already
+	// `fromShownFraction` of the way there, so a quick tap on/off reverses the
+	// fade instead of restarting it from the far end.
+	void BeginAbilitiesPeekFade(bool out, float fromShownFraction)
+	{
+		g_abilitiesPeekHiding = out;
+		const DWORD duration = out ? kAbilitiesPeekFadeOutMs : kAbilitiesPeekFadeInMs;
+		const float done = out ? 1.0f - fromShownFraction : fromShownFraction;
+		const float linear = 1.0f - std::cbrt(std::clamp(1.0f - done, 0.0f, 1.0f));
+		g_abilitiesPeekFadeStart = GetTickCount() - static_cast<DWORD>(linear * duration);
+		if (g_abilitiesPeekFadeStart == 0)
+			g_abilitiesPeekFadeStart = 1;
+	}
+
+	// The character/vehicle the abilities peek would show for right now, or
+	// null if the current screen/focus has nothing to show. RosterList and
+	// PlusPicker already hold a direct pointer; PadViewer has to resolve the
+	// loaded figure's .bin id back to its RosterEntry.
+	const RosterEntry* ResolveAbilitiesPeekEntry()
+	{
+		switch (g_app.screen)
+		{
+		case Screen::RosterList:
+			if (g_app.rosterIndex < g_app.rosterSlots.size())
+				return g_app.rosterSlots[g_app.rosterIndex].entry;
+			return nullptr;
+		case Screen::PlusPicker:
+			if (g_app.plusGroup && g_app.plusBuildIndex < g_app.plusGroup->builds.size())
+				return &g_app.plusGroup->builds[g_app.plusBuildIndex];
+			return nullptr;
+		case Screen::PadViewer:
+			if (!g_app.selectingMoveDestination && g_app.slotIndex < g_app.padState.size() &&
+				g_app.padState[g_app.slotIndex].occupied)
+				return FindRosterEntryByBinResourceId(g_app.padState[g_app.slotIndex].binResourceId);
+			return nullptr;
+		default:
+			return nullptr;
+		}
+	}
+
+	// Called from every controller poll, right alongside UpdatePeekHold below -
+	// same idea (a pure function of what is held down right now), but the
+	// opposite visibility condition: this only fires while the picker itself
+	// is visible, so the two features can never collide on the same button.
+	void UpdateAbilitiesPeekHold(bool anyConnected, ButtonMask heldButtons)
+	{
+		const bool eligibleScreen = g_app.screen == Screen::RosterList ||
+			g_app.screen == Screen::PlusPicker || g_app.screen == Screen::PadViewer;
+		const bool wants = eligibleScreen &&
+			g_app.buttonAbilitiesPeek != 0 &&
+			anyConnected &&
+			g_app.overlayVisible &&
+			!g_app.capturingShortcut &&
+			g_app.capturingBindingIndex < 0 &&
+			(heldButtons & g_app.buttonAbilitiesPeek) == g_app.buttonAbilitiesPeek;
+
+		if (wants && !g_abilitiesPeekHeld)
+		{
+			const RosterEntry* entry = ResolveAbilitiesPeekEntry();
+			if (entry && !entry->abilityIndices.empty())
+			{
+				// Read the current fraction (0 if this is a fresh show, or
+				// wherever a fade-out-in-progress had gotten to if the button
+				// was tapped again quickly) before flipping either flag, so a
+				// quick re-tap reverses smoothly instead of popping.
+				const float fromFraction = g_abilitiesPeekShown ? AbilitiesPeekShownFraction() : 0.0f;
+				g_abilitiesPeekEntry = entry;
+				g_abilitiesPeekHeld = true;
+				g_abilitiesPeekShown = true;
+				BeginAbilitiesPeekFade(false, fromFraction);
+			}
+		}
+		else if (!wants && g_abilitiesPeekHeld)
+		{
+			// g_abilitiesPeekShown stays true here - AbilitiesPeekShownFraction
+			// still needs to report the real (fully-shown) fraction so the
+			// fade-out starts from where the card actually is, not from 0.
+			g_abilitiesPeekHeld = false;
+			BeginAbilitiesPeekFade(true, AbilitiesPeekShownFraction());
+		}
 	}
 
 	// Called from every controller poll with the buttons currently held down
@@ -7592,6 +8006,52 @@ void UpdateInputOwnership(HWND window);
 		DrawScrollBar(g, trackTop, trackBottom, totalRows, kFranchiseVisibleRows, g_app.franchiseTopRow);
 	}
 
+	// Same grid geometry as DrawFranchiseGrid (shares its constants and the
+	// franchiseTopRow scroll position - the two are never shown at once), but
+	// a flat walk over kAbilities instead of the franchise display list, and
+	// no synthetic Favorites-style tile.
+	void DrawAbilityGrid(Gdiplus::Graphics& g)
+	{
+		const size_t count = AbilityGridCount();
+		if (count == 0)
+			return;
+		const size_t totalRows = (count + kFranchiseCols - 1) / kFranchiseCols;
+		for (size_t row = 0; row < kFranchiseVisibleRows; ++row)
+		{
+			for (size_t col = 0; col < kFranchiseCols; ++col)
+			{
+				const size_t index =
+					(static_cast<size_t>(g_app.franchiseTopRow) + row) * kFranchiseCols + col;
+				if (index >= count)
+					break;
+				const int x = kFranchiseOriginX + static_cast<int>(col) * kFranchisePitchX;
+				const int y = kFranchiseOriginY + static_cast<int>(row) * kFranchisePitchY;
+				const bool focused = index == g_app.abilityGridIndex;
+				const float scale = focused ? SelectionTapScale() : 1.0f;
+				const float cx = x + kFranchiseTileW / 2.0f;
+				const float cy = y + kFranchiseTileH / 2.0f;
+				if (focused)
+				{
+					Gdiplus::Bitmap* glow = RenderFocusGlow(
+						kFranchiseTileW, kFranchiseTileH, FocusShape::RoundedTile, kSelectionGlow);
+					DrawImageScaledAbout(g, glow, static_cast<float>(x - kFocusGlowMargin),
+						static_cast<float>(y - kFocusGlowMargin), cx, cy, scale, SelectionGlowAlpha());
+				}
+				Gdiplus::Bitmap* tile = RenderAbilityTile(index, focused);
+				if (tile)
+				{
+					DrawImageScaledAbout(g, tile, static_cast<float>(x - kTileGlowMargin),
+						static_cast<float>(y - kTileGlowMargin), cx, cy, scale);
+				}
+			}
+		}
+
+		const int trackTop = kFranchiseOriginY;
+		const int trackBottom = kFranchiseOriginY
+			+ static_cast<int>(kFranchiseVisibleRows - 1) * kFranchisePitchY + kFranchiseTileH;
+		DrawScrollBar(g, trackTop, trackBottom, totalRows, kFranchiseVisibleRows, g_app.franchiseTopRow);
+	}
+
 	void DrawRoundedSeparator(Gdiplus::Graphics& g, int x, int y, int width, int height)
 	{
 		Gdiplus::GraphicsPath path;
@@ -7806,6 +8266,156 @@ void UpdateInputOwnership(HWND window);
 		g.DrawString(g_app.status.c_str(), -1, &font, box, &format, &textBrush);
 	}
 
+	// Small card listing the abilities of whichever character/vehicle is
+	// currently held-peeked (see UpdateAbilitiesPeekHold) - held/faded the
+	// same way as the status toast above (translucent plate, soft glow, alpha
+	// scaled by AbilitiesPeekShownFraction). Shaped as a vertical icon+name
+	// list with the entry's name as a header on RosterList/PlusPicker; on
+	// PadViewer it's a plain grid of icons with no text at all - the pad grid
+	// underneath is already busy, and the focused pad's own name label is
+	// right there.
+	void DrawAbilitiesPeekPanel(Gdiplus::Graphics& g, int width, int height)
+	{
+		const float shown = AbilitiesPeekShownFraction();
+		if (shown <= 0.004f || !g_abilitiesPeekEntry)
+			return;
+		const RosterEntry& entry = *g_abilitiesPeekEntry;
+		if (entry.abilityIndices.empty())
+			return;
+
+		constexpr unsigned int kAccent = RGB(168, 120, 255); // same violet as the Abilities sort badge
+		constexpr float kTextPx = 22.0f;
+		const bool showLabels = g_app.screen != Screen::PadViewer;
+
+		Gdiplus::RectF box;
+		if (showLabels)
+		{
+			constexpr float kIconSize = 40.0f;
+			constexpr float kRowH = 48.0f;
+			constexpr float kNameH = 32.0f;
+			constexpr float kPadX = 18.0f;
+			constexpr float kPadY = 12.0f;
+
+			float widest = 170.0f;
+			for (int idx : entry.abilityIndices)
+			{
+				if (idx < 0 || static_cast<size_t>(idx) >= kAbilityCount)
+					continue;
+				widest = std::max(widest, kIconSize + 12.0f + MeasureTextWidth(g, kAbilities[idx].name, kTextPx));
+			}
+			widest = std::max(widest, MeasureTextWidth(g, entry.name, kTextPx));
+			const float boxW = std::clamp(widest + kPadX * 2.0f, 210.0f, 320.0f);
+			const float boxH = kNameH + static_cast<float>(entry.abilityIndices.size()) * kRowH + kPadY * 2.0f;
+			box = Gdiplus::RectF((width - boxW) / 2.0f, height * 0.16f, boxW, boxH);
+		}
+		else
+		{
+			constexpr float kIconSize = 52.0f;
+			constexpr float kGap = 12.0f;
+			constexpr float kPad = 16.0f;
+			constexpr size_t kMaxCols = 6;
+			const size_t count = entry.abilityIndices.size();
+			const size_t cols = std::min(count, kMaxCols);
+			const size_t rows = (count + kMaxCols - 1) / kMaxCols;
+			const float boxW = static_cast<float>(cols) * kIconSize +
+				static_cast<float>(cols > 0 ? cols - 1 : 0) * kGap + kPad * 2.0f;
+			const float boxH = static_cast<float>(rows) * kIconSize +
+				static_cast<float>(rows > 0 ? rows - 1 : 0) * kGap + kPad * 2.0f;
+			box = Gdiplus::RectF((width - boxW) / 2.0f, height * 0.16f, boxW, boxH);
+		}
+
+		Gdiplus::GraphicsPath path;
+		AddRoundedRectPath(path, box, 18.0f);
+
+		// Same quantized-bucket glow sizing as the status toast, so a
+		// session's worth of differently-sized cards doesn't grow the glow
+		// bitmap cache one entry per pixel.
+		constexpr float kSizeBucket = 20.0f;
+		const int glowW = static_cast<int>(std::ceil(box.Width / kSizeBucket)) * static_cast<int>(kSizeBucket);
+		const int glowH = static_cast<int>(std::ceil(box.Height / kSizeBucket)) * static_cast<int>(kSizeBucket);
+		if (Gdiplus::Bitmap* glow = RenderFocusGlow(glowW, glowH, FocusShape::RoundedTile, kAccent))
+		{
+			DrawImageWithAlpha(g, glow,
+				Gdiplus::RectF(box.X + (box.Width - glowW) / 2.0f - kFocusGlowMargin,
+					box.Y + (box.Height - glowH) / 2.0f - kFocusGlowMargin,
+					static_cast<float>(glow->GetWidth()), static_cast<float>(glow->GetHeight())),
+				shown);
+		}
+
+		Gdiplus::SolidBrush fill(Gdiplus::Color(static_cast<BYTE>(220.0f * shown), 12, 14, 22));
+		g.FillPath(&fill, &path);
+		Gdiplus::Pen border(Gdiplus::Color(static_cast<BYTE>(200.0f * shown),
+			GetRValue(kAccent), GetGValue(kAccent), GetBValue(kAccent)), 1.6f);
+		g.DrawPath(&border, &path);
+
+		// One ability's icon (or a placeholder, same circular-initial as a
+		// missing portrait) faded in step with the card itself.
+		const auto drawIcon = [&](const Ability& ability, float x, float y, float size) {
+			Gdiplus::Bitmap* icon = ability.iconResourceId != 0
+				? RenderScaledAsset(ability.iconResourceId, static_cast<int>(size), static_cast<int>(size), 0)
+				: nullptr;
+			if (icon)
+			{
+				DrawImageWithAlpha(g, icon, Gdiplus::RectF(x, y, size, size), shown);
+				return;
+			}
+			if (Gdiplus::Bitmap* placeholder = RenderPlaceholder(
+				ability.name.empty() ? L'?' : ability.name[0], ability.ringColor, false,
+				static_cast<int>(size) - 10))
+			{
+				DrawImageWithAlpha(g, placeholder,
+					Gdiplus::RectF(x, y, static_cast<float>(placeholder->GetWidth()),
+						static_cast<float>(placeholder->GetHeight())), shown);
+			}
+		};
+
+		if (showLabels)
+		{
+			constexpr float kIconSize = 40.0f;
+			constexpr float kRowH = 48.0f;
+			constexpr float kNameH = 32.0f;
+			constexpr float kPadX = 18.0f;
+			constexpr float kPadY = 12.0f;
+			DrawTextLineCentered(g, entry.name, static_cast<int>(box.X), static_cast<int>(box.Y),
+				static_cast<int>(box.Width), RGB(240, 244, 250), static_cast<int>(kNameH + kPadY));
+			float rowY = box.Y + kPadY + kNameH;
+			for (int idx : entry.abilityIndices)
+			{
+				if (idx < 0 || static_cast<size_t>(idx) >= kAbilityCount)
+					continue;
+				const Ability& ability = kAbilities[idx];
+				const float iconX = box.X + kPadX;
+				const float iconY = rowY + (kRowH - kIconSize) / 2.0f;
+				drawIcon(ability, iconX, iconY, kIconSize);
+				DrawTextLineCentered(g, ability.name, static_cast<int>(iconX + kIconSize + 12.0f),
+					static_cast<int>(rowY), static_cast<int>(box.Width - kIconSize - kPadX * 2.0f - 12.0f),
+					RGB(226, 232, 240), static_cast<int>(kRowH));
+				rowY += kRowH;
+			}
+		}
+		else
+		{
+			constexpr float kIconSize = 52.0f;
+			constexpr float kGap = 12.0f;
+			constexpr float kPad = 16.0f;
+			constexpr size_t kMaxCols = 6;
+			size_t col = 0, row = 0;
+			for (int idx : entry.abilityIndices)
+			{
+				if (idx < 0 || static_cast<size_t>(idx) >= kAbilityCount)
+					continue;
+				const float iconX = box.X + kPad + static_cast<float>(col) * (kIconSize + kGap);
+				const float iconY = box.Y + kPad + static_cast<float>(row) * (kIconSize + kGap);
+				drawIcon(kAbilities[idx], iconX, iconY, kIconSize);
+				if (++col >= kMaxCols)
+				{
+					col = 0;
+					++row;
+				}
+			}
+		}
+	}
+
 	// The franchise-sort name badge at top-centre of the browse screens, sitting
 	// inline with the LEGO TOYPAD wordmark (top-left) and the "by harrysof"
 	// credit (top-right). Default/User/Story draw their sort name as word-art
@@ -7846,6 +8456,43 @@ void UpdateInputOwnership(HWND window);
 			return;
 		}
 
+		// Abilities roster: this one spans every franchise that has the
+		// filtered ability, so - like Favorites above - there's no single
+		// world logo. Unlike Favorites, an ability icon isn't self-
+		// explanatory on its own, so its name is drawn under it too.
+		if (g_app.screen == Screen::RosterList && g_app.abilityRosterActive)
+		{
+			if (g_app.abilityRosterFilter >= kAbilityCount)
+				return;
+			const Ability& ability = kAbilities[g_app.abilityRosterFilter];
+			constexpr float kIconH = 56.0f;
+			constexpr float kLabelH = 26.0f;
+			const Gdiplus::RectF iconBox((width - kIconH) / 2.0f, kBadgeTop, kIconH, kIconH);
+			Gdiplus::Bitmap* icon = ability.iconResourceId != 0 ? GetAssetBitmap(ability.iconResourceId) : nullptr;
+			if (icon)
+			{
+				const float scale = std::min(iconBox.Width / icon->GetWidth(), iconBox.Height / icon->GetHeight());
+				const int drawW = static_cast<int>(icon->GetWidth() * scale);
+				const int drawH = static_cast<int>(icon->GetHeight() * scale);
+				if (Gdiplus::Bitmap* cached = RenderScaledAsset(ability.iconResourceId, drawW, drawH, 0))
+					g.DrawImage(cached, iconBox.X + (iconBox.Width - drawW) / 2.0f,
+						iconBox.Y + (iconBox.Height - drawH) / 2.0f);
+			}
+			else if (Gdiplus::Bitmap* placeholder = RenderPlaceholder(
+				ability.name.empty() ? L'?' : ability.name[0], ability.ringColor, false,
+				static_cast<int>(kIconH) - 12))
+			{
+				const float pw = static_cast<float>(placeholder->GetWidth());
+				const float ph = static_cast<float>(placeholder->GetHeight());
+				g.DrawImage(placeholder, iconBox.X + (iconBox.Width - pw) / 2.0f,
+					iconBox.Y + (iconBox.Height - ph) / 2.0f, pw, ph);
+			}
+			DrawTextLineCentered(g, ability.name, static_cast<int>((width - 360.0f) / 2.0f),
+				static_cast<int>(kBadgeTop + kIconH + 4.0f), 360, RGB(230, 236, 246),
+				static_cast<int>(kLabelH));
+			return;
+		}
+
 		int nameResId = 0;
 		unsigned int glowColor = 0;
 		switch (g_app.franchiseSort)
@@ -7865,6 +8512,10 @@ void UpdateInputOwnership(HWND window);
 		case AppState::FranchiseSort::Year2:
 			nameResId = kSortYear2ResourceId;
 			glowColor = RGB(255, 158, 74);  // orange
+			break;
+		case AppState::FranchiseSort::Abilities:
+			nameResId = kSortAbilitiesResourceId;
+			glowColor = RGB(168, 120, 255); // violet
 			break;
 		case AppState::FranchiseSort::Default:
 		default:
@@ -8170,7 +8821,10 @@ void UpdateInputOwnership(HWND window);
 			DrawActionButtons(g);
 			break;
 		case Screen::FranchiseList:
-			DrawFranchiseGrid(g);
+			if (g_app.franchiseSort == AppState::FranchiseSort::Abilities)
+				DrawAbilityGrid(g);
+			else
+				DrawFranchiseGrid(g);
 			DrawSortBadge(g, width);
 			break;
 		case Screen::RosterList:
@@ -8185,6 +8839,13 @@ void UpdateInputOwnership(HWND window);
 			}
 			else if (g_app.favoritesTileSelected)
 			{
+				DrawSortBadge(g, width);
+			}
+			else if (g_app.abilityRosterActive)
+			{
+				// This roster spans every franchise that has the filtered
+				// ability, so (like Story/Favorites above) there's no single
+				// world logo to show - the ability's own icon + name instead.
 				DrawSortBadge(g, width);
 			}
 			else
@@ -8429,6 +9090,17 @@ void UpdateInputOwnership(HWND window);
 				{
 					g.DrawImage(cachedText, textX, hintCenterY - kHintTextH / 2.0f);
 				}
+
+				// "Abilities" hint stacked to the left, icon-only peek panel
+				// (see DrawAbilitiesPeekPanel) - only when the focused pad is
+				// occupied by something that actually has ability data.
+				if (const RosterEntry* peekEntry = ResolveAbilitiesPeekEntry();
+					peekEntry && !peekEntry->abilityIndices.empty())
+				{
+					constexpr float kHintStackGap = 20.0f;
+					DrawButtonHint(g, g_app.buttonAbilitiesPeek, L"Abilities",
+						originX - kHintStackGap, hintCenterY, kHintYButtonH);
+				}
 			}
 		}
 
@@ -8447,7 +9119,13 @@ void UpdateInputOwnership(HWND window);
 			if (g_app.favoritesTileSelected)
 			{
 				rightEdge -= kHintStackGap;
-				DrawButtonHint(g, g_app.buttonReorganizeRoster, L"Organize", rightEdge, hintCenterY, kHintButtonH);
+				rightEdge -= DrawButtonHint(g, g_app.buttonReorganizeRoster, L"Organize", rightEdge, hintCenterY, kHintButtonH);
+			}
+			if (const RosterEntry* peekEntry = ResolveAbilitiesPeekEntry();
+				peekEntry && !peekEntry->abilityIndices.empty())
+			{
+				rightEdge -= kHintStackGap;
+				DrawButtonHint(g, g_app.buttonAbilitiesPeek, L"Abilities", rightEdge, hintCenterY, kHintButtonH);
 			}
 			// Story/Favorites browse rosters can also change the sort; the sort
 			// hint sits on the left so it stays clear of Favorite/Organize.
@@ -8474,6 +9152,7 @@ void UpdateInputOwnership(HWND window);
 		}
 
 		DrawStatusToast(g, width, height);
+		DrawAbilitiesPeekPanel(g, width, height);
 
 		// Nothing in the picker can be driven without a pad, so an empty
 		// controller list is called out over whatever screen is up. Drawn
@@ -8725,6 +9404,7 @@ void PollController(HWND window)
 		// particular before the capture branches, which would otherwise
 		// leave it stuck on screen for as long as a capture lasts.
 		UpdatePeekHold(anyConnected, combinedButtons);
+		UpdateAbilitiesPeekHold(anyConnected, combinedButtons);
 
 		// -------------------------------------------------------------
 		// Shortcut capture takes over completely while active.
@@ -10410,7 +11090,8 @@ if (changed)
 				const bool pulsing = ScreenHasPulsingFocus();
 				const int pulseStep = pulsing ? FocusPulseStep() : -1;
 				const bool continuous = ledAnimating || ScreenTransitionActive() ||
-					WindowFadeActive() || SelectionTapActive() || StatusToastActive();
+					WindowFadeActive() || SelectionTapActive() || StatusToastActive() ||
+					AbilitiesPeekFadeActive();
 				if (continuous || (pulsing && pulseStep != lastPulseStep))
 				{
 					constexpr DWORD kMinAnimationFrameMs = 16; // never above ~60fps

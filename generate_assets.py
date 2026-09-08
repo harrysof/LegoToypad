@@ -119,7 +119,6 @@ NAME_OVERRIDES = {
     "Flyin Time Train": "Flying Time Train",
     "Saturns Sandworm": "Saturn's Sandworm",
     "Bane's Drill Diver": "Drill Driver",
-    "The Joker's Lock 'n' Laser Jet": "Lock 'n' Laser Jet",
     "Superman's Hover Pod": "Hover Pod",
     "Ktypton Striker": "Krypton Striker",
     "Wonderwoman's Invisible Jet": "Invisible Jet",
@@ -131,11 +130,34 @@ NAME_OVERRIDES = {
     "Destruct-O-Mech": "Destruct-o-Mech",
     "Taunt-O-Vision": "Taunt-o-Vision",
     "Canon Bike": "Cannon Bike",
+    "Bane Dig 'n' Drill": "Bane Dig 'n Drill",
+    "Bane Drill 'n' Blast": "Bane Drill 'n Blast",
+    "Quinn Mobile": "Quinn-mobile",
+    "Gadget-O-Matic": "Gadget-o-Matic",
+    "Rainbow Canon": "Rainbow Cannon",
 }
 
 
 def display_name(name: str) -> str:
     return NAME_OVERRIDES.get(name, name)
+
+
+# Aliases for abilities.csv "Entity" values that name the same character/
+# vehicle as this app's data but spell it differently. Applied to the raw
+# abilities.csv entity string before matching; everything else resolves
+# through the fold-based matching in load_abilities()/apply_abilities() below,
+# which already tries both the raw source name and its NAME_OVERRIDES-mapped
+# display name, so most entities need no entry here at all.
+ABILITY_NAME_OVERRIDES = {
+    # LOTR spider vehicle: abilities.csv says "8-Legged" leg count, this app's
+    # source data (and the real vehicle) has 6.
+    "8-Legged Stalker": "6-Legged Stalker",
+    # abilities.csv uses the short form; this app's own name is the long one
+    # (see NAME_OVERRIDES history - "Lock 'n' Laser Jet" used to be this
+    # vehicle's display name too, until it was reverted to match the source
+    # data exactly).
+    "Lock 'n' Laser Jet": "The Joker's Lock 'n' Laser Jet",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +353,146 @@ def load_vehicle_families(csv_path):
 
 
 # ---------------------------------------------------------------------------
+# Abilities
+# ---------------------------------------------------------------------------
+# The source of truth is the hand-maintained abilities.csv at the project
+# root (Entity, Type, Abilities - a comma list), a conversion of the
+# LEGO_Dimensions_Abilities.xlsx "Characters & Vehicles" sheet. Vehicles are
+# keyed by each individual BUILD's own name (matching vehicles.csv's
+# "Vehicle" column, not its "Family" column) - different builds of the same
+# vehicle family genuinely have different abilities in the real game.
+
+def fold_name(s: str) -> str:
+    """Loose match key: case-insensitive, ignores a leading "The ", ignores
+    everything but letters/digits. Shared by every abilities.csv <-> roster
+    name comparison below."""
+    s = s.strip().lower()
+    s = re.sub(r"^the\s+", "", s)
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def load_abilities(csv_path):
+    """Returns a list of (entity, type, [ability names]) rows from
+    abilities.csv. Missing file -> empty list (the feature just has no
+    data, same graceful-degradation as a missing vehicles.csv)."""
+    rows = []
+    if not csv_path or not csv_path.is_file():
+        return rows
+    with open(csv_path, "r", newline="", encoding="utf-8") as fp:
+        reader = csv.DictReader(fp)
+        for row in reader:
+            entity = (row.get("Entity") or "").strip()
+            abilities_field = (row.get("Abilities") or "").strip()
+            if not entity or not abilities_field:
+                continue
+            abilities = [a.strip() for a in abilities_field.split(",") if a.strip()]
+            if abilities:
+                rows.append((entity, (row.get("Type") or "").strip(), abilities))
+    return rows
+
+
+def parse_entity_hint(raw):
+    """Splits a trailing "(Franchise)" disambiguator off an entity name, e.g.
+    "Batman (The LEGO Batman Movie)" -> ("Batman", "The LEGO Batman Movie").
+    Only used as a fallback: some real entity names are themselves
+    parenthesized (e.g. the vehicle "Ecto-1 (2016)"), so callers always try
+    matching the whole raw name first and only fall back to this split when
+    that fails."""
+    match = re.match(r"^(.*)\s\(([^)]+)\)\s*$", raw.strip())
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return raw.strip(), None
+
+
+def apply_abilities(franchises, ability_rows, warnings):
+    """Attaches an "abilities" list (ability names) to every matched
+    character/vehicle-build dict under `franchises`, mutating them in place.
+    Returns the sorted list of distinct ability names that ended up attached
+    to at least one entry - the only ones worth a tile in the Abilities
+    browse grid, since anything else would be a dead end."""
+    # fold(name) -> [(name, franchise_name, entry_dict), ...], indexed under
+    # both the raw source name (the .bin stem / vehicles.csv "Vehicle" value,
+    # before NAME_OVERRIDES) and the display name shown in the app, so an
+    # abilities.csv row matches whichever spelling it used. entry["name"] is
+    # already the post-override display name by the time this runs - the raw
+    # form only survives in entry["rawName"], stashed for exactly this.
+    entity_index = {}
+
+    def index(entry, franchise_name):
+        for n in {entry["name"], entry.get("rawName", entry["name"])}:
+            entity_index.setdefault(fold_name(n), []).append((n, franchise_name, entry))
+
+    for franchise in franchises:
+        for character in franchise["characters"]:
+            index(character, franchise["name"])
+        for group in franchise["vehicles"]:
+            for build in group["builds"]:
+                index(build, franchise["name"])
+
+    def resolve_hint(base, hint):
+        candidates = entity_index.get(fold_name(base), [])
+        exact = [c for c in candidates if fold_name(c[1]) == fold_name(hint)]
+        if exact:
+            return exact
+        return [c for c in candidates
+                if fold_name(hint) in fold_name(c[1]) or fold_name(c[1]) in fold_name(hint)]
+
+    # Pre-pass: which (base name, franchise) pairs are already explicitly
+    # claimed by a hinted row, so an unhinted duplicate (e.g. plain "Batman",
+    # once "Batman (The LEGO Batman Movie)" has claimed that franchise) can
+    # resolve to the one franchise left rather than guessing between two.
+    claimed = {}
+    for entity, _etype, _abilities in ability_rows:
+        aliased = ABILITY_NAME_OVERRIDES.get(entity, entity)
+        if fold_name(aliased) in entity_index:
+            continue
+        base, hint = parse_entity_hint(aliased)
+        if not hint:
+            continue
+        for _n, franchise_name, _e in resolve_hint(base, hint):
+            claimed.setdefault(fold_name(base), set()).add(fold_name(franchise_name))
+
+    used_ability_names = set()
+    for entity, _etype, abilities in ability_rows:
+        aliased = ABILITY_NAME_OVERRIDES.get(entity, entity)
+        targets = None  # None = ambiguous; [] = no candidates at all
+
+        if fold_name(aliased) in entity_index:
+            targets = entity_index[fold_name(aliased)]
+        else:
+            base, hint = parse_entity_hint(aliased)
+            candidates = entity_index.get(fold_name(base), [])
+            if not candidates:
+                targets = []
+            elif hint:
+                chosen = resolve_hint(base, hint)
+                targets = chosen if chosen else None
+            else:
+                franchises_seen = set(c[1] for c in candidates)
+                if len(franchises_seen) == 1:
+                    targets = candidates
+                else:
+                    remaining = [c for c in candidates
+                                if fold_name(c[1]) not in claimed.get(fold_name(base), set())]
+                    targets = remaining if len(set(c[1] for c in remaining)) == 1 else None
+
+        if not targets:
+            if targets == []:
+                warnings.append("ability data for '%s' has no matching character/vehicle "
+                                "in this app's roster (skipped)" % entity)
+            else:
+                warnings.append("ability data for '%s' is ambiguous across franchises "
+                                "(skipped)" % entity)
+            continue
+
+        for _name, _franchise, entry in targets:
+            entry["abilities"] = list(abilities)
+            used_ability_names.update(abilities)
+
+    return sorted(used_ability_names, key=lambda n: n.casefold())
+
+
+# ---------------------------------------------------------------------------
 # Main generation
 # ---------------------------------------------------------------------------
 
@@ -397,6 +559,7 @@ def generate(root: Path, out_dir: Path) -> int:
                 ascii_ok([str(binary), str(portrait)], warnings)
             characters.append({
                 "name": display_name(binary.stem),
+                "rawName": binary.stem,
                 "bin": bin_sym,
                 "png": png_sym,
                 "build": 0,
@@ -431,7 +594,8 @@ def generate(root: Path, out_dir: Path) -> int:
                 group = {"character": owner or "", "base": display_name(family), "builds": []}
                 veh_groups[group_key] = group
             group["builds"].append({
-                "name": display_name(name), "bin": bin_sym, "png": png_sym, "build": build,
+                "name": display_name(name), "rawName": name,
+                "bin": bin_sym, "png": png_sym, "build": build,
             })
 
         vehicles = []
@@ -452,6 +616,14 @@ def generate(root: Path, out_dir: Path) -> int:
     # order ids so the .rc and the table agree; ids already assigned in walk
     # order above, which is deterministic because world/char/vehicle iteration
     # is sorted.
+
+    # ---- abilities ----------------------------------------------------
+    # Matches abilities.csv rows onto the characters/vehicle-builds just
+    # assembled above (needs `franchises` fully built for the franchise-hint
+    # disambiguation in apply_abilities). Icon resources are allocated later,
+    # once assets_files() is available.
+    ability_rows = load_abilities(root / "abilities.csv")
+    ability_catalog_names = apply_abilities(franchises, ability_rows, warnings)
 
     # ---- app-level assets -------------------------------------------------
     # The Assets tree is organized into category folders (Wallpapers, Pads,
@@ -597,15 +769,70 @@ def generate(root: Path, out_dir: Path) -> int:
         if candidate.stem.casefold() == "settings_tile":
             settings_tile = candidate
             break
+    # Same optional-with-fallback shape as settings_tile above (see
+    # kAbilitiesTileResourceId in main.cpp): falls back to characters_tile at
+    # runtime if this file isn't present. Matches either "abilities_tile" (the
+    # naming convention of the other *_tile files) or bare "abilities" (what
+    # the panel art was actually dropped in as).
+    abilities_tile = None
+    for candidate in assets_files:
+        if candidate.stem.casefold() in ("abilities_tile", "abilities"):
+            abilities_tile = candidate
+            break
     world_tile_sym = symbols.allocate("ASSET_WORLD_TILE", world_tile) if world_tile else None
     characters_tile_sym = symbols.allocate("ASSET_CHARACTERS_TILE", characters_tile) if characters_tile else None
     settings_tile_sym = symbols.allocate("ASSET_SETTINGS_TILE", settings_tile) if settings_tile else None
+    abilities_tile_sym = symbols.allocate("ASSET_ABILITIES_TILE", abilities_tile) if abilities_tile else None
     if world_tile:
         ascii_ok([str(world_tile)], warnings)
     if characters_tile:
         ascii_ok([str(characters_tile)], warnings)
     if settings_tile:
         ascii_ok([str(settings_tile)], warnings)
+    if abilities_tile:
+        ascii_ok([str(abilities_tile)], warnings)
+
+    # ---- ability icons ------------------------------------------------
+    # One PNG per ability under Assets/Abilities/, matched to a catalog name
+    # (from abilities.csv via apply_abilities above) case/space-insensitively,
+    # same normalized-match convention as character/vehicle portraits
+    # (pair_bins_and_images). Filenames may use the full sheet name
+    # ("Acrobat Ability.png") or the short display form ("Acrobat.png") - an
+    # ability with neither gets iconResourceId 0 and the app falls back to
+    # its RenderPlaceholder() circular-initial, same as a missing portrait -
+    # so the feature works today with zero icons and they can be dropped in
+    # incrementally without touching code.
+    abilities_assets_root = discover_case_insensitive(assets_root, "Abilities")
+    ability_icon_by_norm = {}
+    for p in image_files(abilities_assets_root):
+        ability_icon_by_norm.setdefault(normalize(p.stem), p)
+
+    def ability_short_name(name):
+        return re.sub(r"\s+Ability$", "", name).strip()
+
+    ability_table = []
+    icons_found = 0
+    for name in ability_catalog_names:
+        icon_path = (ability_icon_by_norm.get(normalize(name))
+                    or ability_icon_by_norm.get(normalize(ability_short_name(name))))
+        ability_icon_sym = None
+        if icon_path:
+            ability_icon_sym = symbols.allocate("ABILITY_%s_PNG" % sanitize(name), icon_path)
+            ascii_ok([str(icon_path)], warnings)
+            icons_found += 1
+        ability_table.append({
+            "name": ability_short_name(name),
+            "icon": ability_icon_sym,
+            "ringColor": ring_color_for("ABILITY_%s" % sanitize(name)),
+        })
+
+    ability_index_by_name = {name: i for i, name in enumerate(ability_catalog_names)}
+    for franchise in franchises:
+        for character in franchise["characters"]:
+            character["abilityIndices"] = [ability_index_by_name[a] for a in character.get("abilities", [])]
+        for group in franchise["vehicles"]:
+            for build in group["builds"]:
+                build["abilityIndices"] = [ability_index_by_name[a] for a in build.get("abilities", [])]
 
     # ---- action button assets ---------------------------------------------
     textfield_bar   = None
@@ -643,14 +870,16 @@ def generate(root: Path, out_dir: Path) -> int:
     sort_starter  = pick_named({"starter_sort"}, "starter sort badge")
     sort_year1    = pick_named({"year1_sort"},   "year 1 sort badge")
     sort_year2    = pick_named({"year2_sort"},   "year 2 sort badge")
+    sort_abilities = pick_named({"abilities_sort"}, "abilities sort badge")
     sort_default_sym = symbols.allocate("ASSET_SORT_DEFAULT", sort_default) if sort_default else None
     sort_user_sym    = symbols.allocate("ASSET_SORT_USER",    sort_user)    if sort_user    else None
     sort_starter_sym = symbols.allocate("ASSET_SORT_STARTER", sort_starter) if sort_starter else None
     sort_year1_sym   = symbols.allocate("ASSET_SORT_YEAR1",   sort_year1)   if sort_year1   else None
     sort_year2_sym   = symbols.allocate("ASSET_SORT_YEAR2",   sort_year2)   if sort_year2   else None
+    sort_abilities_sym = symbols.allocate("ASSET_SORT_ABILITIES", sort_abilities) if sort_abilities else None
     for name, asset in [("default_sort", sort_default), ("user_sort", sort_user),
                         ("starter_sort", sort_starter), ("year1_sort", sort_year1),
-                        ("year2_sort", sort_year2)]:
+                        ("year2_sort", sort_year2), ("abilities_sort", sort_abilities)]:
         if asset:
             ascii_ok([str(asset)], warnings)
         else:
@@ -895,6 +1124,14 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("    std::wstring name;       // character name or vehicle base name")
     header.append("    unsigned int ringColor;  // deterministic, see generator")
     header.append("    int buildNumber;         // 0 = character, 1/2/3 = vehicle build")
+    header.append("    std::vector<int> abilityIndices;  // indices into kAbilities[]")
+    header.append("};")
+    header.append("")
+    header.append("struct Ability")
+    header.append("{")
+    header.append("    std::wstring name;       // short display form (\" Ability\" suffix stripped)")
+    header.append("    int iconResourceId;      // RCDATA id of the .png, 0 = none (placeholder shown)")
+    header.append("    unsigned int ringColor;  // deterministic, see generator")
     header.append("};")
     header.append("")
     header.append("struct VehicleGroup")
@@ -931,6 +1168,8 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("")
     header.append("extern const Franchise kFranchises[];")
     header.append("extern const size_t kFranchiseCount;")
+    header.append("extern const Ability kAbilities[];")
+    header.append("extern const size_t kAbilityCount;")
     header.append("extern const BackgroundChoice kBackgroundChoices[];")
     header.append("extern const size_t kBackgroundChoiceCount;")
     header.append("extern const WebFile kWebFiles[];")
@@ -964,6 +1203,8 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const int kSortStarterResourceId;")
     header.append("extern const int kSortYear1ResourceId;")
     header.append("extern const int kSortYear2ResourceId;")
+    header.append("extern const int kSortAbilitiesResourceId;")
+    header.append("extern const int kAbilitiesTileResourceId;")
     header.append("// Single source of truth for the app version shown in the UI (web")
     header.append("// catalog's \"version\" field) - kept in lockstep with APP_VERSION")
     header.append("// below, which also stamps the exe's own FILEVERSION/ProductVersion.")
@@ -1020,6 +1261,8 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kSortStarterResourceId = %s;" % (sort_starter_sym["name"] if sort_starter_sym else "0"))
     cpp.append("const int kSortYear1ResourceId = %s;" % (sort_year1_sym["name"] if sort_year1_sym else "0"))
     cpp.append("const int kSortYear2ResourceId = %s;" % (sort_year2_sym["name"] if sort_year2_sym else "0"))
+    cpp.append("const int kSortAbilitiesResourceId = %s;" % (sort_abilities_sym["name"] if sort_abilities_sym else "0"))
+    cpp.append("const int kAbilitiesTileResourceId = %s;" % (abilities_tile_sym["name"] if abilities_tile_sym else "0"))
     cpp.append("const wchar_t kAppVersion[] = L\"%s\";" % APP_VERSION)
     cpp.append("")
     cpp.append("const int kControllerIconResourceIds[%d][%d] = {"
@@ -1049,9 +1292,10 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("")
 
     def emit_entry(entry):
-        return ("{ %s, %s, %s, %s, %d }"
+        indices = ", ".join(str(i) for i in entry.get("abilityIndices", []))
+        return ("{ %s, %s, %s, %s, %d, { %s } }"
                 % (entry["bin"]["name"], entry["png"]["name"], wstr(entry["name"]),
-                   ring_color_for(entry["bin"]["name"]), entry["build"]))
+                   ring_color_for(entry["bin"]["name"]), entry["build"], indices))
 
     def emit_group(group):
         build_entries = ", ".join(emit_entry(e) for e in group["builds"])
@@ -1068,6 +1312,19 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("};")
     cpp.append("")
     cpp.append("const size_t kFranchiseCount = %d;" % len(franchises))
+    cpp.append("")
+    cpp.append("const Ability kAbilities[] = {")
+    # An empty initializer list is not valid C++ (same issue as kPadSkins
+    # above) - if abilities.csv is ever missing/empty, emit one inert sentinel
+    # (empty name) rather than nothing; main.cpp skips empty-name entries when
+    # building the Abilities browse grid.
+    for ability in (ability_table or [{"name": "", "icon": None, "ringColor": "0"}]):
+        cpp.append("    { %s, %s, %s }," % (
+            wstr(ability["name"]),
+            ability["icon"]["name"] if ability["icon"] else "0",
+            ability["ringColor"]))
+    cpp.append("};")
+    cpp.append("const size_t kAbilityCount = sizeof(kAbilities) / sizeof(kAbilities[0]);")
     cpp.append("")
     cpp.append("const WebFile kWebFiles[] = {")
     for entry in sorted(web_files, key=lambda w: w["name"].casefold()):
@@ -1139,6 +1396,8 @@ def generate(root: Path, out_dir: Path) -> int:
     print("assets root: %s" % assets_root)
     print("worlds: %d, characters: %d, vehicles: %d, resources: %d"
           % (len(franchises), char_count, veh_count, len(symbols.by_name)))
+    print("abilities: %d in catalog, %d with icons, %d showing a placeholder"
+          % (len(ability_table), icons_found, len(ability_table) - icons_found))
     print("wrote: %s" % (", ".join(written) if written else "nothing changed"))
     for warning in warnings:
         print("WARNING: %s" % warning)
