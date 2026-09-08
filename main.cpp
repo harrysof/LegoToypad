@@ -2240,8 +2240,8 @@ void UpdateInputOwnership(HWND window);
 			return nullptr;
 		const Ability& ability = kAbilities[abilityIndex];
 
-		constexpr int tileW = 190;
-		constexpr int tileH = 100;
+		constexpr int tileW = 260;
+		constexpr int tileH = 136;
 		constexpr int margin = 6;
 		const int w = tileW + margin * 2;
 		const int h = tileH + margin * 2;
@@ -2277,8 +2277,8 @@ void UpdateInputOwnership(HWND window);
 		}
 
 		// Icon in the upper band, short name in the lower band.
-		constexpr float iconAreaH = 56.0f;
-		constexpr float labelAreaH = 30.0f;
+		constexpr float iconAreaH = 76.0f;
+		constexpr float labelAreaH = 40.0f;
 		const Gdiplus::RectF iconBox(margin + 8.0f, margin + 4.0f, tileW - 16.0f, iconAreaH);
 		Gdiplus::Bitmap* icon = ability.iconResourceId != 0 ? GetAssetBitmap(ability.iconResourceId) : nullptr;
 		if (icon)
@@ -2294,7 +2294,7 @@ void UpdateInputOwnership(HWND window);
 			g.ResetClip();
 		}
 		else if (Gdiplus::Bitmap* placeholder = RenderPlaceholder(
-			ability.name.empty() ? L'?' : ability.name[0], ability.ringColor, focused, 44))
+			ability.name.empty() ? L'?' : ability.name[0], ability.ringColor, focused, 60))
 		{
 			const float pw = static_cast<float>(placeholder->GetWidth());
 			const float ph = static_cast<float>(placeholder->GetHeight());
@@ -3991,6 +3991,11 @@ void UpdateInputOwnership(HWND window);
 	// scrollable viewport (kFranchiseVisibleRows rows shown at a time).
 	constexpr size_t kFranchiseCols = 4;
 	constexpr size_t kFranchiseVisibleRows = 4;
+	// Abilities grid (same screen, different sort - see DrawAbilityGrid):
+	// fewer, bigger columns than the franchise grid, since an ability icon
+	// needs to read at a glance and 4-per-row read as small.
+	constexpr size_t kAbilityCols = 3;
+	constexpr size_t kAbilityVisibleRows = 3;
 
 	// Franchise grid sorting --------------------------------------------------
 	// The grid shows an *effective* display list (franchiseDisplayList) that
@@ -4227,20 +4232,20 @@ void UpdateInputOwnership(HWND window);
 		const size_t count = AbilityGridCount();
 		if (count == 0)
 			return;
-		const size_t rows = (count + kFranchiseCols - 1) / kFranchiseCols;
-		size_t row = g_app.abilityGridIndex / kFranchiseCols;
-		size_t col = g_app.abilityGridIndex % kFranchiseCols;
+		const size_t rows = (count + kAbilityCols - 1) / kAbilityCols;
+		size_t row = g_app.abilityGridIndex / kAbilityCols;
+		size_t col = g_app.abilityGridIndex % kAbilityCols;
 
 		row = (row + static_cast<size_t>(dy) + rows) % rows;
-		const size_t lastCol = std::min(kFranchiseCols, count - row * kFranchiseCols) - 1;
+		const size_t lastCol = std::min(kAbilityCols, count - row * kAbilityCols) - 1;
 		col = (col + static_cast<size_t>(dx) + lastCol + 1) % (lastCol + 1);
 
-		g_app.abilityGridIndex = row * kFranchiseCols + col;
+		g_app.abilityGridIndex = row * kAbilityCols + col;
 
 		const int focusedRow = static_cast<int>(row);
 		while (focusedRow < g_app.franchiseTopRow)
 			--g_app.franchiseTopRow;
-		while (focusedRow >= g_app.franchiseTopRow + static_cast<int>(kFranchiseVisibleRows))
+		while (focusedRow >= g_app.franchiseTopRow + static_cast<int>(kAbilityVisibleRows))
 			++g_app.franchiseTopRow;
 		if (g_app.franchiseTopRow < 0)
 			g_app.franchiseTopRow = 0;
@@ -7000,6 +7005,17 @@ void UpdateInputOwnership(HWND window);
 	constexpr int kFranchiseTileH = 100;
 	constexpr int kTileGlowMargin = 6;
 
+	// Abilities grid geometry (kAbilityCols=3 wide, kAbilityVisibleRows=3
+	// tall): same origin and same right/bottom edge as the franchise grid
+	// above (40 + 3*280 = 40 + 4*210 = 880 right edge; last tile's bottom
+	// edge is 552 either way), just fewer, proportionally bigger tiles.
+	constexpr int kAbilityOriginX = 40;
+	constexpr int kAbilityOriginY = 128;
+	constexpr int kAbilityPitchX = 280;
+	constexpr int kAbilityPitchY = 144;
+	constexpr int kAbilityTileW = 260;
+	constexpr int kAbilityTileH = 136;
+
 	// Roster grid layout lives with the roster navigation constants above,
 	// because navigation and painting both need the same visual row model.
 
@@ -8015,25 +8031,25 @@ void UpdateInputOwnership(HWND window);
 		const size_t count = AbilityGridCount();
 		if (count == 0)
 			return;
-		const size_t totalRows = (count + kFranchiseCols - 1) / kFranchiseCols;
-		for (size_t row = 0; row < kFranchiseVisibleRows; ++row)
+		const size_t totalRows = (count + kAbilityCols - 1) / kAbilityCols;
+		for (size_t row = 0; row < kAbilityVisibleRows; ++row)
 		{
-			for (size_t col = 0; col < kFranchiseCols; ++col)
+			for (size_t col = 0; col < kAbilityCols; ++col)
 			{
 				const size_t index =
-					(static_cast<size_t>(g_app.franchiseTopRow) + row) * kFranchiseCols + col;
+					(static_cast<size_t>(g_app.franchiseTopRow) + row) * kAbilityCols + col;
 				if (index >= count)
 					break;
-				const int x = kFranchiseOriginX + static_cast<int>(col) * kFranchisePitchX;
-				const int y = kFranchiseOriginY + static_cast<int>(row) * kFranchisePitchY;
+				const int x = kAbilityOriginX + static_cast<int>(col) * kAbilityPitchX;
+				const int y = kAbilityOriginY + static_cast<int>(row) * kAbilityPitchY;
 				const bool focused = index == g_app.abilityGridIndex;
 				const float scale = focused ? SelectionTapScale() : 1.0f;
-				const float cx = x + kFranchiseTileW / 2.0f;
-				const float cy = y + kFranchiseTileH / 2.0f;
+				const float cx = x + kAbilityTileW / 2.0f;
+				const float cy = y + kAbilityTileH / 2.0f;
 				if (focused)
 				{
 					Gdiplus::Bitmap* glow = RenderFocusGlow(
-						kFranchiseTileW, kFranchiseTileH, FocusShape::RoundedTile, kSelectionGlow);
+						kAbilityTileW, kAbilityTileH, FocusShape::RoundedTile, kSelectionGlow);
 					DrawImageScaledAbout(g, glow, static_cast<float>(x - kFocusGlowMargin),
 						static_cast<float>(y - kFocusGlowMargin), cx, cy, scale, SelectionGlowAlpha());
 				}
@@ -8046,10 +8062,10 @@ void UpdateInputOwnership(HWND window);
 			}
 		}
 
-		const int trackTop = kFranchiseOriginY;
-		const int trackBottom = kFranchiseOriginY
-			+ static_cast<int>(kFranchiseVisibleRows - 1) * kFranchisePitchY + kFranchiseTileH;
-		DrawScrollBar(g, trackTop, trackBottom, totalRows, kFranchiseVisibleRows, g_app.franchiseTopRow);
+		const int trackTop = kAbilityOriginY;
+		const int trackBottom = kAbilityOriginY
+			+ static_cast<int>(kAbilityVisibleRows - 1) * kAbilityPitchY + kAbilityTileH;
+		DrawScrollBar(g, trackTop, trackBottom, totalRows, kAbilityVisibleRows, g_app.franchiseTopRow);
 	}
 
 	void DrawRoundedSeparator(Gdiplus::Graphics& g, int x, int y, int width, int height)
@@ -8284,45 +8300,56 @@ void UpdateInputOwnership(HWND window);
 			return;
 
 		constexpr unsigned int kAccent = RGB(168, 120, 255); // same violet as the Abilities sort badge
-		constexpr float kTextPx = 22.0f;
-		const bool showLabels = g_app.screen != Screen::PadViewer;
 
-		Gdiplus::RectF box;
-		if (showLabels)
-		{
-			constexpr float kIconSize = 40.0f;
-			constexpr float kRowH = 48.0f;
-			constexpr float kNameH = 32.0f;
-			constexpr float kPadX = 18.0f;
-			constexpr float kPadY = 12.0f;
+		// Icons only, no names, on every screen this shows on (RosterList,
+		// PlusPicker, PadViewer) - now that most abilities have real art
+		// instead of placeholder letters, the icon alone reads faster than a
+		// wall of ability names, and it means one panel shape everywhere
+		// instead of a RosterList-only list layout plus a PadViewer-only grid.
+		constexpr float kMaxIconSize = 96.0f;
+		constexpr float kMinIconSize = 64.0f;
+		constexpr float kGap = 16.0f;
+		constexpr float kPad = 20.0f;
+		constexpr size_t kPreferredCols = 2;
+		constexpr size_t kWidestCols = 5; // Ethan Hunt's 13 abilities tops out here
+		const size_t count = entry.abilityIndices.size();
+		// Budget for the widen/shrink pass below, not the final position -
+		// the box is centered in the full window once its size is known.
+		const float availableH = height * 0.78f;
 
-			float widest = 170.0f;
-			for (int idx : entry.abilityIndices)
-			{
-				if (idx < 0 || static_cast<size_t>(idx) >= kAbilityCount)
-					continue;
-				widest = std::max(widest, kIconSize + 12.0f + MeasureTextWidth(g, kAbilities[idx].name, kTextPx));
-			}
-			widest = std::max(widest, MeasureTextWidth(g, entry.name, kTextPx));
-			const float boxW = std::clamp(widest + kPadX * 2.0f, 210.0f, 320.0f);
-			const float boxH = kNameH + static_cast<float>(entry.abilityIndices.size()) * kRowH + kPadY * 2.0f;
-			box = Gdiplus::RectF((width - boxW) / 2.0f, height * 0.16f, boxW, boxH);
-		}
-		else
+		// 2 big icons per row by default, but a heavily-abilitied character
+		// would stack enough rows at full size to run off the bottom of the
+		// overlay - widen (more columns, still full-size icons) before ever
+		// shrinking the icons themselves, so a busy character reads as a
+		// wider grid of big icons rather than a tall column of small ones.
+		size_t cols = std::min(count, kPreferredCols);
+		size_t rows = cols == 0 ? 0 : (count + cols - 1) / cols;
+		while (cols < std::min(count, kWidestCols))
 		{
-			constexpr float kIconSize = 52.0f;
-			constexpr float kGap = 12.0f;
-			constexpr float kPad = 16.0f;
-			constexpr size_t kMaxCols = 6;
-			const size_t count = entry.abilityIndices.size();
-			const size_t cols = std::min(count, kMaxCols);
-			const size_t rows = (count + kMaxCols - 1) / kMaxCols;
-			const float boxW = static_cast<float>(cols) * kIconSize +
-				static_cast<float>(cols > 0 ? cols - 1 : 0) * kGap + kPad * 2.0f;
-			const float boxH = static_cast<float>(rows) * kIconSize +
-				static_cast<float>(rows > 0 ? rows - 1 : 0) * kGap + kPad * 2.0f;
-			box = Gdiplus::RectF((width - boxW) / 2.0f, height * 0.16f, boxW, boxH);
+			const float neededH = static_cast<float>(rows) * kMaxIconSize +
+				static_cast<float>(rows - 1) * kGap + kPad * 2.0f;
+			if (neededH <= availableH)
+				break;
+			++cols;
+			rows = (count + cols - 1) / cols;
 		}
+
+		float iconSize = kMaxIconSize;
+		if (rows > 0)
+		{
+			const float fitSize = (availableH - kPad * 2.0f - static_cast<float>(rows - 1) * kGap)
+				/ static_cast<float>(rows);
+			iconSize = std::clamp(fitSize, kMinIconSize, kMaxIconSize);
+		}
+
+		const float boxW = static_cast<float>(cols) * iconSize +
+			static_cast<float>(cols > 0 ? cols - 1 : 0) * kGap + kPad * 2.0f;
+		const float boxH = static_cast<float>(rows) * iconSize +
+			static_cast<float>(rows > 0 ? rows - 1 : 0) * kGap + kPad * 2.0f;
+		// Centered in the full window, not pinned to a fixed offset from the
+		// top - a fixed offset put a big card right up against (sometimes
+		// overlapping) the header band once the card itself grew tall.
+		const Gdiplus::RectF box((width - boxW) / 2.0f, (height - boxH) / 2.0f, boxW, boxH);
 
 		Gdiplus::GraphicsPath path;
 		AddRoundedRectPath(path, box, 18.0f);
@@ -8342,9 +8369,9 @@ void UpdateInputOwnership(HWND window);
 				shown);
 		}
 
-		Gdiplus::SolidBrush fill(Gdiplus::Color(static_cast<BYTE>(220.0f * shown), 12, 14, 22));
+		Gdiplus::SolidBrush fill(Gdiplus::Color(static_cast<BYTE>(250.0f * shown), 10, 11, 16));
 		g.FillPath(&fill, &path);
-		Gdiplus::Pen border(Gdiplus::Color(static_cast<BYTE>(200.0f * shown),
+		Gdiplus::Pen border(Gdiplus::Color(static_cast<BYTE>(235.0f * shown),
 			GetRValue(kAccent), GetGValue(kAccent), GetBValue(kAccent)), 1.6f);
 		g.DrawPath(&border, &path);
 
@@ -8369,49 +8396,18 @@ void UpdateInputOwnership(HWND window);
 			}
 		};
 
-		if (showLabels)
+		size_t col = 0, row = 0;
+		for (int idx : entry.abilityIndices)
 		{
-			constexpr float kIconSize = 40.0f;
-			constexpr float kRowH = 48.0f;
-			constexpr float kNameH = 32.0f;
-			constexpr float kPadX = 18.0f;
-			constexpr float kPadY = 12.0f;
-			DrawTextLineCentered(g, entry.name, static_cast<int>(box.X), static_cast<int>(box.Y),
-				static_cast<int>(box.Width), RGB(240, 244, 250), static_cast<int>(kNameH + kPadY));
-			float rowY = box.Y + kPadY + kNameH;
-			for (int idx : entry.abilityIndices)
+			if (idx < 0 || static_cast<size_t>(idx) >= kAbilityCount)
+				continue;
+			const float iconX = box.X + kPad + static_cast<float>(col) * (iconSize + kGap);
+			const float iconY = box.Y + kPad + static_cast<float>(row) * (iconSize + kGap);
+			drawIcon(kAbilities[idx], iconX, iconY, iconSize);
+			if (++col >= cols)
 			{
-				if (idx < 0 || static_cast<size_t>(idx) >= kAbilityCount)
-					continue;
-				const Ability& ability = kAbilities[idx];
-				const float iconX = box.X + kPadX;
-				const float iconY = rowY + (kRowH - kIconSize) / 2.0f;
-				drawIcon(ability, iconX, iconY, kIconSize);
-				DrawTextLineCentered(g, ability.name, static_cast<int>(iconX + kIconSize + 12.0f),
-					static_cast<int>(rowY), static_cast<int>(box.Width - kIconSize - kPadX * 2.0f - 12.0f),
-					RGB(226, 232, 240), static_cast<int>(kRowH));
-				rowY += kRowH;
-			}
-		}
-		else
-		{
-			constexpr float kIconSize = 52.0f;
-			constexpr float kGap = 12.0f;
-			constexpr float kPad = 16.0f;
-			constexpr size_t kMaxCols = 6;
-			size_t col = 0, row = 0;
-			for (int idx : entry.abilityIndices)
-			{
-				if (idx < 0 || static_cast<size_t>(idx) >= kAbilityCount)
-					continue;
-				const float iconX = box.X + kPad + static_cast<float>(col) * (kIconSize + kGap);
-				const float iconY = box.Y + kPad + static_cast<float>(row) * (kIconSize + kGap);
-				drawIcon(kAbilities[idx], iconX, iconY, kIconSize);
-				if (++col >= kMaxCols)
-				{
-					col = 0;
-					++row;
-				}
+				col = 0;
+				++row;
 			}
 		}
 	}
