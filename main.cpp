@@ -352,6 +352,14 @@ constexpr int kOverlayWidth = 900;
 		int buildNumber = 0;
 	};
 
+	// Which synthetic leading tile (if any) is prepended to the franchise
+	// grid and currently focused/open - the Favorites tile, or the Custom
+	// tile fed by Special\ (see BuildCustomTagList). A tri-state instead of
+	// two independent bools: the two tiles are mutually exclusive, so this
+	// makes that a fact of the type rather than an invariant every call site
+	// has to maintain by hand.
+	enum class VirtualTile { None, Favorites, Custom };
+
 	struct AppState
 	{
 		Screen screen = Screen::PadViewer;
@@ -495,9 +503,10 @@ bool swapConfirmBackButtons = false;
 		// persisted in the ini under [Favorites] and browsed through the
 		// Favorites tile prepended to the franchise grid.
 		std::vector<FavoriteEntry> favorites;
-		// True when the franchise grid's logical index 0 (the Favorites
-		// tile) is the focused/open tile, instead of kFranchises[franchiseIndex].
-		bool favoritesTileSelected = false;
+		// Which leading synthetic tile (Favorites, Custom) is the
+		// focused/open tile, instead of kFranchises[franchiseIndex]. See
+		// VirtualTile.
+		VirtualTile virtualTile = VirtualTile::None;
 		// Reordering the Favorites roster: pick a tile up (source index into
 		// rosterSlots), navigate to a new spot, drop it there. Only ever
 		// active while browsing the Favorites roster itself.
@@ -528,13 +537,17 @@ bool swapConfirmBackButtons = false;
 		// persisted custom order (used only when sort == User).
 		std::vector<size_t> franchiseDisplayList;
 		bool showFavoritesTile = true;
+		// Mirrors showFavoritesTile's suppression rules (same sort modes hide
+		// both), additionally gated on g_customEntries being non-empty - see
+		// RebuildFranchiseDisplayList and BuildCustomTagList.
+		bool showCustomTile = false;
 
 		// Abilities browse mode (FranchiseSort::Abilities): the franchise grid
 		// is replaced by a grid of enlarged ability icons (see DrawAbilityGrid/
 		// MoveAbilityGridSelection), and confirming one opens the same
 		// RosterList screen filtered to every character/vehicle with that
 		// ability (see OpenAbilityRoster). abilityRosterActive parallels
-		// storyRosterActive/favoritesTileSelected: it tells RosterList-side
+		// storyRosterActive/virtualTile: it tells RosterList-side
 		// code (header, hints, Back) that the roster it's showing was built
 		// this way rather than from one franchise.
 		size_t abilityGridIndex = 0;
@@ -1009,6 +1022,9 @@ void UpdateInputOwnership(HWND window);
 	void AdjustSettingsValue(int direction);
 	void ClampSettingsSelection();
 	void BuildPadSkinList();
+	std::filesystem::path GetExecutableDirectory();
+	void BuildCustomTagList();
+	std::string Utf8FromWide(const std::wstring& wide);
 	void CyclePadSkin(int direction);
 	void CycleOpacity(int direction);
 	void CycleSoundVolume(int direction);
@@ -1086,6 +1102,15 @@ void UpdateInputOwnership(HWND window);
 
 	std::map<int, AssetImage> g_assetImages;
 
+	// Custom tags (Special\ folder) - see BuildCustomTagList further down for
+	// how these are populated. Declared here (rather than alongside the rest
+	// of the custom-tags code) because GetAssetBitmap below needs the two
+	// portrait ones in scope to resolve negative portraitResourceId values.
+	std::vector<RosterEntry> g_customEntries;
+	std::vector<std::filesystem::path> g_customBinPaths;
+	std::vector<std::filesystem::path> g_customPortraitPaths;
+	std::map<int, Gdiplus::Bitmap*> g_customPortraitBitmaps;
+
 	// Raw payload of an embedded resource (tag bytes, png bytes...). Owned
 	// by the module; the pointer stays valid for the app's lifetime.
 	const uint8_t* GetResourceBytes(int resId, DWORD& sizeOut)
@@ -1112,10 +1137,38 @@ void UpdateInputOwnership(HWND window);
 	// GDI+ bitmap decoded from an embedded image resource, cached per id.
 	// GDI+ needs the IStream it was decoded from to stay alive for the
 	// Bitmap's lifetime, so both are cached together and freed at shutdown.
+	//
+	// A negative id is a custom portrait loaded from Special\ instead (see
+	// BuildCustomTagList) - same synthetic-id convention GetPadArtBitmap
+	// uses for disk-loaded pad skins, decoded straight from the file (no
+	// resource stream to keep alive) and cached separately in
+	// g_customPortraitBitmaps. Handling it here, rather than in a wrapper,
+	// means every caller (RenderPortrait chief among them) needs no changes.
 	Gdiplus::Bitmap* GetAssetBitmap(int resId)
 	{
 		if (resId == 0)
 			return nullptr;
+		if (resId < 0)
+		{
+			const auto cachedCustom = g_customPortraitBitmaps.find(resId);
+			if (cachedCustom != g_customPortraitBitmaps.end())
+				return cachedCustom->second;
+			const size_t pathIndex = static_cast<size_t>(-resId - 1);
+			Gdiplus::Bitmap* bitmap = nullptr;
+			if (pathIndex < g_customPortraitPaths.size())
+			{
+				bitmap = new Gdiplus::Bitmap(g_customPortraitPaths[pathIndex].c_str());
+				if (bitmap->GetLastStatus() != Gdiplus::Ok)
+				{
+					delete bitmap;
+					bitmap = nullptr;
+				}
+			}
+			// A failed load is cached as null too, so a broken file is
+			// decoded once instead of on every frame.
+			g_customPortraitBitmaps[resId] = bitmap;
+			return bitmap;
+		}
 		const auto existing = g_assetImages.find(resId);
 		if (existing != g_assetImages.end())
 			return existing->second.bitmap;
@@ -1427,6 +1480,136 @@ void UpdateInputOwnership(HWND window);
 			return kPadBackgroundResourceIds[slotIndex];
 		const size_t skin = std::min(g_app.padSkinIndex, g_padSkins.size() - 1);
 		return g_padSkins[skin].artIds[slotIndex];
+	}
+
+	// ---------------------------------------------------------------------
+	// Custom tags (Special\ folder)
+	// ---------------------------------------------------------------------
+	// Lets the user drop their own .bin files in, next to the bundled
+	// catalog: Special\<any folder name>\<CharacterName>.bin (+ optional
+	// <CharacterName>.png/.jpg/.jpeg portrait, same base name). Scanned once
+	// at startup by BuildCustomTagList. Same synthetic-negative-id
+	// convention as the pad skins above (g_padDiskArtPaths/g_padDiskBitmaps):
+	// every RosterEntry::binResourceId/portraitResourceId downstream is just
+	// an int, so the rest of the app (pad state, MOVE swap-reload, the
+	// abilities peek, the JSON web API) keeps working unmodified - it never
+	// needed to know the bytes came from a resource vs a file. The globals
+	// themselves (g_customEntries, g_customBinPaths, g_customPortraitPaths,
+	// g_customPortraitBitmaps) are declared up near g_assetImages, since
+	// GetAssetBitmap needs them in scope for negative portrait ids.
+
+	void ReleaseCustomPortraitBitmaps()
+	{
+		for (auto& [id, bitmap] : g_customPortraitBitmaps)
+			delete bitmap;
+		g_customPortraitBitmaps.clear();
+	}
+
+	// Direct C++ port of generate_assets.py's ring_color_for/hue_from_hash/
+	// hsv_to_rgb (FNV-1a hash -> golden-angle-decorrelated hue -> HSV(0.62,
+	// 0.96) -> RGB), so a custom entry's ring gets the same kind of
+	// deterministic, well-spread color as everything the generator produces -
+	// computed at runtime instead of build time, since there's no build step
+	// for a folder the user just dropped in.
+	unsigned int RingColorForName(const std::wstring& name)
+	{
+		uint32_t hash = 0x811C9DC5u;
+		for (wchar_t wc : name)
+		{
+			// ASCII-only, matching the generator's own fnv1a (which encodes
+			// its input as ASCII) - a non-ASCII character just contributes
+			// its low byte, which only affects which color is picked.
+			hash ^= static_cast<uint8_t>(wc & 0xFF);
+			hash *= 0x01000193u;
+		}
+		const double hueFrac = std::fmod((hash / 4294967296.0) * 0.6180339887498949, 1.0);
+		const float h = static_cast<float>(hueFrac * 360.0);
+		constexpr float s = 0.62f, v = 0.96f;
+		const float c = v * s;
+		const float x = c * (1.0f - std::fabs(std::fmod(h / 60.0f, 2.0f) - 1.0f));
+		const float m = v - c;
+		float r, g, b;
+		if (h < 60) { r = c; g = x; b = 0; }
+		else if (h < 120) { r = x; g = c; b = 0; }
+		else if (h < 180) { r = 0; g = c; b = x; }
+		else if (h < 240) { r = 0; g = x; b = c; }
+		else if (h < 300) { r = x; g = 0; b = c; }
+		else { r = c; g = 0; b = x; }
+		return RGB(static_cast<BYTE>((r + m) * 255.0f + 0.5f), static_cast<BYTE>((g + m) * 255.0f + 0.5f),
+			static_cast<BYTE>((b + m) * 255.0f + 0.5f));
+	}
+
+	// Scans Special\ (created next to the exe if missing) for user-provided
+	// custom tags. One .bin per character folder (its filename, minus
+	// extension, becomes the in-game name), optionally paired with a
+	// same-named .png/.jpg/.jpeg portrait. A .bin that isn't exactly kTagSize
+	// bytes is silently skipped, same as an incomplete pad-skin folder is
+	// today. Characters only - no vehicle/multi-build support.
+	void BuildCustomTagList()
+	{
+		g_customEntries.clear();
+		g_customBinPaths.clear();
+		g_customPortraitPaths.clear();
+		ReleaseCustomPortraitBitmaps();
+
+		const auto specialRoot = GetExecutableDirectory() / L"Special";
+		std::error_code ec;
+		std::filesystem::create_directory(specialRoot, ec);
+		if (!std::filesystem::is_directory(specialRoot, ec))
+			return;
+
+		std::vector<std::filesystem::path> folders;
+		for (const auto& entry : std::filesystem::directory_iterator(specialRoot, ec))
+		{
+			if (entry.is_directory(ec))
+				folders.push_back(entry.path());
+		}
+		std::sort(folders.begin(), folders.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
+			return _wcsicmp(a.filename().c_str(), b.filename().c_str()) < 0;
+		});
+
+		for (const auto& folder : folders)
+		{
+			std::filesystem::path binPath;
+			for (const auto& entry : std::filesystem::directory_iterator(folder, ec))
+			{
+				if (entry.is_regular_file(ec) && _wcsicmp(entry.path().extension().c_str(), L".bin") == 0)
+				{
+					binPath = entry.path();
+					break;
+				}
+			}
+			if (binPath.empty())
+				continue;
+
+			const uintmax_t binSize = std::filesystem::file_size(binPath, ec);
+			if (ec || binSize != kTagSize)
+				continue;
+
+			const std::wstring name = binPath.stem().wstring();
+			g_customBinPaths.push_back(binPath);
+			const int binId = -static_cast<int>(g_customBinPaths.size());
+
+			int portraitId = 0;
+			for (const wchar_t* extension : {L".png", L".jpg", L".jpeg"})
+			{
+				const auto candidate = binPath.parent_path() / (name + extension);
+				if (std::filesystem::is_regular_file(candidate, ec))
+				{
+					g_customPortraitPaths.push_back(candidate);
+					portraitId = -static_cast<int>(g_customPortraitPaths.size());
+					break;
+				}
+			}
+
+			RosterEntry entry;
+			entry.binResourceId = binId;
+			entry.portraitResourceId = portraitId;
+			entry.name = name;
+			entry.ringColor = RingColorForName(name);
+			entry.buildNumber = 0;
+			g_customEntries.push_back(std::move(entry));
+		}
 	}
 
 	// ---------------------------------------------------------------------
@@ -2157,10 +2340,14 @@ void UpdateInputOwnership(HWND window);
 		return bitmap;
 	}
 
+	void DrawTextWrappedCenteredFit(Gdiplus::Graphics& g, const std::wstring& text, int x, int y, int width, int height, COLORREF color);
+
 	// Franchise tile: the world_tile background image with the world logo
 	// drawn on top of it, plus a crisp focus outline when selected. The logo
-	// alone identifies the world - no text label.
-	Gdiplus::Bitmap* RenderFranchiseTile(int logoResourceId, bool focused)
+	// alone identifies the world - no text label, unless there's no logo to
+	// show (logoResourceId 0, the Custom tile - it has no compiled art),
+	// in which case fallbackLabel is centered in its place instead.
+	Gdiplus::Bitmap* RenderFranchiseTile(int logoResourceId, bool focused, const wchar_t* fallbackLabel = nullptr)
 	{
 		constexpr int tileW = 190;
 		constexpr int tileH = 100;
@@ -2216,6 +2403,11 @@ void UpdateInputOwnership(HWND window);
 			g.SetClip(&clip);
 			g.DrawImage(logo, dest);
 			g.ResetClip();
+		}
+		else if (fallbackLabel)
+		{
+			DrawTextWrappedCenteredFit(g, fallbackLabel, static_cast<int>(rect.X), static_cast<int>(rect.Y),
+				static_cast<int>(rect.Width), static_cast<int>(rect.Height), RGB(230, 236, 246));
 		}
 
 		if (focused)
@@ -3605,11 +3797,14 @@ void UpdateInputOwnership(HWND window);
 	// REMOVE: 5-byte header (0x02, pad, index, 0x00, 0x00).
 	// MOVE:   5-byte header (0x03, destPad, destIndex, srcPad, srcIndex).
 	//
-	// The byte layout is unchanged from before. The one difference: tag data
-	// now comes from embedded resources, and since there is no on-disk .bin
-	// anymore the LOAD path is empty (length 0), so Cemu can't attach a
-	// persistent FileStream back to a source file - game writes stay in
-	// Cemu's memory for the session instead.
+	// The byte layout is unchanged from before. Most tag data comes from
+	// embedded resources, which have no on-disk file behind them, so the
+	// LOAD path is empty (length 0) for those - the emulator can't attach a
+	// persistent FileStream back to a source file, so game writes stay in
+	// its own memory for the session instead. A custom tag loaded from
+	// Special\ (see BuildCustomTagList) is the exception: it has a real file,
+	// so its LOAD carries that file's path, and the emulator keeps it open
+	// read/write and persists game writes straight into it.
 	// ---------------------------------------------------------------------
 
 	bool SendAll(SOCKET socket, const uint8_t* data, size_t length)
@@ -3713,8 +3908,15 @@ void UpdateInputOwnership(HWND window);
 
 	// Sends one tag's 180 bytes to a pad slot, whatever they came from - an
 	// embedded resource for the shipped library, a file on disk for a custom
-	// tag. The wire message is identical either way.
-	bool SendLoadBytesToSlot(const std::vector<uint8_t>& tagData, size_t slotIndex, std::wstring& errorOut)
+	// tag. The wire message is identical either way, except a custom tag
+	// also carries its real file path (filePath non-empty): the receiving
+	// emulator (shadPS4/Cemu/RPCS3, see the seamless bridges) opens that
+	// file read/write and keeps writing the game's changes back into it, so
+	// in-game customization of a Special\ tag actually persists - unlike the
+	// bundled catalog, which has no real file behind it for the emulator to
+	// write back to.
+	bool SendLoadBytesToSlot(const std::vector<uint8_t>& tagData, size_t slotIndex, std::wstring& errorOut,
+		const std::wstring& filePath = std::wstring())
 	{
 		if (tagData.size() != kTagSize)
 		{
@@ -3722,17 +3924,35 @@ void UpdateInputOwnership(HWND window);
 			return false;
 		}
 
-		// Header + tag + 2-byte little-endian path length + path bytes.
-		// The path is empty now (see the wire protocol note above).
-		std::vector<uint8_t> message(5 + kTagSize + 2);
+		// Header + tag + 2-byte little-endian path length + UTF-8 path bytes.
+		const std::string pathUtf8 = filePath.empty() ? std::string() : Utf8FromWide(filePath);
+		std::vector<uint8_t> message(5 + kTagSize + 2 + pathUtf8.size());
 		message[0] = kLoadCommand;
 		message[1] = kSlots[slotIndex].pad;
 		message[2] = kSlots[slotIndex].index;
 		std::copy(tagData.begin(), tagData.end(), message.begin() + 5);
-		message[5 + kTagSize] = 0;
-		message[5 + kTagSize + 1] = 0;
+		message[5 + kTagSize] = static_cast<uint8_t>(pathUtf8.size() & 0xFF);
+		message[5 + kTagSize + 1] = static_cast<uint8_t>((pathUtf8.size() >> 8) & 0xFF);
+		std::copy(pathUtf8.begin(), pathUtf8.end(), message.begin() + 5 + kTagSize + 2);
 
 		return SendToypadMessage(message.data(), message.size(), errorOut);
+	}
+
+	// Reads a tag file from disk - the Special\ counterpart to
+	// LoadResourceBytes for the embedded catalog.
+	std::vector<uint8_t> LoadFileBytes(const std::filesystem::path& path)
+	{
+		std::ifstream file(path, std::ios::binary | std::ios::ate);
+		if (!file)
+			return {};
+		const std::streamsize size = file.tellg();
+		if (size <= 0)
+			return {};
+		file.seekg(0);
+		std::vector<uint8_t> data(static_cast<size_t>(size));
+		if (!file.read(reinterpret_cast<char*>(data.data()), size))
+			return {};
+		return data;
 	}
 
 	bool SendLoadResourceToSlot(int binResourceId, size_t slotIndex, std::wstring& errorOut)
@@ -3741,6 +3961,28 @@ void UpdateInputOwnership(HWND window);
 		{
 			errorOut = L"Missing tag data for this entry.";
 			return false;
+		}
+
+		// Negative ids are custom tags loaded from Special\ (see
+		// BuildCustomTagList) - send the real path along so the emulator
+		// persists game writes back into the user's own file.
+		if (binResourceId < 0)
+		{
+			const size_t pathIndex = static_cast<size_t>(-binResourceId - 1);
+			if (pathIndex >= g_customBinPaths.size())
+			{
+				errorOut = L"Missing tag data for this entry.";
+				return false;
+			}
+			const std::filesystem::path& binPath = g_customBinPaths[pathIndex];
+			const std::vector<uint8_t> tagData = LoadFileBytes(binPath);
+			if (tagData.size() != kTagSize)
+			{
+				errorOut = L"The custom tag file has the wrong size (must be " +
+					std::to_wstring(kTagSize) + L" bytes).";
+				return false;
+			}
+			return SendLoadBytesToSlot(tagData, slotIndex, errorOut, binPath.wstring());
 		}
 
 		const std::vector<uint8_t> tagData = LoadResourceBytes(binResourceId);
@@ -4124,6 +4366,9 @@ void UpdateInputOwnership(HWND window);
 			g_app.showFavoritesTile = false;
 			break;
 		}
+		// Custom mirrors Favorites' suppression rules exactly (same sorts hide
+		// both), additionally gated on there being anything to show.
+		g_app.showCustomTile = g_app.showFavoritesTile && !g_customEntries.empty();
 	}
 
 	std::wstring DescribeFranchiseSort()
@@ -4148,8 +4393,8 @@ void UpdateInputOwnership(HWND window);
 		if (g_app.screen == Screen::FranchiseList)
 			return true;
 		if (g_app.screen == Screen::RosterList)
-			return g_app.storyRosterActive ||
-				(g_app.favoritesTileSelected && g_app.franchiseSort == AppState::FranchiseSort::Favorites);
+			return g_app.storyRosterActive || g_app.virtualTile == VirtualTile::Custom ||
+				(g_app.virtualTile == VirtualTile::Favorites && g_app.franchiseSort == AppState::FranchiseSort::Favorites);
 		return false;
 	}
 
@@ -4191,20 +4436,48 @@ void UpdateInputOwnership(HWND window);
 		return 0;
 	}
 
+	// Number of synthetic tiles (Favorites, Custom) prepended to the
+	// franchise grid before the real franchises start. Favorites always
+	// comes first when both are shown.
+	size_t LeadingVirtualTileCount()
+	{
+		return (g_app.showFavoritesTile ? 1 : 0) + (g_app.showCustomTile ? 1 : 0);
+	}
+
+	// Which virtual tile a logical grid index below LeadingVirtualTileCount()
+	// refers to. Only meaningful for indices in that range.
+	VirtualTile VirtualTileAtLogicalIndex(size_t logicalIndex)
+	{
+		if (g_app.showFavoritesTile)
+		{
+			if (logicalIndex == 0)
+				return VirtualTile::Favorites;
+			--logicalIndex;
+		}
+		if (g_app.showCustomTile && logicalIndex == 0)
+			return VirtualTile::Custom;
+		return VirtualTile::None;
+	}
+
 	void MoveFranchiseSelection(int dx, int dy)
 	{
-		// The grid shows the effective display list (franchiseDisplayList) plus
-		// an optional Favorites tile at logical index 0. Keeping the existing
-		// ragged-last-row wrap math untouched, just over the extra item when the
-		// tile is present.
+		// The grid shows the effective display list (franchiseDisplayList)
+		// plus up to two leading synthetic tiles (Favorites, Custom).
+		// Keeping the existing ragged-last-row wrap math untouched, just over
+		// the extra items when they're present.
 		const size_t realCount = g_app.franchiseDisplayList.size();
 		if (realCount == 0)
 			return;
-		const size_t logicalCount = realCount + (g_app.showFavoritesTile ? 1 : 0);
+		const size_t leadingCount = LeadingVirtualTileCount();
+		const size_t logicalCount = realCount + leadingCount;
 		const size_t rows = (logicalCount + kFranchiseCols - 1) / kFranchiseCols;
-		size_t logicalIndex = g_app.showFavoritesTile
-			? (g_app.favoritesTileSelected ? 0 : 1 + FindFranchiseDisplaySlot(g_app.franchiseIndex))
-			: FindFranchiseDisplaySlot(g_app.franchiseIndex);
+		size_t logicalIndex;
+		if (g_app.virtualTile == VirtualTile::Favorites)
+			logicalIndex = 0;
+		else if (g_app.virtualTile == VirtualTile::Custom)
+			logicalIndex = g_app.showFavoritesTile ? 1 : 0;
+		else
+			logicalIndex = leadingCount + FindFranchiseDisplaySlot(g_app.franchiseIndex);
 		size_t row = logicalIndex / kFranchiseCols;
 		size_t col = logicalIndex % kFranchiseCols;
 
@@ -4213,21 +4486,16 @@ void UpdateInputOwnership(HWND window);
 		col = (col + static_cast<size_t>(dx) + lastCol + 1) % (lastCol + 1);
 
 		logicalIndex = row * kFranchiseCols + col;
-		if (g_app.showFavoritesTile)
+		if (logicalIndex < leadingCount)
 		{
-			g_app.favoritesTileSelected = (logicalIndex == 0);
-			if (!g_app.favoritesTileSelected)
-			{
-				const size_t slot = logicalIndex - 1;
-				if (slot < g_app.franchiseDisplayList.size())
-					g_app.franchiseIndex = g_app.franchiseDisplayList[slot];
-			}
+			g_app.virtualTile = VirtualTileAtLogicalIndex(logicalIndex);
 		}
 		else
 		{
-			g_app.favoritesTileSelected = false;
-			if (logicalIndex < g_app.franchiseDisplayList.size())
-				g_app.franchiseIndex = g_app.franchiseDisplayList[logicalIndex];
+			g_app.virtualTile = VirtualTile::None;
+			const size_t slot = logicalIndex - leadingCount;
+			if (slot < g_app.franchiseDisplayList.size())
+				g_app.franchiseIndex = g_app.franchiseDisplayList[slot];
 		}
 
 		// Keep the focused row inside the visible viewport.
@@ -4279,10 +4547,11 @@ void UpdateInputOwnership(HWND window);
 	}
 
 	// Picks up the focused franchise tile so the next navigation + Confirm
-	// drops it in a new spot. The synthetic Favorites tile can't be moved.
+	// drops it in a new spot. Neither synthetic tile (Favorites, Custom)
+	// can be moved.
 	void BeginFranchiseReorganize()
 	{
-		if (g_app.favoritesTileSelected)
+		if (g_app.virtualTile != VirtualTile::None)
 			return;
 		// Reordering only makes sense in the custom-order view; in the other
 		// sorts the grid order is fixed, so guide the user instead.
@@ -4299,7 +4568,7 @@ void UpdateInputOwnership(HWND window);
 	void DropFranchiseReorder()
 	{
 		const size_t from = g_app.reorganizeFranchiseSourceIndex;
-		const size_t to = g_app.favoritesTileSelected
+		const size_t to = g_app.virtualTile != VirtualTile::None
 			? from : FindFranchiseDisplaySlot(g_app.franchiseIndex);
 		g_app.reorganizingFranchise = false;
 		if (from >= g_app.franchiseDisplayOrder.size() || to >= g_app.franchiseDisplayOrder.size() ||
@@ -4632,7 +4901,7 @@ void UpdateInputOwnership(HWND window);
 		signature = signature * 131 + g_app.padActionIndex;
 		signature = signature * 131 + g_app.franchiseIndex;
 		signature = signature * 131 + g_app.abilityGridIndex;
-		signature = signature * 131 + (g_app.favoritesTileSelected ? 1 : 0);
+		signature = signature * 131 + static_cast<uint64_t>(g_app.virtualTile);
 		signature = signature * 131 + g_app.rosterIndex;
 		signature = signature * 131 + g_app.plusBuildIndex;
 		signature = signature * 131 + g_app.settingsIndex;
@@ -4758,10 +5027,11 @@ void UpdateInputOwnership(HWND window);
 		g_app.franchiseTopRow = 0;
 		if (!g_app.franchiseDisplayList.empty())
 			g_app.franchiseIndex = g_app.franchiseDisplayList[0];
-		// The Favorites tile is logical index 0 in the grid when shown (see
-		// MoveFranchiseSelection/DrawFranchiseGrid) - it's the first tile
-		// shown, so it should also be the one initially focused.
-		g_app.favoritesTileSelected = g_app.showFavoritesTile;
+		// Whichever leading synthetic tile is shown first (Favorites, else
+		// Custom) is also the one initially focused - see
+		// MoveFranchiseSelection/DrawFranchiseGrid.
+		g_app.virtualTile = g_app.showFavoritesTile ? VirtualTile::Favorites
+			: (g_app.showCustomTile ? VirtualTile::Custom : VirtualTile::None);
 		g_app.storyRosterActive = false;
 		g_app.screen = Screen::FranchiseList;
 	}
@@ -4775,7 +5045,7 @@ void UpdateInputOwnership(HWND window);
 		g_app.franchiseTopRow = 0;
 		if (g_app.abilityGridIndex >= kAbilityCount)
 			g_app.abilityGridIndex = 0;
-		g_app.favoritesTileSelected = false;
+		g_app.virtualTile = VirtualTile::None;
 		g_app.storyRosterActive = false;
 		g_app.screen = Screen::FranchiseList;
 	}
@@ -4793,7 +5063,7 @@ void UpdateInputOwnership(HWND window);
 		case AppState::FranchiseSort::Favorites:
 			g_app.storyRosterActive = false;
 			g_app.abilityRosterActive = false;
-			g_app.favoritesTileSelected = true;
+			g_app.virtualTile = VirtualTile::Favorites;
 			OpenFavoritesRoster();
 			g_app.rosterIndex = 0;
 			g_app.rosterTopRow = 0;
@@ -4835,6 +5105,15 @@ void UpdateInputOwnership(HWND window);
 	{
 		if (binResourceId == 0)
 			return nullptr;
+		if (binResourceId < 0)
+		{
+			for (const auto& entry : g_customEntries)
+			{
+				if (entry.binResourceId == binResourceId)
+					return &entry;
+			}
+			return nullptr;
+		}
 		for (size_t i = 0; i < kFranchiseCount; ++i)
 		{
 			for (const auto& character : kFranchises[i].characters)
@@ -4920,6 +5199,17 @@ void UpdateInputOwnership(HWND window);
 		}
 	}
 
+	// Builds the roster grid from every character loaded from Special\ (see
+	// BuildCustomTagList). Flat and already built up front, unlike
+	// OpenFavoritesRoster - no franchise scan or vehicle grouping needed,
+	// and characters only (see BuildCustomTagList's scope notes).
+	void OpenCustomRoster()
+	{
+		g_app.rosterSlots.clear();
+		for (const auto& entry : g_customEntries)
+			g_app.rosterSlots.push_back({RosterSlot::Kind::Character, &entry, nullptr});
+	}
+
 	// Builds the roster grid from every character/vehicle build that has the
 	// given ability (kAbilities[abilityIndex]) - same two-pass, all-Characters-
 	// then-all-Vehicles shape as OpenFavoritesRoster, for the same reason
@@ -4960,7 +5250,7 @@ void UpdateInputOwnership(HWND window);
 		g_app.rosterTopRow = 0;
 		g_app.plusGroup = nullptr;
 		g_app.storyRosterActive = false;
-		g_app.favoritesTileSelected = false;
+		g_app.virtualTile = VirtualTile::None;
 		g_app.abilityRosterActive = true;
 		g_app.abilityRosterFilter = abilityIndex;
 		g_app.screen = Screen::RosterList;
@@ -4968,8 +5258,10 @@ void UpdateInputOwnership(HWND window);
 
 	void OpenRosterList()
 	{
-		if (g_app.favoritesTileSelected)
+		if (g_app.virtualTile == VirtualTile::Favorites)
 			OpenFavoritesRoster();
+		else if (g_app.virtualTile == VirtualTile::Custom)
+			OpenCustomRoster();
 		else
 		{
 			g_app.rosterSlots.clear();
@@ -5113,7 +5405,7 @@ void UpdateInputOwnership(HWND window);
 			// it toggles that exact build even if the family has others.
 			// Anywhere else, a tile with more than one build is the "+"
 			// family tile and isn't favoritable directly.
-			if (slot.group->builds.size() > 1 && !g_app.favoritesTileSelected)
+			if (slot.group->builds.size() > 1 && g_app.virtualTile != VirtualTile::Favorites)
 			{
 				g_app.status = L"Open it to favorite a specific build.";
 				return;
@@ -5235,7 +5527,7 @@ void UpdateInputOwnership(HWND window);
 	// roster - a real franchise's roster order comes from the game data.
 	void BeginRosterReorganize()
 	{
-		if (!g_app.favoritesTileSelected || g_app.rosterIndex >= g_app.rosterSlots.size())
+		if (g_app.virtualTile != VirtualTile::Favorites || g_app.rosterIndex >= g_app.rosterSlots.size())
 			return;
 		g_app.reorganizingRoster = true;
 		g_app.reorganizeRosterSourceIndex = g_app.rosterIndex;
@@ -5380,7 +5672,7 @@ void UpdateInputOwnership(HWND window);
 				// tile stands for the one build that actually has the filtered
 				// ability, not necessarily build 1; opening the picker there
 				// would let you wander onto a sibling build without it.
-				if (!g_app.favoritesTileSelected && !g_app.abilityRosterActive &&
+				if (g_app.virtualTile != VirtualTile::Favorites && !g_app.abilityRosterActive &&
 					g_app.rosterSlots[g_app.rosterIndex].group &&
 					g_app.rosterSlots[g_app.rosterIndex].group->builds.size() > 1)
 					OpenPlusPicker(*g_app.rosterSlots[g_app.rosterIndex].group);
@@ -5454,12 +5746,15 @@ void UpdateInputOwnership(HWND window);
 				break;
 			}
 			if (g_app.storyRosterActive ||
-				(g_app.favoritesTileSelected && g_app.franchiseSort == AppState::FranchiseSort::Favorites))
+				(g_app.virtualTile == VirtualTile::Favorites && g_app.franchiseSort == AppState::FranchiseSort::Favorites))
 			{
 				// A browse roster (Story / Favorites sort) was opened straight
-				// from the pad viewer, so Back skips the franchise grid.
+				// from the pad viewer, so Back skips the franchise grid. The
+				// Custom roster is always reached via the franchise grid (no
+				// dedicated sort mode jumps straight to it), so it falls
+				// through to the "back to the grid" branch below instead.
 				g_app.storyRosterActive = false;
-				g_app.favoritesTileSelected = false;
+				g_app.virtualTile = VirtualTile::None;
 				g_app.screen = Screen::PadViewer;
 			}
 			else
@@ -7990,11 +8285,14 @@ void UpdateInputOwnership(HWND window);
 
 	void DrawFranchiseGrid(Gdiplus::Graphics& g)
 	{
-		// Logical index 0 is the Favorites tile (custom_bin.png) when shown;
-		// logical i>=1 (or i>=0 without the tile) maps to the franchise at
-		// display slot of the current sort's franchiseDisplayList.
+		// Up to two leading synthetic tiles (Favorites, then Custom) come
+		// before the real franchises - see LeadingVirtualTileCount/
+		// VirtualTileAtLogicalIndex. Logical index >= leadingCount maps to
+		// the franchise at that display slot of the current sort's
+		// franchiseDisplayList.
 		const size_t realCount = g_app.franchiseDisplayList.size();
-		const size_t logicalCount = realCount + (g_app.showFavoritesTile ? 1 : 0);
+		const size_t leadingCount = LeadingVirtualTileCount();
+		const size_t logicalCount = realCount + leadingCount;
 		if (logicalCount == 0)
 			return;
 		const size_t totalRows = (logicalCount + kFranchiseCols - 1) / kFranchiseCols;
@@ -8008,18 +8306,19 @@ void UpdateInputOwnership(HWND window);
 					break;
 				const int x = kFranchiseOriginX + static_cast<int>(col) * kFranchisePitchX;
 				const int y = kFranchiseOriginY + static_cast<int>(row) * kFranchisePitchY;
-				const bool isFavoritesTile = g_app.showFavoritesTile && index == 0;
-				const size_t slot = g_app.showFavoritesTile ? (index - 1) : index;
-				const bool inRange = slot < g_app.franchiseDisplayList.size();
-				const bool focused = isFavoritesTile
-					? g_app.favoritesTileSelected
-					: (!g_app.favoritesTileSelected && inRange &&
+				const VirtualTile tileHere = index < leadingCount ? VirtualTileAtLogicalIndex(index) : VirtualTile::None;
+				const size_t slot = index >= leadingCount ? index - leadingCount : 0;
+				const bool inRange = tileHere == VirtualTile::None && slot < g_app.franchiseDisplayList.size();
+				const bool focused = tileHere != VirtualTile::None
+					? g_app.virtualTile == tileHere
+					: (g_app.virtualTile == VirtualTile::None && inRange &&
 						g_app.franchiseDisplayList[slot] == g_app.franchiseIndex);
-				const bool isReorganizeSource = g_app.reorganizingFranchise && !isFavoritesTile &&
+				const bool isReorganizeSource = g_app.reorganizingFranchise && tileHere == VirtualTile::None &&
 					inRange && slot == g_app.reorganizeFranchiseSourceIndex;
-				const int logoResourceId = isFavoritesTile
-					? kCustomBinIconResourceId
+				const int logoResourceId = tileHere == VirtualTile::Favorites ? kCustomBinIconResourceId
+					: tileHere == VirtualTile::Custom ? 0
 					: kFranchises[g_app.franchiseDisplayList[slot]].logoResourceId;
+				const wchar_t* fallbackLabel = tileHere == VirtualTile::Custom ? L"Custom" : nullptr;
 				const float scale = focused ? SelectionTapScale() : 1.0f;
 				const float cx = x + kFranchiseTileW / 2.0f;
 				const float cy = y + kFranchiseTileH / 2.0f;
@@ -8040,7 +8339,7 @@ void UpdateInputOwnership(HWND window);
 						kFranchiseTileW, kFranchiseTileH, FocusShape::RoundedTile, kReorganizeGlow);
 					g.DrawImage(glow, x - kFocusGlowMargin, y - kFocusGlowMargin);
 				}
-				Gdiplus::Bitmap* tile = RenderFranchiseTile(logoResourceId, focused);
+				Gdiplus::Bitmap* tile = RenderFranchiseTile(logoResourceId, focused, fallbackLabel);
 				if (tile)
 				{
 					DrawImageScaledAbout(g, tile, static_cast<float>(x - kTileGlowMargin),
@@ -8200,8 +8499,9 @@ void UpdateInputOwnership(HWND window);
 
 				// Favorited-star badge: only useful while browsing a real
 				// franchise's roster (every tile in the Favorites roster is
-				// trivially favorited already, so it's skipped there).
-				if (!g_app.favoritesTileSelected && slot.kind != RosterSlot::Kind::Plus && slot.entry &&
+				// trivially favorited already, so it's skipped there; Custom
+				// entries aren't favoritable at all - see BuildCustomTagList).
+				if (g_app.virtualTile == VirtualTile::None && slot.kind != RosterSlot::Kind::Plus && slot.entry &&
 					IsFavorited(kFranchises[g_app.franchiseIndex].name,
 						slot.kind == RosterSlot::Kind::Vehicle && slot.group ? slot.group->baseName : slot.entry->name,
 						slot.kind == RosterSlot::Kind::Vehicle, slot.entry->buildNumber))
@@ -8226,7 +8526,7 @@ void UpdateInputOwnership(HWND window);
 	// when the roster being browsed is the aggregated favorites list.
 	int CurrentRosterWorldLogoResourceId()
 	{
-		if (g_app.favoritesTileSelected)
+		if (g_app.virtualTile == VirtualTile::Favorites)
 			return kCustomBinIconResourceId;
 		return kFranchises[g_app.franchiseIndex].logoResourceId;
 	}
@@ -8463,13 +8763,22 @@ void UpdateInputOwnership(HWND window);
 		// with the pill bottom clear of the roster panel that starts at y=94.
 		constexpr float kBadgeTop = 24.0f;
 
+		// Custom: no compiled word-art or icon exists for it (unlike Favorites'
+		// custom_bin.png), so it gets a plain text label instead of a badge.
+		if (g_app.screen == Screen::RosterList && g_app.virtualTile == VirtualTile::Custom && !g_app.storyRosterActive)
+		{
+			DrawTextLineCentered(g, L"Custom", static_cast<int>((width - 360.0f) / 2.0f),
+				static_cast<int>(kBadgeTop + 14.0f), 360, RGB(230, 236, 246), 40);
+			return;
+		}
+
 		// Favorites: no name plate - show the custom_bin icon enlarged, centred.
 		// This roster can be reached either by cycling to the Favorites sort or
 		// by confirming the Favorites tile on the grid, so the check is on the
 		// roster screen state rather than the sort value. The story roster
-		// never shows it (its name plate is "Starter"), and `favoritesTileSelected`
-		// can be stale there, so the story guard wins.
-		if (g_app.screen == Screen::RosterList && g_app.favoritesTileSelected && !g_app.storyRosterActive)
+		// never shows it (its name plate is "Starter"), and the Favorites tile
+		// state can be stale there, so the story guard wins.
+		if (g_app.screen == Screen::RosterList && g_app.virtualTile == VirtualTile::Favorites && !g_app.storyRosterActive)
 		{
 			Gdiplus::Bitmap* favLogo = GetAssetBitmap(kCustomBinIconResourceId);
 			if (!favLogo)
@@ -8867,7 +9176,7 @@ void UpdateInputOwnership(HWND window);
 			{
 				DrawSortBadge(g, width);
 			}
-			else if (g_app.favoritesTileSelected)
+			else if (g_app.virtualTile == VirtualTile::Favorites || g_app.virtualTile == VirtualTile::Custom)
 			{
 				DrawSortBadge(g, width);
 			}
@@ -9145,8 +9454,11 @@ void UpdateInputOwnership(HWND window);
 			constexpr float kHintStackGap = 20.0f;
 			const float hintCenterY = height - kHintBottomInset - kHintButtonH / 2.0f;
 			float rightEdge = width - kTopMargin;
-			rightEdge -= DrawButtonHint(g, g_app.buttonFavorite, L"Favorite", rightEdge, hintCenterY, kHintButtonH);
-			if (g_app.favoritesTileSelected)
+			// Custom entries aren't favoritable (see BuildCustomTagList), so
+			// the hint would be misleading there.
+			if (g_app.virtualTile != VirtualTile::Custom)
+				rightEdge -= DrawButtonHint(g, g_app.buttonFavorite, L"Favorite", rightEdge, hintCenterY, kHintButtonH);
+			if (g_app.virtualTile == VirtualTile::Favorites)
 			{
 				rightEdge -= kHintStackGap;
 				rightEdge -= DrawButtonHint(g, g_app.buttonReorganizeRoster, L"Organize", rightEdge, hintCenterY, kHintButtonH);
@@ -9164,8 +9476,8 @@ void UpdateInputOwnership(HWND window);
 					L"Sort", kTopMargin, hintCenterY, kHintButtonH);
 		}
 		// Franchise grid: "X  Organize" hint on the right (only in the custom
-		// order view; the synthetic Favorites tile has nothing to reorganize
-		// from), with the "LB/RB  Sort" hint on the left.
+		// order view; neither synthetic tile - Favorites or Custom - has
+		// anything to reorganize from), with the "LB/RB  Sort" hint on the left.
 		else if (g_app.screen == Screen::FranchiseList)
 		{
 			constexpr float kHintBottomInset = 18.0f;
@@ -9173,7 +9485,7 @@ void UpdateInputOwnership(HWND window);
 			const float hintCenterY = height - kHintBottomInset - kHintButtonH / 2.0f;
 			DrawButtonHintLeft(g, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER,
 				L"Sort", kTopMargin, hintCenterY, kHintButtonH);
-			if (g_app.franchiseSort == AppState::FranchiseSort::User && !g_app.favoritesTileSelected)
+			if (g_app.franchiseSort == AppState::FranchiseSort::User && g_app.virtualTile == VirtualTile::None)
 			{
 				const float rightEdge = width - kTopMargin;
 				DrawButtonHint(g, g_app.buttonReorganizeFranchise, L"Organize",
@@ -9638,13 +9950,13 @@ void PollController(HWND window)
 		// the Favorites roster (a real franchise's roster order comes from
 		// the game data) and for real franchise tiles in the world grid.
 		if ((combinedPressed & g_app.buttonReorganizeRoster) && g_app.screen == Screen::RosterList &&
-			g_app.favoritesTileSelected && !g_app.reorganizingRoster)
+			g_app.virtualTile == VirtualTile::Favorites && !g_app.reorganizingRoster)
 		{
 			BeginRosterReorganize();
 			changed = true;
 		}
 		if ((combinedPressed & g_app.buttonReorganizeFranchise) && g_app.screen == Screen::FranchiseList &&
-			!g_app.favoritesTileSelected && !g_app.reorganizingFranchise)
+			g_app.virtualTile == VirtualTile::None && !g_app.reorganizingFranchise)
 		{
 			BeginFranchiseReorganize();
 			changed = true;
@@ -11286,6 +11598,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	// The pad-skin list has to exist before the settings load, because the
 	// saved skin is stored by name and resolved against this list.
 	BuildPadSkinList();
+	// Same reasoning as the pad-skin list: showCustomTile (computed from
+	// g_customEntries) has to be right before the franchise grid first
+	// builds its display list.
+	BuildCustomTagList();
 	g_app.port = ReadPort();
 	LoadShortcutFromIni();
 	LoadInputSettingsFromIni();
@@ -11333,6 +11649,7 @@ g_app.status = std::to_wstring(embeddedTags) +
 		ReleaseGlossCache();
 		ReleaseAssetImages();
 		ReleasePadDiskBitmaps();
+		ReleaseCustomPortraitBitmaps();
 		UnloadUIFont();
 		Gdiplus::GdiplusShutdown(g_gdiplusToken);
 		WSACleanup();
@@ -11401,6 +11718,7 @@ g_app.status = std::to_wstring(embeddedTags) +
 	ReleaseGlossCache();
 	ReleaseAssetImages();
 	ReleasePadDiskBitmaps();
+	ReleaseCustomPortraitBitmaps();
 	UnloadUIFont();
 	SDL_Quit();
 	Gdiplus::GdiplusShutdown(g_gdiplusToken);
