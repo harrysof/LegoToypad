@@ -820,6 +820,7 @@ ASSET_SORT_YEAR1 RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\Leg
 ASSET_SORT_YEAR2 RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\Branding\\Year2_sort.png"
 ASSET_SORT_ABILITIES RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\Branding\\Abilities_sort.png"
 ASSET_CUSTOM_BIN_ICON RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\custombins\\custom_bin.png"
+ASSET_CUSTOM_TILE RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\custombins\\custom_tile.png"
 ASSET_SFX_NAVIGATE RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\SFX\\Navigate.wav"
 ASSET_SFX_SELECT RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\SFX\\Select.wav"
 ASSET_SFX_MOVE RCDATA "C:\\Users\\HarrysofXD\\Documents\\Scripts_Projects\\LegoToypad\\Assets\\SFX\\Move.wav"

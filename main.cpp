@@ -2345,8 +2345,9 @@ void UpdateInputOwnership(HWND window);
 	// Franchise tile: the world_tile background image with the world logo
 	// drawn on top of it, plus a crisp focus outline when selected. The logo
 	// alone identifies the world - no text label, unless there's no logo to
-	// show (logoResourceId 0, the Custom tile - it has no compiled art),
-	// in which case fallbackLabel is centered in its place instead.
+	// show (logoResourceId 0 - e.g. the Custom tile when custom_tile.png
+	// isn't present in Assets), in which case fallbackLabel is centered in
+	// its place instead.
 	Gdiplus::Bitmap* RenderFranchiseTile(int logoResourceId, bool focused, const wchar_t* fallbackLabel = nullptr)
 	{
 		constexpr int tileW = 190;
@@ -8316,7 +8317,7 @@ void UpdateInputOwnership(HWND window);
 				const bool isReorganizeSource = g_app.reorganizingFranchise && tileHere == VirtualTile::None &&
 					inRange && slot == g_app.reorganizeFranchiseSourceIndex;
 				const int logoResourceId = tileHere == VirtualTile::Favorites ? kCustomBinIconResourceId
-					: tileHere == VirtualTile::Custom ? 0
+					: tileHere == VirtualTile::Custom ? kCustomTileResourceId
 					: kFranchises[g_app.franchiseDisplayList[slot]].logoResourceId;
 				const wchar_t* fallbackLabel = tileHere == VirtualTile::Custom ? L"Custom" : nullptr;
 				const float scale = focused ? SelectionTapScale() : 1.0f;
@@ -8763,12 +8764,27 @@ void UpdateInputOwnership(HWND window);
 		// with the pill bottom clear of the roster panel that starts at y=94.
 		constexpr float kBadgeTop = 24.0f;
 
-		// Custom: no compiled word-art or icon exists for it (unlike Favorites'
-		// custom_bin.png), so it gets a plain text label instead of a badge.
+		// Custom: no name plate - show the custom_tile icon enlarged, centred,
+		// same treatment as Favorites' custom_bin icon below. Falls back to a
+		// plain text label if custom_tile.png isn't present in Assets.
 		if (g_app.screen == Screen::RosterList && g_app.virtualTile == VirtualTile::Custom && !g_app.storyRosterActive)
 		{
-			DrawTextLineCentered(g, L"Custom", static_cast<int>((width - 360.0f) / 2.0f),
-				static_cast<int>(kBadgeTop + 14.0f), 360, RGB(230, 236, 246), 40);
+			Gdiplus::Bitmap* customLogo = GetAssetBitmap(kCustomTileResourceId);
+			if (!customLogo)
+			{
+				DrawTextLineCentered(g, L"Custom", static_cast<int>((width - 360.0f) / 2.0f),
+					static_cast<int>(kBadgeTop + 14.0f), 360, RGB(230, 236, 246), 40);
+				return;
+			}
+			const Gdiplus::RectF box((width - 90.0f) / 2.0f, kBadgeTop, 90.0f, 66.0f);
+			const float scale = std::min(
+				box.Width / customLogo->GetWidth(), box.Height / customLogo->GetHeight());
+			const int drawW = static_cast<int>(customLogo->GetWidth() * scale);
+			const int drawH = static_cast<int>(customLogo->GetHeight() * scale);
+			if (Gdiplus::Bitmap* cached = RenderScaledAsset(
+				kCustomTileResourceId, drawW, drawH, 0))
+				g.DrawImage(cached, box.X + (box.Width - drawW) / 2.0f,
+					box.Y + (box.Height - drawH) / 2.0f);
 			return;
 		}
 

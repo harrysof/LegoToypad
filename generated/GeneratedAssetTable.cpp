@@ -13,6 +13,7 @@ const int kCharactersTileResourceId = ASSET_CHARACTERS_TILE;
 const int kSettingsTileResourceId = ASSET_SETTINGS_TILE;
 const int kPadBackgroundResourceIds[7] = { ASSET_PAD_BG_DEFAULT_LEFT_UPPER, ASSET_PAD_BG_DEFAULT_CENTER, ASSET_PAD_BG_DEFAULT_RIGHT_UPPER, ASSET_PAD_BG_DEFAULT_LEFT_LOWER_LEFT, ASSET_PAD_BG_DEFAULT_LEFT_LOWER_RIGHT, ASSET_PAD_BG_DEFAULT_RIGHT_LOWER_LEFT, ASSET_PAD_BG_DEFAULT_RIGHT_LOWER_RIGHT };
 const int kCustomBinIconResourceId = ASSET_CUSTOM_BIN_ICON;
+const int kCustomTileResourceId = ASSET_CUSTOM_TILE;
 const int kSfxNavigateResourceId = ASSET_SFX_NAVIGATE;
 const int kSfxSelectResourceId = ASSET_SFX_SELECT;
 const int kSfxMoveResourceId = ASSET_SFX_MOVE;

@@ -892,6 +892,17 @@ def generate(root: Path, out_dir: Path) -> int:
     if custom_bin_icon:
         ascii_ok([str(custom_bin_icon)], warnings)
 
+    # ---- custom franchise-tile logo ----------------------------------------
+    # Logo shown on the "Custom" virtual tile in the Pick-a-World grid (the
+    # tile that opens the Special\ roster - see BuildCustomTagList in
+    # main.cpp). Optional: falls back to a plain "Custom" text label at
+    # runtime (RenderFranchiseTile's fallbackLabel) if this file isn't
+    # present, same graceful-degradation as settings_tile/abilities_tile.
+    custom_tile_logo = pick_named({"custom_tile", "customtile"}, "custom tile logo")
+    custom_tile_logo_sym = symbols.allocate("ASSET_CUSTOM_TILE", custom_tile_logo) if custom_tile_logo else None
+    if custom_tile_logo:
+        ascii_ok([str(custom_tile_logo)], warnings)
+
     # ---- UI sound effects --------------------------------------------------
     # Assets/SFX/Navigate.wav and Select.wav, embedded verbatim and played
     # from memory with PlaySound(SND_MEMORY). Missing files just mean that
@@ -1186,6 +1197,7 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("extern const PadSkin kPadSkins[];")
     header.append("extern const size_t kPadSkinCount;")
     header.append("extern const int kCustomBinIconResourceId;")
+    header.append("extern const int kCustomTileResourceId;")
     header.append("extern const int kSfxNavigateResourceId;")
     header.append("extern const int kSfxSelectResourceId;")
     header.append("extern const int kSfxMoveResourceId;")
@@ -1244,6 +1256,7 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kPadBackgroundResourceIds[7] = { %s };"
                % ", ".join(sym["name"] if sym else "0" for sym in pad_bg_syms))
     cpp.append("const int kCustomBinIconResourceId = %s;" % (custom_bin_icon_sym["name"] if custom_bin_icon_sym else "0"))
+    cpp.append("const int kCustomTileResourceId = %s;" % (custom_tile_logo_sym["name"] if custom_tile_logo_sym else "0"))
     cpp.append("const int kSfxNavigateResourceId = %s;" % (sfx_navigate_sym["name"] if sfx_navigate_sym else "0"))
     cpp.append("const int kSfxSelectResourceId = %s;" % (sfx_select_sym["name"] if sfx_select_sym else "0"))
     cpp.append("const int kSfxMoveResourceId = %s;" % (sfx_move_sym["name"] if sfx_move_sym else "0"))
