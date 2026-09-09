@@ -1172,6 +1172,26 @@ void UpdateInputOwnership(HWND window);
 		g_assetImages.clear();
 	}
 
+	// Decodes every ability icon into g_assetImages up front, at startup
+	// while the window is still hidden, instead of leaving it to whichever
+	// interaction happens to touch a given icon first. Without this, the
+	// first RT peek (DrawAbilitiesPeekPanel) or the first visit to the
+	// Abilities sort grid (RenderAbilityTile) on a never-before-shown icon
+	// pays for that icon's PNG decode synchronously inside the paint call -
+	// with several abilities on one entry (Ethan Hunt has 13), that showed
+	// up as the peek panel hanging half-faded for a second or two before it
+	// finished fading in. Ability icons are the biggest, most numerous
+	// group of cold assets reachable from a single interaction (~78 of
+	// them, several hundred KB apiece), so they get this dedicated pass
+	// rather than every asset in the game. GetAssetBitmap already caches by
+	// resource id, so this is a no-op for any icon a screen already forced
+	// to load before this runs.
+	void PrewarmAbilityIcons()
+	{
+		for (size_t i = 0; i < kAbilityCount; ++i)
+			GetAssetBitmap(kAbilities[i].iconResourceId);
+	}
+
 	void ReleaseGlossCache()
 	{
 		for (auto& [key, bitmap] : g_glossCache)
@@ -2227,10 +2247,15 @@ void UpdateInputOwnership(HWND window);
 	void DrawTextWrappedCenteredFit(Gdiplus::Graphics& g, const std::wstring& text, int x, int y, int width, int height, COLORREF color);
 
 	// Ability tile: the Abilities.png panel (falls back to characters_tile.png
-	// - see kAbilitiesTileResourceId in generate_assets.py) with the ability's
-	// icon and short name on top, same focus outline as a franchise tile.
-	// Unlike a franchise logo, an ability icon alone isn't self-explanatory,
-	// so - unlike RenderFranchiseTile - this always draws a text label too.
+	// - see kAbilitiesTileResourceId in generate_assets.py) holding just the
+	// ability's icon, blown up to fill the panel, with the short name drawn
+	// UNDER the panel (in the gap the grid pitch leaves between rows) rather
+	// than inside it. Unlike a franchise logo, an ability icon alone isn't
+	// self-explanatory, so - unlike RenderFranchiseTile - this always draws a
+	// text label too. The returned bitmap is therefore taller than the panel
+	// itself: panel + kAbilityLabelGap + kAbilityLabelH (the geometry
+	// constants near kAbilityTileH mirror these, and the scroll bar's track
+	// accounts for the extra height).
 	// Keyed by abilityIndex rather than the icon resource id, since more than
 	// one ability can share resId 0 (no icon yet) or even the same
 	// deterministic ring colour in principle; the index is always unique.
@@ -2241,10 +2266,12 @@ void UpdateInputOwnership(HWND window);
 		const Ability& ability = kAbilities[abilityIndex];
 
 		constexpr int tileW = 260;
-		constexpr int tileH = 136;
+		constexpr int tileH = 100;   // panel only - the label sits below it
+		constexpr int labelGap = 4;
+		constexpr int labelH = 34;
 		constexpr int margin = 6;
 		const int w = tileW + margin * 2;
-		const int h = tileH + margin * 2;
+		const int h = tileH + margin * 2 + labelGap + labelH;
 		const int variant = focused ? 1 : 0;
 		const GlossKey key{GlossKind::AbilityTile, variant, static_cast<int>(abilityIndex), 0, w, h};
 		const auto cached = g_glossCache.find(key);
@@ -2276,10 +2303,10 @@ void UpdateInputOwnership(HWND window);
 			g.ResetClip();
 		}
 
-		// Icon in the upper band, short name in the lower band.
-		constexpr float iconAreaH = 76.0f;
-		constexpr float labelAreaH = 40.0f;
-		const Gdiplus::RectF iconBox(margin + 8.0f, margin + 4.0f, tileW - 16.0f, iconAreaH);
+		// The icon now owns the whole panel (the label moved below it), so it
+		// is scaled to the panel's inner box - height-bound for the round
+		// icons abilities actually use.
+		const Gdiplus::RectF iconBox(margin + 8.0f, margin + 5.0f, tileW - 16.0f, tileH - 10.0f);
 		Gdiplus::Bitmap* icon = ability.iconResourceId != 0 ? GetAssetBitmap(ability.iconResourceId) : nullptr;
 		if (icon)
 		{
@@ -2294,7 +2321,7 @@ void UpdateInputOwnership(HWND window);
 			g.ResetClip();
 		}
 		else if (Gdiplus::Bitmap* placeholder = RenderPlaceholder(
-			ability.name.empty() ? L'?' : ability.name[0], ability.ringColor, focused, 60))
+			ability.name.empty() ? L'?' : ability.name[0], ability.ringColor, focused, 88))
 		{
 			const float pw = static_cast<float>(placeholder->GetWidth());
 			const float ph = static_cast<float>(placeholder->GetHeight());
@@ -2302,8 +2329,8 @@ void UpdateInputOwnership(HWND window);
 				iconBox.Y + (iconBox.Height - ph) / 2.0f, pw, ph);
 		}
 
-		DrawTextWrappedCenteredFit(g, ability.name, margin, static_cast<int>(margin + iconAreaH + 6.0f),
-			tileW, static_cast<int>(labelAreaH), RGB(230, 236, 246));
+		DrawTextWrappedCenteredFit(g, ability.name, margin, margin + tileH + labelGap,
+			tileW, labelH, RGB(230, 236, 246));
 
 		if (focused)
 		{
@@ -7007,14 +7034,20 @@ void UpdateInputOwnership(HWND window);
 
 	// Abilities grid geometry (kAbilityCols=3 wide, kAbilityVisibleRows=3
 	// tall): same origin and same right/bottom edge as the franchise grid
-	// above (40 + 3*280 = 40 + 4*210 = 880 right edge; last tile's bottom
-	// edge is 552 either way), just fewer, proportionally bigger tiles.
+	// above (40 + 3*280 = 40 + 4*210 = 880 right edge), just fewer,
+	// proportionally bigger tiles. kAbilityTileH is the PANEL height only -
+	// the name is drawn under the panel (see RenderAbilityTile), so a row
+	// really occupies kAbilityTileH + kAbilityLabelGap + kAbilityLabelH = 138
+	// of the 144 pitch, keeping the last row's bottom edge at 128 + 2*144 +
+	// 138 = 554, about where the franchise grid ends.
 	constexpr int kAbilityOriginX = 40;
 	constexpr int kAbilityOriginY = 128;
 	constexpr int kAbilityPitchX = 280;
 	constexpr int kAbilityPitchY = 144;
 	constexpr int kAbilityTileW = 260;
-	constexpr int kAbilityTileH = 136;
+	constexpr int kAbilityTileH = 100;
+	constexpr int kAbilityLabelGap = 4;
+	constexpr int kAbilityLabelH = 34;
 
 	// Roster grid layout lives with the roster navigation constants above,
 	// because navigation and painting both need the same visual row model.
@@ -8064,7 +8097,8 @@ void UpdateInputOwnership(HWND window);
 
 		const int trackTop = kAbilityOriginY;
 		const int trackBottom = kAbilityOriginY
-			+ static_cast<int>(kAbilityVisibleRows - 1) * kAbilityPitchY + kAbilityTileH;
+			+ static_cast<int>(kAbilityVisibleRows - 1) * kAbilityPitchY
+			+ kAbilityTileH + kAbilityLabelGap + kAbilityLabelH;
 		DrawScrollBar(g, trackTop, trackBottom, totalRows, kAbilityVisibleRows, g_app.franchiseTopRow);
 	}
 
@@ -11211,6 +11245,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	// the message loop, once every cached bitmap is released.
 	Gdiplus::GdiplusStartupInput gdiplusStartupInput;
 	Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
+
+	// Pay for decoding the ability icon PNGs here, once, while the overlay
+	// window doesn't exist yet and nothing is on screen to look laggy -
+	// see PrewarmAbilityIcons for why this set of assets in particular.
+	PrewarmAbilityIcons();
 
 	// SDL2 provides the unified controller input (Xbox / PS4 / PS5 / Switch
 	// Pro) via its GameController API. SDL_INIT_GAMECONTROLLER implies the
