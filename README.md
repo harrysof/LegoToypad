@@ -4,7 +4,7 @@
   <img src="Assets/Branding/Legotoypad_Logo.png" alt="LegoToypad logo" width="220">
 </p>
 
-A controller-driven companion app for LEGO Dimensions emulation. It emulates the Toypad and every tag - 78 characters and 240 vehicles across all 30 franchises - and sends them straight to the emulator. No mouse, no physical toy needed.
+A controller-driven companion app for LEGO Dimensions emulation. It emulates the Toypad and every tag - 75 characters and 240 vehicles across all 30 franchises - and sends them straight to the emulator. No mouse, no physical toy needed.
 
 Works with any of the emulator builds below that have the local Toypad listener enabled. Everything (tags, art, sounds) is baked into `LegoToypad.exe` - there are no loose files to manage.
 
@@ -23,7 +23,7 @@ LegoToypad needs an emulator build with the Toypad listener enabled. Grab the on
 
 ## Features
 
-- Full tag library built in: all 30 franchises, 78 characters, 240 vehicles
+- Full tag library built in: all 30 franchises, 75 characters, 240 vehicles
 - Controller-first UI, no mouse needed
 - True Toypad layout: 7 pad slots (3/1/3), with Load / Move / Clear per slot
 - Toypad sneak peek: hold a button to see the pads over the game without pausing it
