@@ -105,7 +105,6 @@ NAME_OVERRIDES = {
     "Jake the Dog": "Jake",
     "Marceline the Vampire Queen": "Marceline",
     "Beetle Juice": "Betelgeuse",
-    "Joker": "The Joker",
     "Twelfth Doctor": "The Doctor",
     "Lord Voldemort": "Voldemort",
     "Owen Grady": "Owen",
@@ -391,6 +390,24 @@ def load_abilities(csv_path):
     return rows
 
 
+def ability_section_from_folder_name(folder):
+    """Maps an Assets/Abilities subfolder name to the canonical section label
+    the app filters on. Tolerant of case and of trailing words (so both
+    "One-Timed" and "One-Timed Use" resolve to "One-Timed"). Returns "" for an
+    unrecognized folder."""
+    f = folder.strip().casefold()
+    for prefix, section in (
+        ("uncommon", "Uncommon"),
+        ("common", "Common"),
+        ("exclusive", "Exclusive"),
+        ("vehicular", "Vehicular"),
+        ("one", "One-Timed"),
+    ):
+        if f.startswith(prefix):
+            return section
+    return ""
+
+
 def parse_entity_hint(raw):
     """Splits a trailing "(Franchise)" disambiguator off an entity name, e.g.
     "Batman (The LEGO Batman Movie)" -> ("Batman", "The LEGO Batman Movie").
@@ -623,7 +640,7 @@ def generate(root: Path, out_dir: Path) -> int:
     # disambiguation in apply_abilities). Icon resources are allocated later,
     # once assets_files() is available.
     ability_rows = load_abilities(root / "abilities.csv")
-    ability_catalog_names = apply_abilities(franchises, ability_rows, warnings)
+    attached_ability_names = apply_abilities(franchises, ability_rows, warnings)
 
     # ---- app-level assets -------------------------------------------------
     # The Assets tree is organized into category folders (Wallpapers, Pads,
@@ -792,20 +809,31 @@ def generate(root: Path, out_dir: Path) -> int:
     if abilities_tile:
         ascii_ok([str(abilities_tile)], warnings)
 
-    # ---- ability icons ------------------------------------------------
-    # One PNG per ability under Assets/Abilities/, matched to a catalog name
-    # (from abilities.csv via apply_abilities above) case/space-insensitively,
-    # same normalized-match convention as character/vehicle portraits
-    # (pair_bins_and_images). Filenames may use the full sheet name
-    # ("Acrobat Ability.png") or the short display form ("Acrobat.png") - an
-    # ability with neither gets iconResourceId 0 and the app falls back to
-    # its RenderPlaceholder() circular-initial, same as a missing portrait -
-    # so the feature works today with zero icons and they can be dropped in
-    # incrementally without touching code.
+    # ---- ability icons / catalog --------------------------------------
+    # Icons live under Assets/Abilities/<Section>/<Ability Name>.png, where the
+    # subfolder names the section (Common, Uncommon, Exclusive, Vehicular,
+    # One-Timed Use). The scan is recursive so moving an icon between folders
+    # (or adding a new one) is all it takes to recategorize it.
+    #
+    # The catalog is the union of every icon found and every ability attached
+    # to a character/vehicle in abilities.csv. That way an ability with no
+    # figures still gets a tile (its roster just comes up empty) instead of
+    # being dropped, and an ability with no icon still gets a placeholder
+    # tile. The section is always taken from the icon's folder.
     abilities_assets_root = discover_case_insensitive(assets_root, "Abilities")
     ability_icon_by_norm = {}
-    for p in image_files(abilities_assets_root):
+    ability_section_by_name = {}
+    icon_names = []
+    for p in asset_files(abilities_assets_root, (".png", ".jpg", ".jpeg")):
+        icon_names.append(p.stem)
         ability_icon_by_norm.setdefault(normalize(p.stem), p)
+        section = ability_section_from_folder_name(p.parent.name)
+        if section:
+            ability_section_by_name.setdefault(p.stem, section)
+
+    ability_catalog_names = sorted(
+        set(attached_ability_names) | set(icon_names),
+        key=lambda n: n.casefold())
 
     def ability_short_name(name):
         return re.sub(r"\s+Ability$", "", name).strip()
@@ -822,6 +850,7 @@ def generate(root: Path, out_dir: Path) -> int:
             icons_found += 1
         ability_table.append({
             "name": ability_short_name(name),
+            "section": ability_section_by_name.get(name, ""),
             "icon": ability_icon_sym,
             "ringColor": ring_color_for("ABILITY_%s" % sanitize(name)),
         })
@@ -1132,6 +1161,7 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("{")
     header.append("    int binResourceId;       // RCDATA id of the .bin payload")
     header.append("    int portraitResourceId;  // RCDATA id of the .png, 0 = none")
+    header.append("    std::wstring stableId;   // resource-name stem; stable across id reassignment")
     header.append("    std::wstring name;       // character name or vehicle base name")
     header.append("    unsigned int ringColor;  // deterministic, see generator")
     header.append("    int buildNumber;         // 0 = character, 1/2/3 = vehicle build")
@@ -1141,6 +1171,7 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("struct Ability")
     header.append("{")
     header.append("    std::wstring name;       // short display form (\" Ability\" suffix stripped)")
+    header.append("    std::wstring section;    // Common/Uncommon/Exclusive/Vehicular/One-Timed, empty = none")
     header.append("    int iconResourceId;      // RCDATA id of the .png, 0 = none (placeholder shown)")
     header.append("    unsigned int ringColor;  // deterministic, see generator")
     header.append("};")
@@ -1306,9 +1337,10 @@ def generate(root: Path, out_dir: Path) -> int:
 
     def emit_entry(entry):
         indices = ", ".join(str(i) for i in entry.get("abilityIndices", []))
-        return ("{ %s, %s, %s, %s, %d, { %s } }"
-                % (entry["bin"]["name"], entry["png"]["name"], wstr(entry["name"]),
-                   ring_color_for(entry["bin"]["name"]), entry["build"], indices))
+        return ("{ %s, %s, %s, %s, %s, %d, { %s } }"
+                % (entry["bin"]["name"], entry["png"]["name"], wstr(entry["bin"]["name"]),
+                   wstr(entry["name"]), ring_color_for(entry["bin"]["name"]),
+                   entry["build"], indices))
 
     def emit_group(group):
         build_entries = ", ".join(emit_entry(e) for e in group["builds"])
@@ -1331,9 +1363,10 @@ def generate(root: Path, out_dir: Path) -> int:
     # above) - if abilities.csv is ever missing/empty, emit one inert sentinel
     # (empty name) rather than nothing; main.cpp skips empty-name entries when
     # building the Abilities browse grid.
-    for ability in (ability_table or [{"name": "", "icon": None, "ringColor": "0"}]):
-        cpp.append("    { %s, %s, %s }," % (
+    for ability in (ability_table or [{"name": "", "section": "", "icon": None, "ringColor": "0"}]):
+        cpp.append("    { %s, %s, %s, %s }," % (
             wstr(ability["name"]),
+            wstr(ability.get("section", "")),
             ability["icon"]["name"] if ability["icon"] else "0",
             ability["ringColor"]))
     cpp.append("};")

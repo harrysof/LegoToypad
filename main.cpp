@@ -289,6 +289,12 @@ constexpr int kOverlayWidth = 900;
 		int binResourceId = 0;
 		int portraitResourceId = 0;
 		unsigned int ringColor = 0;
+		// Stable resource-name stem of the loaded entry (see
+		// RosterEntry::stableId) and its build number. Kept here so a later
+		// MOVE/swap can reload the same tag - including its writable copy -
+		// without re-resolving the entry from the resource id.
+		std::wstring stableId;
+		int buildNumber = 0;
 	};
 
 	// How a physical pad region's LED is behaving, as commanded by the game's
@@ -431,6 +437,19 @@ bool swapConfirmBackButtons = false;
 		// UI sound effects (Assets/SFX): a blip when the selection moves and
 		// a different one when something is confirmed.
 		bool soundEffects = true;
+		// When on, loading a character/vehicle also dismisses the overlay so
+		// you drop straight back into the game (the picker's "I'm done"
+		// gesture). When off, loading still returns to the pad viewer but
+		// leaves the overlay open (the pre-1.9 behaviour), so several tags can
+		// be loaded in a row without reopening it each time.
+		bool fastLoading = true;
+		// When on, loading a vehicle/gadget materialises a real writable .bin
+		// under Writable\ next to the exe (seeded from the bundled tag the
+		// first time) and hands the emulator its path, so in-game tag writing
+		// - the centre-pad "write this tag" prompts - persists to disk and is
+		// picked up on the next load. Off leaves the bundled tag read-only,
+		// exactly as before.
+		bool writableVehicleTags = true;
 		// Playback level, 0-100. PlaySound has no volume control of its own,
 		// so this is applied by scaling the WAV's samples (see GetSoundBytes).
 		int soundVolume = 70;
@@ -553,6 +572,12 @@ bool swapConfirmBackButtons = false;
 		size_t abilityGridIndex = 0;
 		bool abilityRosterActive = false;
 		size_t abilityRosterFilter = 0; // index into kAbilities, valid while abilityRosterActive
+		// Section filter on the Abilities grid, cycled with Y: 0 = All,
+		// otherwise 1 + index into kAbilitySections. abilityFilteredIndices
+		// maps a visible grid slot back to its kAbilities[] index under the
+		// active filter (rebuilt by RebuildAbilityFilter).
+		size_t abilitySectionFilter = 0;
+		std::vector<size_t> abilityFilteredIndices;
 	};
 
 	AppState g_app;
@@ -886,6 +911,8 @@ bool swapConfirmBackButtons = false;
 		WindowPlacement,
 		SneakPeek,
 		LedMirror,
+		FastLoading,
+		WritableTags,
 		SoundEffects,
 		SoundVolume,
 		ClearAllPads,
@@ -1036,6 +1063,10 @@ void UpdateInputOwnership(HWND window);
 	std::wstring DescribeOpacity();
 	std::wstring DescribeSoundEffects();
 	std::wstring DescribeSoundVolume();
+	void ToggleFastLoading();
+	std::wstring DescribeFastLoading();
+	void ToggleWritableVehicleTags();
+	std::wstring DescribeWritableVehicleTags();
 
 	// ---------------------------------------------------------------------
 	// GDI+ plumbing
@@ -3082,9 +3113,10 @@ void UpdateInputOwnership(HWND window);
 			"; and 2 upwards are the remaining bundled Assets/Wallpapers images.\n"
 			"BackgroundIndex=0\n"
 			"; FranchiseSort = 0 Default (all worlds, alphabetical), 1 User (custom\n"
-			"; order), 2 Story (starter pack characters/vehicles), 3 Favorites,\n"
-			"; 4 Year 1 (2015 wave), 5 Year 2 (2016 wave). Browsed with the\n"
-			"; shoulder buttons (RB/LB) on the world screen.\n"
+			"; order), 2 Starter (starter pack characters/vehicles), 3 Favorites,\n"
+			"; 4 Year 1 (2015 wave), 5 Year 2 (2016 wave), 6 Abilities. Browsed with\n"
+			"; the shoulder buttons (RB/LB) on the world screen, which step through\n"
+			"; Default - Year 1 - Year 2 - Abilities - User - Favorites - Starter.\n"
 			"FranchiseSort=0\n"
 			"; Controller bindings for the picker's own actions, as raw XInput button\n"
 			"; values (A=4096, B=8192, X=16384, Y=32768, LB=256, RB=512, LT=65536,\n"
@@ -3133,6 +3165,16 @@ void UpdateInputOwnership(HWND window);
 			"; including ones you drop into Assets/Pads next to this exe after install,\n"
 			"; which are picked up at startup and switchable from Settings.\n"
 			"PadSkin=Default\n"
+			"; FastLoading = 1 dismisses the overlay as soon as a character or vehicle\n"
+			"; is loaded, dropping you straight back into the game. Set it to 0 to stay\n"
+			"; on the pad viewer after a load with the overlay still open, so several\n"
+			"; tags can be loaded in a row without reopening it each time.\n"
+			"FastLoading=1\n"
+			"; WritableVehicleTags = 1 makes the app hand the emulator a real file\n"
+			"; for every vehicle/gadget it loads (Writable\\<id>.bin, seeded from the\n"
+			"; bundled tag on first use). In-game tag writing then persists to that\n"
+			"; file and is loaded back next time. Set to 0 for read-only bundled tags.\n"
+			"WritableVehicleTags=1\n"
 			"\n"
 			"; Written by the app when you change the Window row in Settings.\n"
 			"[Window]\n"
@@ -3373,6 +3415,10 @@ void UpdateInputOwnership(HWND window);
 			std::to_wstring(g_app.soundVolume).c_str(), iniPath.c_str());
 		WritePrivateProfileStringW(L"Input", L"SneakPeek",
 			std::to_wstring(g_app.peekSizeChoice).c_str(), iniPath.c_str());
+		WritePrivateProfileStringW(L"Input", L"FastLoading",
+			g_app.fastLoading ? L"1" : L"0", iniPath.c_str());
+		WritePrivateProfileStringW(L"Input", L"WritableVehicleTags",
+			g_app.writableVehicleTags ? L"1" : L"0", iniPath.c_str());
 		// Stored by folder name, not by index: adding or removing a skin
 		// folder must never silently repoint this at a different one.
 		WritePrivateProfileStringW(L"Input", L"PadSkin",
@@ -3395,7 +3441,7 @@ void UpdateInputOwnership(HWND window);
 		{
 			const int sortVal = GetPrivateProfileIntW(
 				L"Input", L"FranchiseSort", 0, iniPath.c_str());
-			const int maxSort = static_cast<int>(AppState::FranchiseSort::Year2);
+			const int maxSort = static_cast<int>(AppState::FranchiseSort::Abilities);
 			g_app.franchiseSort = static_cast<AppState::FranchiseSort>(
 				std::clamp(sortVal, 0, maxSort));
 		}
@@ -3413,6 +3459,10 @@ void UpdateInputOwnership(HWND window);
 			GetPrivateProfileIntW(L"Input", L"SneakPeek",
 				static_cast<INT>(kDefaultPeekSizeChoice), iniPath.c_str())),
 			0, kPeekSizeChoiceCount - 1));
+		g_app.fastLoading =
+			GetPrivateProfileIntW(L"Input", L"FastLoading", 1, iniPath.c_str()) != 0;
+		g_app.writableVehicleTags =
+			GetPrivateProfileIntW(L"Input", L"WritableVehicleTags", 1, iniPath.c_str()) != 0;
 		std::array<wchar_t, 96> padSkinBuffer{};
 		GetPrivateProfileStringW(L"Input", L"PadSkin", L"Default", padSkinBuffer.data(),
 			static_cast<DWORD>(padSkinBuffer.size()), iniPath.c_str());
@@ -3956,7 +4006,36 @@ void UpdateInputOwnership(HWND window);
 		return data;
 	}
 
-	bool SendLoadResourceToSlot(int binResourceId, size_t slotIndex, std::wstring& errorOut)
+	// Writes tag bytes to a file, creating Writable\ if needed. Returns false
+	// if the file could not be written (e.g. a read-only install folder), in
+	// which case the caller falls back to sending the tag without a path.
+	bool WriteFileBytes(const std::filesystem::path& path, const std::vector<uint8_t>& data)
+	{
+		std::error_code ec;
+		std::filesystem::create_directories(path.parent_path(), ec);
+		if (ec)
+			return false;
+		std::ofstream file(path, std::ios::binary | std::ios::trunc);
+		if (!file)
+			return false;
+		file.write(reinterpret_cast<const char*>(data.data()),
+			static_cast<std::streamsize>(data.size()));
+		return file.good();
+	}
+
+	// The writable copy of a bundled vehicle/gadget tag. Keyed by the stable
+	// resource-name stem (world + entry + build), never by the numeric
+	// resource id, so the file survives asset regeneration that reassigns ids.
+	std::filesystem::path WritableTagPath(const std::wstring& stableId)
+	{
+		return GetExecutableDirectory() / L"Writable" / (stableId + L".bin");
+	}
+
+	// stableId/buildNumber identify the entry for the writable-tag path;
+	// they are ignored for the negative (Special\) custom ids, which already
+	// carry a real file path of their own.
+	bool SendLoadResourceToSlot(int binResourceId, const std::wstring& stableId, int buildNumber,
+		size_t slotIndex, std::wstring& errorOut)
 	{
 		if (binResourceId == 0)
 		{
@@ -3986,12 +4065,34 @@ void UpdateInputOwnership(HWND window);
 			return SendLoadBytesToSlot(tagData, slotIndex, errorOut, binPath.wstring());
 		}
 
-		const std::vector<uint8_t> tagData = LoadResourceBytes(binResourceId);
+		std::vector<uint8_t> tagData = LoadResourceBytes(binResourceId);
 		if (tagData.size() != kTagSize)
 		{
 			errorOut = L"The embedded tag for this entry has the wrong size.";
 			return false;
 		}
+
+		// Vehicles/gadgets (buildNumber >= 1) can be made writable: keep a
+		// real .bin under Writable\, seeded from the bundled tag the first
+		// time, and send its path so the emulator writes the game's changes
+		// back into it. If a copy already exists, load from it instead of the
+		// bundled default. A write failure (e.g. a read-only install folder)
+		// silently falls back to a path-less, session-only load.
+		if (g_app.writableVehicleTags && buildNumber >= 1 && !stableId.empty())
+		{
+			const std::filesystem::path path = WritableTagPath(stableId);
+			const std::vector<uint8_t> saved = LoadFileBytes(path);
+			if (saved.size() == kTagSize)
+			{
+				tagData = saved;
+			}
+			else if (!WriteFileBytes(path, tagData))
+			{
+				return SendLoadBytesToSlot(tagData, slotIndex, errorOut);
+			}
+			return SendLoadBytesToSlot(tagData, slotIndex, errorOut, path.wstring());
+		}
+
 		return SendLoadBytesToSlot(tagData, slotIndex, errorOut);
 	}
 
@@ -4029,7 +4130,8 @@ void UpdateInputOwnership(HWND window);
 		// LOAD anyway, so this still overwrites whatever is on that pad.
 
 		std::wstring error;
-		if (!SendLoadResourceToSlot(entry.binResourceId, slotIndex, error))
+		if (!SendLoadResourceToSlot(entry.binResourceId, entry.stableId, entry.buildNumber,
+			slotIndex, error))
 		{
 			g_app.status = error;
 			return;
@@ -4044,18 +4146,22 @@ void UpdateInputOwnership(HWND window);
 		slot.binResourceId = entry.binResourceId;
 		slot.portraitResourceId = entry.portraitResourceId;
 		slot.ringColor = entry.ringColor;
+		slot.stableId = entry.stableId;
+		slot.buildNumber = entry.buildNumber;
 
 		g_app.status = L"LOAD sent: " + name + L" -> " + kSlots[slotIndex].label;
 		if (updateUi)
 		{
-			// Loading a figure is the one action that means "I'm done with the
-			// picker" - the tag is on the pad and the game is ready for it, so
-			// close the overlay and drop straight back into the game instead of
-			// making the user close it manually.
+			// Loading always returns to the pad viewer. Fast loading (on by
+			// default) then also dismisses the overlay, since the tag is on the
+			// pad and the game is ready for it - the picker's "I'm done"
+			// gesture. With it off the overlay stays up on the pad viewer, so
+			// several tags can be loaded in a row without reopening it.
 			g_app.storyRosterActive = false;
 			g_app.screen = Screen::PadViewer;
 			InvalidateRect(g_mainWindow, nullptr, FALSE);
-			HideOverlay(g_mainWindow);
+			if (g_app.fastLoading)
+				HideOverlay(g_mainWindow);
 		}
 	}
 
@@ -4149,7 +4255,8 @@ void UpdateInputOwnership(HWND window);
 		{
 			if (destSlot.occupied)
 			{
-				const bool reloaded = SendLoadResourceToSlot(destSlot.binResourceId, sourceIndex, error);
+				const bool reloaded = SendLoadResourceToSlot(destSlot.binResourceId, destSlot.stableId,
+					destSlot.buildNumber, sourceIndex, error);
 				if (!reloaded)
 				{
 					g_app.padState[destIndex] = sourceSlot;
@@ -4403,14 +4510,18 @@ void UpdateInputOwnership(HWND window);
 	// story/favorites roster) and keeps the focused selection valid.
 	void CycleFranchiseSort(int direction)
 	{
+		// Order the shoulder buttons step through:
+		// Default - Year 1 - Year 2 - Abilities - User - Favorites - Starter.
+		// (The enum values themselves are unchanged, so the ini value that
+		// persists the current sort keeps meaning the same thing.)
 		const auto modes = {
 			AppState::FranchiseSort::Default,
-			AppState::FranchiseSort::User,
-			AppState::FranchiseSort::Story,
 			AppState::FranchiseSort::Year1,
 			AppState::FranchiseSort::Year2,
-			AppState::FranchiseSort::Favorites,
 			AppState::FranchiseSort::Abilities,
+			AppState::FranchiseSort::User,
+			AppState::FranchiseSort::Favorites,
+			AppState::FranchiseSort::Story,
 		};
 		const int count = static_cast<int>(modes.size());
 		int idx = 0;
@@ -4509,15 +4620,69 @@ void UpdateInputOwnership(HWND window);
 			g_app.franchiseTopRow = 0;
 	}
 
-	// kAbilityCount is never truly 0 (generate_assets.py emits one inert
-	// empty-name sentinel rather than an empty array when abilities.csv is
-	// missing/empty) - this is the "really zero" count the ability grid/roster
-	// code treats as empty.
+	// Ability sections, in the order the Abilities grid's Y filter cycles them
+	// (after "All"). The labels match the Section values generate_assets.py
+	// emits from ability_sections.csv.
+	const wchar_t* const kAbilitySectionNames[] = {
+		L"Common", L"Uncommon", L"Exclusive", L"Vehicular", L"One-Timed",
+	};
+	constexpr size_t kAbilitySectionCount =
+		sizeof(kAbilitySectionNames) / sizeof(kAbilitySectionNames[0]);
+	constexpr size_t kAbilityFilterChoiceCount = kAbilitySectionCount + 1; // + All
+
+	// Rebuilt whenever the section filter changes (and lazily before first
+	// use). kAbilities is static, so this is cheap and only runs on input.
+	bool g_abilityFilterDirty = true;
+
+	void RebuildAbilityFilter()
+	{
+		g_app.abilityFilteredIndices.clear();
+		const bool all = g_app.abilitySectionFilter == 0;
+		const size_t sectionIndex = all ? 0 : g_app.abilitySectionFilter - 1;
+		for (size_t i = 0; i < kAbilityCount; ++i)
+		{
+			// The inert empty-name sentinel generate_assets.py emits for an
+			// empty catalog never becomes a tile.
+			if (kAbilities[i].name.empty())
+				continue;
+			if (all || kAbilities[i].section == kAbilitySectionNames[sectionIndex])
+				g_app.abilityFilteredIndices.push_back(i);
+		}
+		g_abilityFilterDirty = false;
+	}
+
+	std::wstring DescribeAbilityFilter()
+	{
+		if (g_app.abilitySectionFilter == 0)
+			return L"All";
+		return kAbilitySectionNames[g_app.abilitySectionFilter - 1];
+	}
+
+	// Number of tiles the Abilities grid shows under the active filter. Always
+	// rebuilds first when the filter changed, so callers can index
+	// abilityFilteredIndices straight after calling this.
 	size_t AbilityGridCount()
 	{
-		if (kAbilityCount == 1 && kAbilities[0].name.empty())
-			return 0;
-		return kAbilityCount;
+		if (g_abilityFilterDirty)
+			RebuildAbilityFilter();
+		return g_app.abilityFilteredIndices.size();
+	}
+
+	// Y on the Abilities grid: step to the next/previous section filter (All,
+	// Common, Uncommon, Exclusive, Vehicular, One-Timed) and keep the focused
+	// slot valid.
+	void CycleAbilityFilter(int direction)
+	{
+		const int count = static_cast<int>(kAbilityFilterChoiceCount);
+		int index = static_cast<int>(g_app.abilitySectionFilter);
+		index = (index + direction + count) % count;
+		g_app.abilitySectionFilter = static_cast<size_t>(index);
+		g_abilityFilterDirty = true;
+		const size_t tiles = AbilityGridCount();
+		if (g_app.abilityGridIndex >= tiles)
+			g_app.abilityGridIndex = 0;
+		g_app.franchiseTopRow = 0;
+		g_app.status = L"Ability filter: " + DescribeAbilityFilter();
 	}
 
 	// Same ragged-grid wrap shape as MoveFranchiseSelection, simpler: no
@@ -4902,6 +5067,7 @@ void UpdateInputOwnership(HWND window);
 		signature = signature * 131 + g_app.padActionIndex;
 		signature = signature * 131 + g_app.franchiseIndex;
 		signature = signature * 131 + g_app.abilityGridIndex;
+		signature = signature * 131 + g_app.abilitySectionFilter;
 		signature = signature * 131 + static_cast<uint64_t>(g_app.virtualTile);
 		signature = signature * 131 + g_app.rosterIndex;
 		signature = signature * 131 + g_app.plusBuildIndex;
@@ -5044,7 +5210,7 @@ void UpdateInputOwnership(HWND window);
 	void OpenAbilityGrid()
 	{
 		g_app.franchiseTopRow = 0;
-		if (g_app.abilityGridIndex >= kAbilityCount)
+		if (g_app.abilityGridIndex >= AbilityGridCount())
 			g_app.abilityGridIndex = 0;
 		g_app.virtualTile = VirtualTile::None;
 		g_app.storyRosterActive = false;
@@ -5643,7 +5809,7 @@ void UpdateInputOwnership(HWND window);
 			else if (g_app.franchiseSort == AppState::FranchiseSort::Abilities)
 			{
 				if (g_app.abilityGridIndex < AbilityGridCount())
-					OpenAbilityRoster(g_app.abilityGridIndex);
+					OpenAbilityRoster(g_app.abilityFilteredIndices[g_app.abilityGridIndex]);
 			}
 			else
 				OpenRosterList();
@@ -6076,6 +6242,8 @@ void UpdateInputOwnership(HWND window);
 		RebuildFranchiseDisplay();
 		g_app.buttonStyleChoice = defaults.buttonStyleChoice;
 		g_app.soundEffects = defaults.soundEffects;
+		g_app.fastLoading = defaults.fastLoading;
+		g_app.writableVehicleTags = defaults.writableVehicleTags;
 		g_app.padSkinIndex = defaults.padSkinIndex;
 		g_app.peekSizeChoice = defaults.peekSizeChoice;
 		HidePeekWindow(true); // the HUD's size setting just changed under it
@@ -7135,6 +7303,38 @@ void UpdateInputOwnership(HWND window);
 	}
 
 	// ---------------------------------------------------------------------
+	// Fast loading
+	// ---------------------------------------------------------------------
+
+	std::wstring DescribeFastLoading()
+	{
+		return g_app.fastLoading ? L"On" : L"Off";
+	}
+
+	void ToggleFastLoading()
+	{
+		g_app.fastLoading = !g_app.fastLoading;
+		SaveInputSettingsToIni();
+		g_app.status = L"Fast loading: " + DescribeFastLoading();
+	}
+
+	// ---------------------------------------------------------------------
+	// Writable vehicle tags
+	// ---------------------------------------------------------------------
+
+	std::wstring DescribeWritableVehicleTags()
+	{
+		return g_app.writableVehicleTags ? L"On" : L"Off";
+	}
+
+	void ToggleWritableVehicleTags()
+	{
+		g_app.writableVehicleTags = !g_app.writableVehicleTags;
+		SaveInputSettingsToIni();
+		g_app.status = L"Writable vehicle tags: " + DescribeWritableVehicleTags();
+	}
+
+	// ---------------------------------------------------------------------
 	// The Settings list
 	// ---------------------------------------------------------------------
 
@@ -7182,6 +7382,8 @@ void UpdateInputOwnership(HWND window);
 		row(SettingAction::ConfirmStyle, L"Confirm button", DescribeConfirmButtonMode());
 		row(SettingAction::ButtonStyle, L"Button labels", DescribeButtonStyle());
 		row(SettingAction::KeyboardLayout, L"Keyboard layout", {});
+		row(SettingAction::FastLoading, L"Fast loading", DescribeFastLoading(),
+			ToneForSwitch(g_app.fastLoading));
 
 		heading(L"Button bindings");
 		for (size_t i = 0; i < kBindableActions.size(); ++i)
@@ -7191,6 +7393,8 @@ void UpdateInputOwnership(HWND window);
 		}
 
 		heading(L"System");
+		row(SettingAction::WritableTags, L"Writable vehicle tags", DescribeWritableVehicleTags(),
+			ToneForSwitch(g_app.writableVehicleTags));
 		row(SettingAction::ClearAllPads, L"Clear all pads", {});
 		row(SettingAction::WebRemote, L"Web remote", DescribeWebRemote(),
 			ToneForSwitch(g_app.webEnabled));
@@ -7296,6 +7500,8 @@ void UpdateInputOwnership(HWND window);
 		case SettingAction::WindowPlacement: ToggleWindowDraggable(); break;
 		case SettingAction::SneakPeek: CycleSneakPeek(direction); break;
 		case SettingAction::LedMirror: ToggleLedMirror(); break;
+		case SettingAction::FastLoading: ToggleFastLoading(); break;
+		case SettingAction::WritableTags: ToggleWritableVehicleTags(); break;
 		case SettingAction::SoundEffects: ToggleSoundEffects(); break;
 		case SettingAction::SoundVolume: CycleSoundVolume(direction); break;
 		case SettingAction::WebRemote: ToggleWebRemote(); break;
@@ -8369,13 +8575,15 @@ void UpdateInputOwnership(HWND window);
 		{
 			for (size_t col = 0; col < kAbilityCols; ++col)
 			{
-				const size_t index =
+				const size_t gridIndex =
 					(static_cast<size_t>(g_app.franchiseTopRow) + row) * kAbilityCols + col;
-				if (index >= count)
+				if (gridIndex >= count)
 					break;
+				// The filter maps a visible slot to the real kAbilities index.
+				const size_t abilityIndex = g_app.abilityFilteredIndices[gridIndex];
 				const int x = kAbilityOriginX + static_cast<int>(col) * kAbilityPitchX;
 				const int y = kAbilityOriginY + static_cast<int>(row) * kAbilityPitchY;
-				const bool focused = index == g_app.abilityGridIndex;
+				const bool focused = gridIndex == g_app.abilityGridIndex;
 				const float scale = focused ? SelectionTapScale() : 1.0f;
 				const float cx = x + kAbilityTileW / 2.0f;
 				const float cy = y + kAbilityTileH / 2.0f;
@@ -8386,7 +8594,7 @@ void UpdateInputOwnership(HWND window);
 					DrawImageScaledAbout(g, glow, static_cast<float>(x - kFocusGlowMargin),
 						static_cast<float>(y - kFocusGlowMargin), cx, cy, scale, SelectionGlowAlpha());
 				}
-				Gdiplus::Bitmap* tile = RenderAbilityTile(index, focused);
+				Gdiplus::Bitmap* tile = RenderAbilityTile(abilityIndex, focused);
 				if (tile)
 				{
 					DrawImageScaledAbout(g, tile, static_cast<float>(x - kTileGlowMargin),
@@ -8400,6 +8608,15 @@ void UpdateInputOwnership(HWND window);
 			+ static_cast<int>(kAbilityVisibleRows - 1) * kAbilityPitchY
 			+ kAbilityTileH + kAbilityLabelGap + kAbilityLabelH;
 		DrawScrollBar(g, trackTop, trackBottom, totalRows, kAbilityVisibleRows, g_app.franchiseTopRow);
+	}
+
+	// Persistent indicator under the "Abilities" sort badge showing which
+	// section filter (Y) is active, so the grid's contents are self-explanatory
+	// even before the status toast fades.
+	void DrawAbilityFilterLabel(Gdiplus::Graphics& g, int width)
+	{
+		const std::wstring text = L"Filter: " + DescribeAbilityFilter();
+		DrawTextLineCentered(g, text, 0, 92, width, RGB(200, 176, 255), 24);
 	}
 
 	void DrawRoundedSeparator(Gdiplus::Graphics& g, int x, int y, int width, int height)
@@ -9177,10 +9394,16 @@ void UpdateInputOwnership(HWND window);
 			break;
 		case Screen::FranchiseList:
 			if (g_app.franchiseSort == AppState::FranchiseSort::Abilities)
+			{
 				DrawAbilityGrid(g);
+				DrawSortBadge(g, width);
+				DrawAbilityFilterLabel(g, width);
+			}
 			else
+			{
 				DrawFranchiseGrid(g);
-			DrawSortBadge(g, width);
+				DrawSortBadge(g, width);
+			}
 			break;
 		case Screen::RosterList:
 		{
@@ -9506,6 +9729,11 @@ void UpdateInputOwnership(HWND window);
 				const float rightEdge = width - kTopMargin;
 				DrawButtonHint(g, g_app.buttonReorganizeFranchise, L"Organize",
 					rightEdge, hintCenterY, kHintButtonH);
+			}
+			if (g_app.franchiseSort == AppState::FranchiseSort::Abilities)
+			{
+				const float rightEdge = width - kTopMargin;
+				DrawButtonHint(g, g_app.buttonFavorite, L"Filter", rightEdge, hintCenterY, kHintButtonH);
 			}
 		}
 
@@ -9957,6 +10185,14 @@ void PollController(HWND window)
 			else if (g_app.screen == Screen::PlusPicker)
 			{
 				ToggleFavoriteForFocusedPlusBuild();
+				changed = true;
+			}
+			else if (g_app.screen == Screen::FranchiseList &&
+				g_app.franchiseSort == AppState::FranchiseSort::Abilities)
+			{
+				// Y cycles the ability-section filter: All, Common, Uncommon,
+				// Exclusive, Vehicular, One-Timed.
+				CycleAbilityFilter(+1);
 				changed = true;
 			}
 		}
