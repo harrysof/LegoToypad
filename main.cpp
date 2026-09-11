@@ -6772,15 +6772,27 @@ void UpdateInputOwnership(HWND window);
 		constexpr float kFlashDarkBrightness = 0.34f;
 		constexpr BYTE kFlashDarkAlpha =
 			static_cast<BYTE>((1.0f - kFlashDarkBrightness) * 255.0f + 0.5f);
+		// Soft default white the real toypad's pads sit at when no LED command
+		// is active (the game's own idle state drives the same). A region with
+		// no command is filled with this rather than left empty, so e.g. the
+		// scale keystone's centre pad reads as a normal pad, not a hole.
+		constexpr BYTE kDefaultLedR = 236, kDefaultLedG = 240, kDefaultLedB = 248;
+		constexpr BYTE kDefaultLedAlpha = 205;
 
 		for (int region = 0; region < 3; ++region)
 		{
 			const LedRegion& led = g_app.ledRegions[static_cast<size_t>(region)];
-			if (led.mode == LedMode::Off)
-				continue;
 
 			Gdiplus::GraphicsPath path;
 			AppendLedRegionShape(path, region, 0.0f, 0.0f, cells); // window coordinates
+
+			if (led.mode == LedMode::Off)
+			{
+				Gdiplus::SolidBrush white(Gdiplus::Color(kDefaultLedAlpha,
+					kDefaultLedR, kDefaultLedG, kDefaultLedB));
+				g.FillPath(&white, &path);
+				continue;
+			}
 
 			if (led.mode == LedMode::Flash && led.intensity <= 0.004f)
 			{
@@ -7768,6 +7780,14 @@ void UpdateInputOwnership(HWND window);
 	// so nothing needs re-resolving each frame. Left stale (not nulled) once
 	// a hold ends: only ever read while AbilitiesPeekShownFraction() > 0.
 	const RosterEntry* g_abilitiesPeekEntry = nullptr;
+	// The shown-fraction the last abilities-peek paint actually used. A cold
+	// first paint can take longer than the whole 90ms fade (GDI+ scaling the
+	// icon PNGs inside the paint), so the fade finishes *during* that frame
+	// and the repaint loop - gated on AbilitiesPeekFadeActive() - stops before
+	// ever drawing the settled card. The tick compares this against the live
+	// fraction and forces one more frame when they disagree, so the card always
+	// lands on its final state instead of hanging half-faded until the next tap.
+	float g_abilitiesPeekLastPaintFraction = -1.0f;
 	constexpr DWORD kAbilitiesPeekFadeInMs = 90;
 	constexpr DWORD kAbilitiesPeekFadeOutMs = 130;
 
@@ -8845,6 +8865,7 @@ void UpdateInputOwnership(HWND window);
 	void DrawAbilitiesPeekPanel(Gdiplus::Graphics& g, int width, int height)
 	{
 		const float shown = AbilitiesPeekShownFraction();
+		g_abilitiesPeekLastPaintFraction = (shown <= 0.004f || !g_abilitiesPeekEntry) ? 0.0f : shown;
 		if (shown <= 0.004f || !g_abilitiesPeekEntry)
 			return;
 		const RosterEntry& entry = *g_abilitiesPeekEntry;
@@ -11683,9 +11704,15 @@ if (changed)
 				static int lastPulseStep = -1;
 				const bool pulsing = ScreenHasPulsingFocus();
 				const int pulseStep = pulsing ? FocusPulseStep() : -1;
+				// A slow first abilities-peek paint can outlast its own fade, so
+				// the fade-active gate alone would stop before the settled card
+				// is ever drawn. Keep asking for frames until the last painted
+				// fraction catches up with the live one.
+				const bool abilitiesPeekSettling = g_abilitiesPeekShown &&
+					std::fabs(AbilitiesPeekShownFraction() - g_abilitiesPeekLastPaintFraction) > 0.01f;
 				const bool continuous = ledAnimating || ScreenTransitionActive() ||
 					WindowFadeActive() || SelectionTapActive() || StatusToastActive() ||
-					AbilitiesPeekFadeActive();
+					AbilitiesPeekFadeActive() || abilitiesPeekSettling;
 				if (continuous || (pulsing && pulseStep != lastPulseStep))
 				{
 					constexpr DWORD kMinAnimationFrameMs = 16; // never above ~60fps
