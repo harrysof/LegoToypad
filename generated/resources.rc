@@ -5,8 +5,8 @@
 // RCDATA payloads below are the embedded asset payloads.
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,8,0,0
- PRODUCTVERSION 1,8,0,0
+ FILEVERSION 1,9,0,0
+ PRODUCTVERSION 1,9,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -19,11 +19,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "HarrysofXD"
             VALUE "FileDescription", "Controller-driven LEGO Dimensions Toypad companion for Cemu, RPCS3, shadPS4 and Xenia"
-            VALUE "FileVersion", "1.8.0"
+            VALUE "FileVersion", "1.9.0"
             VALUE "InternalName", "LegoToypad"
             VALUE "OriginalFilename", "LegoToypad.exe"
             VALUE "ProductName", "LegoToypad"
-            VALUE "ProductVersion", "1.8.0"
+            VALUE "ProductVersion", "1.9.0"
         END
     END
     BLOCK "VarFileInfo"
