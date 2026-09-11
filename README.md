@@ -85,8 +85,9 @@ The whole picker is usable with just a keyboard - no controller required. Open
 | Arrow keys | Move selection |
 | Enter | Confirm |
 | Esc | Back |
-| S | Settings |
-| M | Move the focused pad's figure |
+| S | Settings / Favorite / Filter (same as the controller's Y) |
+| M | Move / Organize (same as the controller's X) |
+| Z (hold) | Show the focused figure's abilities |
 | L | Load a figure onto the focused pad |
 | C | Clear the focused pad |
 | G | Toggle the LED demo |
@@ -94,7 +95,8 @@ The whole picker is usable with just a keyboard - no controller required. Open
 
 Ctrl+L is the default toggle and stays active even after you set a controller
 shortcut, so both work at once. Change the toggle from **Settings -> Toggle
-shortcut**.
+shortcut**. With no controller connected, the on-screen button hints switch to
+these keys automatically.
 
 ## Setup
 

@@ -178,10 +178,12 @@ constexpr int kOverlayWidth = 900;
 	};
 	constexpr size_t kButtonStyleCount = 3;
 
-	// Settings row values: Auto follows whatever is plugged in, the rest
-	// pin one style. Auto is index 0, so the explicit styles are offset
-	// by one (see ButtonStyleFromChoice).
-	constexpr size_t kButtonStyleChoiceCount = kButtonStyleCount + 1;
+	// Settings row values: Auto follows whatever is plugged in, the three
+	// explicit styles pin one pad, and Keyboard pins keycaps. Auto is index 0,
+	// so the explicit styles are offset by one (see ButtonStyleFromChoice);
+	// Keyboard sits after the three controller styles.
+	constexpr size_t kKeyboardStyleChoice = kButtonStyleCount + 1;
+	constexpr size_t kButtonStyleChoiceCount = kButtonStyleCount + 2;
 
 	struct ButtonName
 	{
@@ -479,6 +481,9 @@ bool swapConfirmBackButtons = false;
 		// Auto resolves to, and whether anything is plugged in at all.
 		ButtonStyle detectedButtonStyle = ButtonStyle::Xbox;
 		bool controllerConnected = false;
+		// Which input the user last touched, so Auto button labels follow the
+		// device actually in use (keyboard keys vs the connected pad's style).
+		bool lastInputWasKeyboard = false;
 		// Web remote: the built-in HTTP server that lets the same tag library
 		// be driven from a phone browser on the local network. Runs on its own
 		// thread; requests that touch app state are marshaled back to the
@@ -949,7 +954,23 @@ bool swapConfirmBackButtons = false;
 	{
 		if (g_app.buttonStyleChoice == 0)
 			return g_app.detectedButtonStyle;
+		if (g_app.buttonStyleChoice == kKeyboardStyleChoice)
+			return ButtonStyle::Xbox; // no pad in keyboard mode; hints draw keycaps
 		return static_cast<ButtonStyle>(std::min(g_app.buttonStyleChoice, kButtonStyleCount) - 1);
+	}
+
+	// True when the UI should label buttons as keyboard keys instead of pad
+	// buttons: the Keyboard choice pins it, and Auto falls back to it when
+	// nothing is plugged in.
+	bool KeyboardLabelsActive()
+	{
+		if (g_app.buttonStyleChoice == kKeyboardStyleChoice)
+			return true;
+		if (g_app.buttonStyleChoice != 0)
+			return false;
+		// Auto: keyboard when nothing is plugged in, otherwise follow whichever
+		// device the user last touched.
+		return !g_app.controllerConnected || g_app.lastInputWasKeyboard;
 	}
 
 	std::wstring ButtonStyleName(ButtonStyle style)
@@ -1837,9 +1858,10 @@ void UpdateInputOwnership(HWND window);
 	// occupant tint are both skipped, so DrawLedRegionTint's colour lands on
 	// bare transparency. A colour over dark printed art reads as a muddy wash
 	// and its fade is almost impossible to follow; over an empty box the hue is
-	// true and every step of the ramp is visible. It follows the Toypad LEDs
-	// setting rather than whether a region happens to be lit right now, so pads
-	// never flip between art and outline mid-flash. It is a separate cache
+	// true and every step of the ramp is visible. PadUsesLedOutline only asks
+	// for this while the pad's region actually has an LED command, so a region
+	// that is off keeps the normal pad skin (and a flash's dark beat still
+	// stays an outline, since the region is not Off). It is a separate cache
 	// variant, so the switch costs one extra cached bitmap per pad.
 	constexpr int kPadGlowMargin = 8;
 	constexpr int kPadOutlineVariantBit = 0x100;
@@ -2955,21 +2977,76 @@ void UpdateInputOwnership(HWND window);
 		return cursor;
 	}
 
+	// Keyboard key shown in a hint when no controller is in use. Empty when the
+	// action has no keyboard equivalent.
+	std::wstring KeyboardHintKey(ButtonMask mask)
+	{
+		if (mask == 0)
+			return {};
+		if (mask == g_app.buttonFavorite || mask == g_app.buttonSettings)
+			return L"S";
+		if (mask == g_app.buttonMoveActive || mask == g_app.buttonReorganizeRoster ||
+			mask == g_app.buttonReorganizeFranchise)
+			return L"M";
+		if (mask == g_app.buttonAbilitiesPeek)
+			return L"Z";
+		if (mask == g_app.buttonQuickLoad)
+			return L"L";
+		if (mask == g_app.buttonQuickClear)
+			return L"C";
+		return {};
+	}
+
+	// Hints fall back to keyboard keycaps when nothing is plugged in, so a
+	// keyboard-only user never sees controller buttons they can't press.
+	bool UseKeyboardHints()
+	{
+		return KeyboardLabelsActive();
+	}
+
+	// A single keycap in the hint style (same look as the keyboard-layout
+	// screen). Pass draw=false to measure only.
+	float DrawHintKeycap(Gdiplus::Graphics& g, const std::wstring& key, float x, float y,
+		float h, bool draw)
+	{
+		constexpr float kPadX = 11.0f;
+		const float textW = MeasureTextWidth(g, key, h * 0.46f);
+		const float w = std::max(h, textW + kPadX * 2.0f);
+		if (!draw)
+			return w;
+		Gdiplus::GraphicsPath path;
+		AddRoundedRectPath(path, Gdiplus::RectF(x, y, w, h), 8.0f);
+		Gdiplus::SolidBrush body(Gdiplus::Color(235, 24, 30, 42));
+		g.FillPath(&body, &path);
+		Gdiplus::Pen border(Gdiplus::Color(200, 130, 140, 160), 1.6f);
+		g.DrawPath(&border, &path);
+		DrawTextLineCentered(g, key, static_cast<int>(x), static_cast<int>(y),
+			static_cast<int>(w), RGB(240, 244, 250), static_cast<int>(h));
+		return w;
+	}
+
 	// One "<icon> Label" hint, right-aligned so its right edge lands at
 	// rightX - mirrors the built-in Settings hint's layout (see Paint), but
 	// draws the label with the UI font directly since there's no bundled
 	// text-image asset for these. Returns the total width used, so several
-	// hints can stack leftward from the same right edge.
+	// hints can stack leftward from the same right edge. With no controller
+	// connected the button icon becomes its keyboard keycap.
 	float DrawButtonHint(Gdiplus::Graphics& g, ButtonMask mask, const std::wstring& label,
 		float rightX, float centerY, float h)
 	{
 		constexpr float kGap = 8.0f;
 		constexpr float kTextPx = 22.0f;
-		const float buttonW = DrawPadButtonMask(g, mask, 0.0f, 0.0f, h, false);
+		const std::wstring key = UseKeyboardHints() ? KeyboardHintKey(mask) : std::wstring();
+		const float buttonW = key.empty()
+			? DrawPadButtonMask(g, mask, 0.0f, 0.0f, h, false)
+			: DrawHintKeycap(g, key, 0.0f, 0.0f, h, false);
 		const float textW = MeasureTextWidth(g, label, kTextPx);
 		const float totalW = buttonW + kGap + textW;
 		const float originX = rightX - totalW;
-		DrawPadButtonMask(g, mask, originX, centerY - h / 2.0f, h, true);
+		if (key.empty())
+			DrawPadButtonMask(g, mask, originX, centerY - h / 2.0f, h, true);
+		else
+			DrawHintKeycap(g, key, originX, centerY - h / 2.0f, h, true);
 		DrawTextLineCentered(g, label, static_cast<int>(originX + buttonW + kGap),
 			static_cast<int>(centerY - h / 2.0f), static_cast<int>(textW) + 4, RGB(226, 232, 240),
 			static_cast<int>(h));
@@ -2978,7 +3055,8 @@ void UpdateInputOwnership(HWND window);
 
 	// "<LB> <RB> Sort" hint on the left side of the screen, so it stays clear
 	// of the right-aligned Favorite/Organize hints. Both shoulder buttons are
-	// drawn side by side and share a single label, left-aligned at leftX.
+	// drawn side by side and share a single label, left-aligned at leftX. With
+	// no controller connected, the keyboard's [ and ] keys are shown instead.
 	float DrawButtonHintLeft(Gdiplus::Graphics& g, ButtonMask mask1, ButtonMask mask2,
 		const std::wstring& label, float leftX, float centerY, float h)
 	{
@@ -2986,9 +3064,18 @@ void UpdateInputOwnership(HWND window);
 		constexpr float kGap = 8.0f;
 		constexpr float kTextPx = 22.0f;
 		float cursor = leftX;
-		cursor += DrawPadButtonMask(g, mask1, cursor, centerY - h / 2.0f, h, true);
-		cursor += kIconGap;
-		cursor += DrawPadButtonMask(g, mask2, cursor, centerY - h / 2.0f, h, true);
+		if (UseKeyboardHints())
+		{
+			cursor += DrawHintKeycap(g, L"[", cursor, centerY - h / 2.0f, h, true);
+			cursor += kIconGap;
+			cursor += DrawHintKeycap(g, L"]", cursor, centerY - h / 2.0f, h, true);
+		}
+		else
+		{
+			cursor += DrawPadButtonMask(g, mask1, cursor, centerY - h / 2.0f, h, true);
+			cursor += kIconGap;
+			cursor += DrawPadButtonMask(g, mask2, cursor, centerY - h / 2.0f, h, true);
+		}
 		cursor += kGap;
 		const float textW = MeasureTextWidth(g, label, kTextPx);
 		DrawTextLineCentered(g, label, static_cast<int>(cursor),
@@ -3138,9 +3225,10 @@ void UpdateInputOwnership(HWND window);
 			"; this button is down. 65536 is LT.\n"
 			"ButtonSneakPeek=65536\n"
 			"; ButtonStyle picks the button icons/names shown in the UI:\n"
-			"; Auto | Xbox | DualShock4 | Switch. Auto follows the connected pad\n"
-			"; (Xbox wins when several are plugged in). Icons only - every pad works\n"
-			"; either way, and the values above stay raw XInput numbers.\n"
+			"; Auto | Xbox | DualShock4 | Switch | Keyboard. Auto follows the connected\n"
+			"; pad (Xbox wins when several are plugged in), or shows keyboard keys when\n"
+			"; none is. Icons/labels only - every pad works either way, and the values\n"
+			"; above stay raw XInput numbers.\n"
 			"ButtonStyle=Auto\n"
 			"; ToypadLeds = 1 mirrors the running game's toypad LEDs onto the pads.\n"
 			"; It is off by default: mirroring redraws the pads as bare colour boxes\n"
@@ -3291,10 +3379,12 @@ void UpdateInputOwnership(HWND window);
 
 	std::wstring DescribeButtonStyle()
 	{
+		if (g_app.buttonStyleChoice == kKeyboardStyleChoice)
+			return L"Keyboard";
 		if (g_app.buttonStyleChoice != 0)
 			return ButtonStyleName(EffectiveButtonStyle());
-		if (!g_app.controllerConnected)
-			return L"Auto (no controller, showing " + ButtonStyleName(g_app.detectedButtonStyle) + L")";
+		if (KeyboardLabelsActive())
+			return L"Auto (keyboard)";
 		return L"Auto (" + ButtonStyleName(g_app.detectedButtonStyle) + L")";
 	}
 
@@ -3308,6 +3398,7 @@ void UpdateInputOwnership(HWND window);
 		case 1: return L"Xbox";
 		case 2: return L"DualShock4";
 		case 3: return L"Switch";
+		case 4: return L"Keyboard";
 		default: break;
 		}
 		return L"Auto";
@@ -6772,27 +6863,17 @@ void UpdateInputOwnership(HWND window);
 		constexpr float kFlashDarkBrightness = 0.34f;
 		constexpr BYTE kFlashDarkAlpha =
 			static_cast<BYTE>((1.0f - kFlashDarkBrightness) * 255.0f + 0.5f);
-		// Soft default white the real toypad's pads sit at when no LED command
-		// is active (the game's own idle state drives the same). A region with
-		// no command is filled with this rather than left empty, so e.g. the
-		// scale keystone's centre pad reads as a normal pad, not a hole.
-		constexpr BYTE kDefaultLedR = 236, kDefaultLedG = 240, kDefaultLedB = 248;
-		constexpr BYTE kDefaultLedAlpha = 205;
 
 		for (int region = 0; region < 3; ++region)
 		{
 			const LedRegion& led = g_app.ledRegions[static_cast<size_t>(region)];
+			// No LED command: leave the region alone so the pad keeps its normal
+			// skin art (see PadUsesLedOutline) instead of being tinted white.
+			if (led.mode == LedMode::Off)
+				continue;
 
 			Gdiplus::GraphicsPath path;
 			AppendLedRegionShape(path, region, 0.0f, 0.0f, cells); // window coordinates
-
-			if (led.mode == LedMode::Off)
-			{
-				Gdiplus::SolidBrush white(Gdiplus::Color(kDefaultLedAlpha,
-					kDefaultLedR, kDefaultLedG, kDefaultLedB));
-				g.FillPath(&white, &path);
-				continue;
-			}
 
 			if (led.mode == LedMode::Flash && led.intensity <= 0.004f)
 			{
@@ -7585,6 +7666,30 @@ void UpdateInputOwnership(HWND window);
 	// on in DrawPadOccupant after DrawLedRegionTint, so the LED colour passes
 	// behind the figure instead of washing over it. An empty pad is just the
 	// bare tile - no placeholder dot, no label - matching the reference design.
+	// The wire region (0 left, 1 center, 2 right) a pad slot belongs to.
+	int PadRegionForSlot(size_t slotIndex)
+	{
+		for (int region = 0; region < 3; ++region)
+			for (int i = 0; i < kLedRegionSlotCount[region]; ++i)
+				if (kLedRegionSlots[region][i] == static_cast<int>(slotIndex))
+					return region;
+		return -1;
+	}
+
+	// With the LED mirror on, a pad is drawn as a bare outline so the region's
+	// colour reads directly - but only while that region actually has an LED
+	// command. An unlit region (e.g. the scale keystone's centre pad) keeps the
+	// normal pad skin instead of an empty box or a white fill.
+	bool PadUsesLedOutline(size_t slotIndex)
+	{
+		if (!g_app.ledMirrorEnabled)
+			return false;
+		const int region = PadRegionForSlot(slotIndex);
+		if (region < 0)
+			return true;
+		return g_app.ledRegions[static_cast<size_t>(region)].mode != LedMode::Off;
+	}
+
 	void DrawPad(Gdiplus::Graphics& g, size_t index)
 	{
 		const RECT& cell = kPadCells[index];
@@ -7638,10 +7743,11 @@ void UpdateInputOwnership(HWND window);
 				static_cast<int>(cell.top) - kFocusGlowMargin);
 		}
 
-		// Toypad LEDs on: the pads are bare outlines so the LED colour reads
-		// directly instead of staining the printed glass art.
+		// Toypad LEDs on: a lit region's pads are bare outlines so the LED
+		// colour reads directly; an unlit region keeps its normal pad skin
+		// (see PadUsesLedOutline).
 		Gdiplus::Bitmap* pad = RenderPad(static_cast<int>(index), cell, visual, occupantColor,
-			g_app.ledMirrorEnabled);
+			PadUsesLedOutline(index));
 		if (pad)
 		{
 			DrawImageScaledAbout(g, pad, static_cast<float>(cell.left - kPadGlowMargin),
@@ -7780,6 +7886,9 @@ void UpdateInputOwnership(HWND window);
 	// so nothing needs re-resolving each frame. Left stale (not nulled) once
 	// a hold ends: only ever read while AbilitiesPeekShownFraction() > 0.
 	const RosterEntry* g_abilitiesPeekEntry = nullptr;
+	// True while the keyboard's Z key is held: the keyboard equivalent of the
+	// controller's hold-to-peek abilities button.
+	bool g_keyboardAbilitiesPeekHeld = false;
 	// The shown-fraction the last abilities-peek paint actually used. A cold
 	// first paint can take longer than the whole 90ms fade (GDI+ scaling the
 	// icon PNGs inside the paint), so the fade finishes *during* that frame
@@ -8054,7 +8163,7 @@ void UpdateInputOwnership(HWND window);
 			// a HUD nobody can navigate, so a pad is simply empty or loaded.
 			Gdiplus::Bitmap* pad = RenderPad(static_cast<int>(index), cell,
 				slot.occupied ? PadVisual::Occupied : PadVisual::Idle,
-				slot.occupied ? slot.ringColor : 0, g_app.ledMirrorEnabled);
+				slot.occupied ? slot.ringColor : 0, PadUsesLedOutline(index));
 			if (pad)
 			{
 				g.DrawImage(pad, static_cast<int>(cell.left) - kPadGlowMargin,
@@ -8193,15 +8302,19 @@ void UpdateInputOwnership(HWND window);
 	// is visible, so the two features can never collide on the same button.
 	void UpdateAbilitiesPeekHold(bool anyConnected, ButtonMask heldButtons)
 	{
+		// A keyup can't arrive while the overlay is hidden, so clear the
+		// keyboard hold here rather than leaving it stuck on for the next open.
+		if (!g_app.overlayVisible)
+			g_keyboardAbilitiesPeekHeld = false;
 		const bool eligibleScreen = g_app.screen == Screen::RosterList ||
 			g_app.screen == Screen::PlusPicker || g_app.screen == Screen::PadViewer;
+		const bool controllerWants = g_app.buttonAbilitiesPeek != 0 && anyConnected &&
+			(heldButtons & g_app.buttonAbilitiesPeek) == g_app.buttonAbilitiesPeek;
 		const bool wants = eligibleScreen &&
-			g_app.buttonAbilitiesPeek != 0 &&
-			anyConnected &&
 			g_app.overlayVisible &&
 			!g_app.capturingShortcut &&
 			g_app.capturingBindingIndex < 0 &&
-			(heldButtons & g_app.buttonAbilitiesPeek) == g_app.buttonAbilitiesPeek;
+			(controllerWants || g_keyboardAbilitiesPeekHeld);
 
 		if (wants && !g_abilitiesPeekHeld)
 		{
@@ -9217,17 +9330,18 @@ void UpdateInputOwnership(HWND window);
 
 		struct KbKey { const wchar_t* label; const wchar_t* caption; };
 		const KbKey row1[] = {
-			{L"Esc", L"Back"}, {L"S", L"Settings"}, {L"M", L"Move pad"},
-			{L"L", L"Quick load"}, {L"C", L"Quick clear"}, {L"G", L"LED demo"},
-			{L"[", L"Prev sort"}, {L"]", L"Next sort"},
+			{L"Esc", L"Back"}, {L"S", L"Settings / Fav"}, {L"M", L"Move / Organize"},
+			{L"Z", L"Abilities"}, {L"L", L"Quick load"}, {L"C", L"Quick clear"},
+			{L"G", L"LED demo"}, {L"[", L"Prev sort"}, {L"]", L"Next sort"},
 		};
 		const int row1Count = static_cast<int>(sizeof(row1) / sizeof(row1[0]));
-		const float row1W = row1Count * kKeyW + (row1Count - 1) * kGapX;
+		const float row1KeyW = 80.0f;
+		const float row1W = row1Count * row1KeyW + (row1Count - 1) * kGapX;
 		const float row1X = kPanelX + (panelW - row1W) / 2.0f;
 		const float row1Y = kPanelY + 62.0f;
 		for (int i = 0; i < row1Count; ++i)
 		{
-			DrawKeycap(g, row1X + i * (kKeyW + kGapX), row1Y, kKeyW, kKeyH,
+			DrawKeycap(g, row1X + i * (row1KeyW + kGapX), row1Y, row1KeyW, kKeyH,
 				row1[i].label, row1[i].caption, false);
 		}
 
@@ -9675,15 +9789,22 @@ void UpdateInputOwnership(HWND window);
 			Gdiplus::Bitmap* settingsText = GetAssetBitmap(kSettingsTextResourceId);
 			if (settingsText)
 			{
-				const float buttonW = DrawPadButtonMask(g, g_app.buttonSettings, 0.0f, 0.0f,
-					kHintYButtonH, false);
+				const std::wstring settingsKey =
+					UseKeyboardHints() ? KeyboardHintKey(g_app.buttonSettings) : std::wstring();
+				const float buttonW = settingsKey.empty()
+					? DrawPadButtonMask(g, g_app.buttonSettings, 0.0f, 0.0f, kHintYButtonH, false)
+					: DrawHintKeycap(g, settingsKey, 0.0f, 0.0f, kHintYButtonH, false);
 				const float textW = settingsText->GetWidth() * (kHintTextH / settingsText->GetHeight());
 				const float totalW = buttonW + kHintGap + textW;
 				const float originX = width - kTopMargin - totalW;
 				const float textX = originX + buttonW + kHintGap;
 
-				DrawPadButtonMask(g, g_app.buttonSettings, originX,
-					hintCenterY - kHintYButtonH / 2.0f, kHintYButtonH, true);
+				if (settingsKey.empty())
+					DrawPadButtonMask(g, g_app.buttonSettings, originX,
+						hintCenterY - kHintYButtonH / 2.0f, kHintYButtonH, true);
+				else
+					DrawHintKeycap(g, settingsKey, originX,
+						hintCenterY - kHintYButtonH / 2.0f, kHintYButtonH, true);
 				if (Gdiplus::Bitmap* cachedText = RenderScaledAsset(
 					kSettingsTextResourceId, static_cast<int>(textW), static_cast<int>(kHintTextH), 0))
 				{
@@ -9761,29 +9882,8 @@ void UpdateInputOwnership(HWND window);
 		DrawStatusToast(g, width, height);
 		DrawAbilitiesPeekPanel(g, width, height);
 
-		// Nothing in the picker can be driven without a pad, so an empty
-		// controller list is called out over whatever screen is up. Drawn
-		// last so it sits on top of everything, on a plate because "No
-		// Background" leaves the game itself behind the text.
-		if (!g_app.controllerConnected)
-		{
-			const std::wstring warning = L"Connect a controller!";
-			constexpr float kWarningPx = 38.0f;
-			const float warningW = MeasureTextWidth(g, warning, kWarningPx);
-			const Gdiplus::RectF plate((width - warningW) / 2.0f - 26.0f,
-				height / 2.0f - 32.0f, warningW + 52.0f, 64.0f);
-			Gdiplus::GraphicsPath platePath;
-			AddRoundedRectPath(platePath, plate, 14.0f);
-			Gdiplus::SolidBrush plateFill(Gdiplus::Color(170, 8, 10, 16));
-			g.FillPath(&plateFill, &platePath);
-
-			Gdiplus::Font warningFont = MakeUIFont(kWarningPx);
-			Gdiplus::SolidBrush warningBrush(ToGdiPlusColor(RGB(236, 64, 64)));
-			Gdiplus::StringFormat warningFormat(Gdiplus::StringFormatFlagsNoWrap);
-			warningFormat.SetAlignment(Gdiplus::StringAlignmentCenter);
-			warningFormat.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-			g.DrawString(warning.c_str(), -1, &warningFont, plate, &warningFormat, &warningBrush);
-		}
+		// No "Connect a controller!" banner: the picker is fully usable from
+		// the keyboard, so an empty controller list is not an error.
 
 		// Composite the transition layer, if there is one. The few pixels of
 		// upward travel are applied as a destination offset rather than a
@@ -9991,11 +10091,14 @@ void PollController(HWND window)
 		}
 		const ButtonMask previousCombined = previousCombinedButtons;
 		previousCombinedButtons = combinedButtons;
+		// Any controller activity flips Auto button labels back to the pad.
+		if (combinedPressed != 0 || stickUp || stickDown || stickLeft || stickRight)
+			g_app.lastInputWasKeyboard = false;
 
-		// Live controller facts drive the "Connect a controller!" warning and
-		// Auto button labels, so they are refreshed before any of the early
-		// returns below - including the one taken when nothing is connected,
-		// which is exactly when the warning has to appear.
+		// Live controller facts drive Auto button labels and the keyboard-hint
+		// fallback, so they are refreshed before any of the early returns below
+		// - including the one taken when nothing is connected, which is exactly
+		// when the keyboard hints have to appear.
 		if (g_app.controllerConnected != anyConnected ||
 			(anyConnected && g_app.detectedButtonStyle != bestStyle))
 		{
@@ -11406,6 +11509,9 @@ if (changed)
 				InvalidateRect(window, nullptr, FALSE);
 				return 0;
 			}
+			// Any keypress means the user is on the keyboard right now, so Auto
+			// button labels follow that.
+			g_app.lastInputWasKeyboard = true;
 			switch (wParam)
 			{
 			case VK_UP: Navigate(-1); break;
@@ -11424,15 +11530,30 @@ if (changed)
 				break;
 			case VK_RETURN: Confirm(); break;
 			case VK_ESCAPE: Back(window); break;
+			// S mirrors the controller's Y everywhere: Settings on the pad
+			// viewer, and favorite / filter on the screens where Y does those.
 			case 'S':
 				if (g_app.screen == Screen::PadViewer)
 					g_app.screen = Screen::Settings;
+				else if (g_app.screen == Screen::RosterList && !g_app.reorganizingRoster)
+					ToggleFavoriteForFocusedRoster();
+				else if (g_app.screen == Screen::PlusPicker)
+					ToggleFavoriteForFocusedPlusBuild();
+				else if (g_app.screen == Screen::FranchiseList &&
+					g_app.franchiseSort == AppState::FranchiseSort::Abilities)
+					CycleAbilityFilter(+1);
 				break;
-			// Keyboard equivalents of the one-press pad actions bound to
-			// X / RB / LB on a controller.
+			// M mirrors the controller's X everywhere: quick move on the pad
+			// viewer, and organize on the Favorites roster / world grid.
 			case 'M':
 				if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
 					BeginMoveFromSelectedPad();
+				else if (g_app.screen == Screen::RosterList &&
+					g_app.virtualTile == VirtualTile::Favorites && !g_app.reorganizingRoster)
+					BeginRosterReorganize();
+				else if (g_app.screen == Screen::FranchiseList &&
+					g_app.virtualTile == VirtualTile::None && !g_app.reorganizingFranchise)
+					BeginFranchiseReorganize();
 				break;
 			case 'L':
 				if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
@@ -11451,6 +11572,10 @@ if (changed)
 				if (g_app.screen == Screen::PadViewer)
 					ToggleLedDemo();
 				break;
+			// Z is the keyboard's hold-to-peek abilities button (controller RT).
+			case 'Z':
+				g_keyboardAbilitiesPeekHeld = true;
+				break;
 			// Keyboard equivalents of the LB/RB sort cycling on the franchise
 			// grid / browse rosters.
 			case VK_OEM_4: // '[' - previous sort
@@ -11463,6 +11588,13 @@ if (changed)
 				break;
 			}
 			InvalidateRect(window, nullptr, FALSE);
+			return 0;
+		case WM_KEYUP:
+			if (wParam == 'Z')
+			{
+				g_keyboardAbilitiesPeekHeld = false;
+				InvalidateRect(window, nullptr, FALSE);
+			}
 			return 0;
 		case WM_CHAR:
 			return DefWindowProcW(window, message, wParam, lParam);
