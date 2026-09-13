@@ -2456,9 +2456,21 @@ void UpdateInputOwnership(HWND window);
 		Gdiplus::Bitmap* logo = GetAssetBitmap(logoResourceId);
 		if (logo)
 		{
-			// Contain-fit the logo across most of the tile.
+			// Contain-fit the logo across most of the tile. Two world logos
+			// read as undersized at the default fit and get a slightly larger
+			// box, still centred on the tile: Ghostbusters' near-square mark is
+			// height-bound against the wide tile, and Scooby-Doo's art carries
+			// transparent padding the contain-fit counts as usable pixels.
 			constexpr float logoAreaH = 84.0f;
-			const Gdiplus::RectF box(margin + 8.0f, margin + 8.0f, tileW - 16.0f, logoAreaH);
+			const float grow =
+				(logoResourceId == WORLD_GHOSTBUSTERS_LOGO || logoResourceId == WORLD_SCOOBY_DOO_LOGO)
+				? 1.15f : 1.0f;
+			const float boxW = (tileW - 16.0f) * grow;
+			const float boxH = logoAreaH * grow;
+			const Gdiplus::RectF box(
+				(margin + 8.0f) - (boxW - (tileW - 16.0f)) / 2.0f,
+				(margin + 8.0f) - (boxH - logoAreaH) / 2.0f,
+				boxW, boxH);
 			const float scale = std::min(box.Width / logo->GetWidth(), box.Height / logo->GetHeight());
 			const float drawW = logo->GetWidth() * scale;
 			const float drawH = logo->GetHeight() * scale;
