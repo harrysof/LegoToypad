@@ -319,6 +319,14 @@ constexpr int kOverlayWidth = 900;
 		int count = 0;      // Flash/Fade: cycle count, 0 = repeat until next command
 		int speedTicks = 0; // Fade: ticks per fade step
 		DWORD cycleStart = 0;
+		// The region's resting colour, i.e. the last solid/faded-to colour
+		// before any flash. The real toypad is momentary on Flash: when a
+		// finite flash's cycles run out it returns to whatever the pad was
+		// showing, not to black. The wire's Flash command carries no "from"
+		// colour, so the base has to be remembered here (the emulator stores
+		// the finished Flash command verbatim, so it can't tell us either).
+		bool hasBase = false;
+		uint8_t baseR = 0, baseG = 0, baseB = 0;
 		float intensity = 0.0f; // 0..1 overall alpha, computed by the animation tick
 		// The colour actually drawn this frame. Equals r/g/b for every mode
 		// except Fade, where the real toypad alternates between fromR/G/B and
@@ -6686,6 +6694,14 @@ void UpdateInputOwnership(HWND window);
 		if (region < 0)
 			return;
 		LedRegion& led = g_app.ledRegions[static_cast<size_t>(region)];
+		// A flash is transient: remember what the pad was resting on so the
+		// region can return to it once the flash's cycles run out. Solid and
+		// Fade are resting states, so they move the base to their colour.
+		if (mode != LedMode::Flash)
+		{
+			led.hasBase = true;
+			led.baseR = r; led.baseG = g; led.baseB = b;
+		}
 		led.mode = mode;
 		led.r = r; led.g = g; led.b = b;
 		// Stored verbatim, never second-guessed: only ComputeLedFrame's Fade
@@ -6748,8 +6764,21 @@ void UpdateInputOwnership(HWND window);
 			}
 			if (led.count > 0 && elapsed >= period * led.count)
 			{
-				led.mode = LedMode::Off;
-				led.intensity = 0.0f;
+				// Cycles exhausted: the real toypad returns to the colour it
+				// was resting on before the flash, not to black. Fall back to
+				// Off only when nothing preceded the flash.
+				if (led.hasBase)
+				{
+					led.mode = LedMode::Solid;
+					led.r = led.baseR; led.g = led.baseG; led.b = led.baseB;
+					led.curR = led.r; led.curG = led.g; led.curB = led.b;
+					led.intensity = 1.0f;
+				}
+				else
+				{
+					led.mode = LedMode::Off;
+					led.intensity = 0.0f;
+				}
 				return;
 			}
 			const DWORD phase = static_cast<DWORD>(elapsed) % static_cast<DWORD>(period);
@@ -6797,6 +6826,8 @@ void UpdateInputOwnership(HWND window);
 			// when the count was even and the settled colour is fromR/G/B.
 			led.r = led.curR; led.g = led.curG; led.b = led.curB;
 			led.mode = LedMode::Solid;
+			led.hasBase = true;
+			led.baseR = led.r; led.baseG = led.g; led.baseB = led.b;
 		}
 	}
 
@@ -7225,6 +7256,7 @@ void UpdateInputOwnership(HWND window);
 			{
 				led.mode = LedMode::Off;
 				led.intensity = 0.0f;
+				led.hasBase = false;
 			}
 		}
 		if (g_mainWindow)
