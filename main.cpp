@@ -1028,6 +1028,16 @@ bool swapConfirmBackButtons = false;
 	// the listener serves one connection at a time, so only one is ever open.
 	std::mutex g_socketMutex;
 
+	// Raised for the whole of a user-initiated LOAD/REMOVE/MOVE. The LED poll
+	// checks it before and after taking g_socketMutex, so a command the player
+	// just issued is never queued behind the mirror's connect/recv - the game
+	// sees the pad change on the first try instead of only after a retry.
+	std::atomic<bool> g_userToypadCommandPending{false};
+	// GetTickCount() of the last user command that completed. The poll stays
+	// off the wire for kLedPollQuietAfterUserCommandMs afterwards, so the game
+	// has an uninterrupted window to register the new pad state.
+	std::atomic<DWORD> g_lastUserToypadCommandTick{0};
+
 	// The library catalog is static once the app is running, so it is built a
 	// single time on the UI thread (it reads live background settings) and
 	// then served from cache to every browser tab.
@@ -4007,11 +4017,9 @@ void UpdateInputOwnership(HWND window);
 
 	// Shared connect-send-close for LOAD/REMOVE/MOVE. On failure, errorOut is
 	// set to a message suitable for g_app.status and false is returned.
-	bool SendToypadMessage(const uint8_t* data, size_t length, std::wstring& errorOut)
+	// Caller must already hold g_socketMutex.
+	bool SendToypadMessageLocked(const uint8_t* data, size_t length, std::wstring& errorOut)
 	{
-		// One listener connection at a time: the LED poll uses the same port, so
-		// hold the shared mutex for the whole connect/send/close transaction.
-		std::lock_guard lock(g_socketMutex);
 		SOCKET clientSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (clientSocket == INVALID_SOCKET)
 		{
@@ -4038,6 +4046,24 @@ void UpdateInputOwnership(HWND window);
 			return false;
 		}
 		return true;
+	}
+
+	// User-initiated path. The pending flag is raised *before* the mutex is
+	// taken and lowered only once the transaction is done, so the LED poll can
+	// stand down even while this call is still waiting for the lock - otherwise
+	// a poll already mid-recv would sit in front of the player's move and the
+	// game could miss the pad change until the move was retried.
+	bool SendToypadMessage(const uint8_t* data, size_t length, std::wstring& errorOut)
+	{
+		g_userToypadCommandPending.store(true, std::memory_order_release);
+		bool sent;
+		{
+			std::lock_guard lock(g_socketMutex);
+			sent = SendToypadMessageLocked(data, length, errorOut);
+		}
+		g_lastUserToypadCommandTick.store(GetTickCount(), std::memory_order_relaxed);
+		g_userToypadCommandPending.store(false, std::memory_order_release);
+		return sent;
 	}
 
 	std::wstring EntryDisplayName(const RosterEntry& entry)
@@ -6948,6 +6974,15 @@ void UpdateInputOwnership(HWND window);
 	constexpr uint8_t kLedProtocolVersion = 2;
 	constexpr uint8_t kLedResponseSize = 4 + 3 * 12;
 	constexpr int kLedPollIntervalMs = 33;
+	// The poll must never pin g_socketMutex the way a user send may: loopback
+	// accepts in well under a millisecond, so a stalled/dead listener is simply
+	// treated as "no snapshot this cycle" after a fraction of a frame rather
+	// than holding up the next LOAD/MOVE behind a 250ms wait.
+	constexpr int kLedPollConnectTimeoutMs = 60;
+	constexpr int kLedPollRecvTimeoutMs = 60;
+	// How long the poll keeps off the wire after a user LOAD/REMOVE/MOVE, giving
+	// the emulator and game an undisturbed window to register the pad change.
+	constexpr int kLedPollQuietAfterUserCommandMs = 250;
 
 	std::atomic<bool> g_ledPollRunning{false};
 	std::thread g_ledPollThread;
@@ -7032,83 +7067,99 @@ void UpdateInputOwnership(HWND window);
 			InvalidateRect(g_mainWindow, nullptr, FALSE);
 	}
 
+	// One GET_LED round trip. Caller must hold g_socketMutex; this never blocks
+	// longer than kLedPollConnectTimeoutMs + kLedPollRecvTimeoutMs, so a user
+	// send waiting on the same mutex is never parked behind a dead listener.
+	void PollLedSnapshotOnce(HWND window)
+	{
+		const SOCKET clientSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (clientSocket == INVALID_SOCKET)
+			return;
+
+		DWORD recvTimeout = kLedPollRecvTimeoutMs;
+		setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO,
+			reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
+
+		sockaddr_in address{};
+		address.sin_family = AF_INET;
+		address.sin_port = htons(g_app.port);
+		address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (!ConnectWithTimeout(clientSocket, address, kLedPollConnectTimeoutMs))
+		{
+			closesocket(clientSocket);
+			return;
+		}
+
+		const uint8_t request[kLedPollHeaderSize] = {kGetLedCommand, 0, 0, 0, 0};
+		bool ok = SendAll(clientSocket, request, sizeof(request));
+		std::array<uint8_t, kLedResponseSize> response{};
+		if (ok)
+		{
+			size_t received = 0;
+			while (received < response.size())
+			{
+				const int got = recv(clientSocket,
+					reinterpret_cast<char*>(response.data() + received),
+					static_cast<int>(response.size() - received), 0);
+				if (got == SOCKET_ERROR || got == 0)
+				{
+					ok = false;
+					break;
+				}
+				received += static_cast<size_t>(got);
+			}
+		}
+		closesocket(clientSocket);
+		// The version byte guards against a stale build on either end
+		// silently misreading a different-sized snapshot (v1 was 30
+		// bytes with no fromR/G/B; see TOYPAD_LED_PROTOCOL.md).
+		if (ok && response[0] == 0x4C && response[2] == kLedProtocolVersion && response[3] == 0x03)
+		{
+			LedPollFrame* frame = new LedPollFrame();
+			frame->serial = response[1];
+			for (size_t i = 0; i < 3; ++i)
+			{
+				const size_t off = 4 + i * 12;
+				frame->pad[i] = response[off + 0];
+				frame->mode[i] = response[off + 1];
+				frame->r[i] = response[off + 2];
+				frame->g[i] = response[off + 3];
+				frame->b[i] = response[off + 4];
+				frame->fromR[i] = response[off + 5];
+				frame->fromG[i] = response[off + 6];
+				frame->fromB[i] = response[off + 7];
+				frame->onTicks[i] = response[off + 8];
+				frame->offTicks[i] = response[off + 9];
+				frame->count[i] = response[off + 10];
+				frame->speedTicks[i] = response[off + 11];
+			}
+			if (!PostMessageW(window, kLedMessage, reinterpret_cast<WPARAM>(frame), 0))
+				delete frame;
+		}
+	}
+
 	void LedPollThread(HWND window)
 	{
 		while (g_ledPollRunning)
 		{
+			// Yield to the player: skip this cycle outright while a LOAD/MOVE/
+			// CLEAR is in flight, and for a short grace window after the last
+			// one landed, so the game registers the new pad state without the
+			// mirror's traffic in the way.
+			if (g_userToypadCommandPending.load(std::memory_order_acquire) ||
+				GetTickCount() - g_lastUserToypadCommandTick.load(std::memory_order_relaxed) <
+					static_cast<DWORD>(kLedPollQuietAfterUserCommandMs))
+			{
+				Sleep(kLedPollIntervalMs);
+				continue;
+			}
 			{
 				std::lock_guard lock(g_socketMutex);
-				const SOCKET clientSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-				if (clientSocket != INVALID_SOCKET)
-				{
-					// A dead listener must never pin the shared mutex for long.
-					DWORD recvTimeout = 250;
-					setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO,
-						reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
-
-					sockaddr_in address{};
-					address.sin_family = AF_INET;
-					address.sin_port = htons(g_app.port);
-					address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-					// This runs on its own thread, so a slow connect() can't
-					// freeze the window the way it could on the UI-thread
-					// callers - but it would still hold g_socketMutex for
-					// however long it took, starving every Load/Move/Clear
-					// and custom-tag request behind it. Same bounded wait.
-					if (!ConnectWithTimeout(clientSocket, address, kSocketConnectTimeoutMs))
-					{
-						closesocket(clientSocket);
-					}
-					else
-					{
-						const uint8_t request[kLedPollHeaderSize] = {kGetLedCommand, 0, 0, 0, 0};
-						bool ok = SendAll(clientSocket, request, sizeof(request));
-						std::array<uint8_t, kLedResponseSize> response{};
-						if (ok)
-						{
-							size_t received = 0;
-							while (received < response.size())
-							{
-								const int got = recv(clientSocket,
-									reinterpret_cast<char*>(response.data() + received),
-									static_cast<int>(response.size() - received), 0);
-								if (got == SOCKET_ERROR || got == 0)
-								{
-									ok = false;
-									break;
-								}
-								received += static_cast<size_t>(got);
-							}
-						}
-						closesocket(clientSocket);
-						// The version byte guards against a stale build on either end
-						// silently misreading a different-sized snapshot (v1 was 30
-						// bytes with no fromR/G/B; see TOYPAD_LED_PROTOCOL.md).
-						if (ok && response[0] == 0x4C && response[2] == kLedProtocolVersion && response[3] == 0x03)
-						{
-							LedPollFrame* frame = new LedPollFrame();
-							frame->serial = response[1];
-							for (size_t i = 0; i < 3; ++i)
-							{
-								const size_t off = 4 + i * 12;
-								frame->pad[i] = response[off + 0];
-								frame->mode[i] = response[off + 1];
-								frame->r[i] = response[off + 2];
-								frame->g[i] = response[off + 3];
-								frame->b[i] = response[off + 4];
-								frame->fromR[i] = response[off + 5];
-								frame->fromG[i] = response[off + 6];
-								frame->fromB[i] = response[off + 7];
-								frame->onTicks[i] = response[off + 8];
-								frame->offTicks[i] = response[off + 9];
-								frame->count[i] = response[off + 10];
-								frame->speedTicks[i] = response[off + 11];
-							}
-							if (!PostMessageW(window, kLedMessage, reinterpret_cast<WPARAM>(frame), 0))
-								delete frame;
-						}
-					}
-				}
+				// Re-check once the lock is held: a command may have been raised
+				// while this thread was waiting its turn. If so, give up this
+				// cycle rather than keep the listener occupied.
+				if (!g_userToypadCommandPending.load(std::memory_order_acquire))
+					PollLedSnapshotOnce(window);
 			}
 			if (!g_ledPollRunning)
 				break;
