@@ -18,7 +18,7 @@ LegoToypad needs an emulator build with the Toypad listener enabled. Grab the on
 |---|---|
 | Cemu | [Cemu-2.6-Remote-Toypad-Build](https://github.com/harrysof/Cemu-2.6-Remote-Toypad-Build) |
 | RPCS3 | [RPCS3-Seamless-Toypad-Build](https://github.com/NeverCookFirst/RPCS3-Seamless-Toypad-Build) |
-| shadPS4 | [[shadPS4-Seamless-Toypad-Build](https://github.com/NeverCookFirst/shadPS4-Seamless-Toypad-Bridge](https://github.com/harrysof/shadPS4)) |
+| shadPS4 | [shadPS4-Seamless-Toypad-Build](https://github.com/NeverCookFirst/shadPS4-Seamless-Toypad-Bridge](https://github.com/harrysof/shadPS4)) |
 | Xenia | [Xenia-Seamless-Toypad-Build](https://github.com/NeverCookFirst/Xenia-Seamless-Toypad-Build) |
 
 ## Features
