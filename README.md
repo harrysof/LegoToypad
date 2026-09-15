@@ -14,12 +14,12 @@ Thanks to the [LEGO Dimensions Discord](https://discord.gg/PuXpBMFE4P) for suppo
 
 <table>
   <tr>
-    <td><img width="440" alt="explorer_1PImBeH5jK" src="https://github.com/user-attachments/assets/4c12c0a8-1eb2-4416-8aa1-3b931bb30b5a" /></td>
-    <td><img width="440" alt="explorer_q8HPIB8Sh4" src="https://github.com/user-attachments/assets/76867655-d336-4899-9e40-8b32a8d92f9e" /></td>
+    <td><img width="440" alt="main_pad" src="https://github.com/user-attachments/assets/ab24dfdc-ec6c-428e-bd61-95625719eb67" /></td>
+    <td><img width="440" alt="abilities" src="https://github.com/user-attachments/assets/5451728c-1d5c-4313-a1fd-28782a211d63" /></td>
   </tr>
   <tr>
-    <td><img width="440" alt="explorer_OqUuwURU34" src="https://github.com/user-attachments/assets/5451728c-1d5c-4313-a1fd-28782a211d63" /></td>
-    <td><img width="440" alt="explorer_aPQYDY9Xuk" src="https://github.com/user-attachments/assets/ab24dfdc-ec6c-428e-bd61-95625719eb67" /></td>
+    <td><img width="440" alt="franchises" src="https://github.com/user-attachments/assets/76867655-d336-4899-9e40-8b32a8d92f9e" /></td>
+    <td><img width="440" alt="settings" src="https://github.com/user-attachments/assets/4c12c0a8-1eb2-4416-8aa1-3b931bb30b5a" /></td>
   </tr>
 </table>
 
