@@ -1682,6 +1682,59 @@ void UpdateInputOwnership(HWND window);
 		}
 	}
 
+	// Custom tag display order, persisted like the favorites order but keyed
+	// by name. The Special\ scan produces a fixed folder-name order; the user
+	// can reorganize it from the Custom roster (see ReorderCustom).
+	void SaveCustomOrderToIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		WritePrivateProfileStringW(L"CustomOrder", nullptr, nullptr, iniPath.c_str());
+		WritePrivateProfileStringW(L"CustomOrder", L"Count",
+			std::to_wstring(g_customEntries.size()).c_str(), iniPath.c_str());
+		for (size_t i = 0; i < g_customEntries.size(); ++i)
+		{
+			const std::wstring key = L"Item" + std::to_wstring(i);
+			WritePrivateProfileStringW(L"CustomOrder", key.c_str(),
+				g_customEntries[i].name.c_str(), iniPath.c_str());
+		}
+	}
+
+	void ApplyCustomOrderFromIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		const int count = static_cast<int>(
+			GetPrivateProfileIntW(L"CustomOrder", L"Count", 0, iniPath.c_str()));
+		if (count <= 0)
+			return;
+		std::vector<RosterEntry> ordered;
+		ordered.reserve(g_customEntries.size());
+		std::vector<bool> used(g_customEntries.size(), false);
+		std::array<wchar_t, 512> buffer{};
+		for (int i = 0; i < count; ++i)
+		{
+			const std::wstring key = L"Item" + std::to_wstring(i);
+			GetPrivateProfileStringW(L"CustomOrder", key.c_str(), L"", buffer.data(),
+				static_cast<DWORD>(buffer.size()), iniPath.c_str());
+			const std::wstring name = buffer.data();
+			if (name.empty())
+				continue;
+			for (size_t j = 0; j < g_customEntries.size(); ++j)
+			{
+				if (used[j] || g_customEntries[j].name != name)
+					continue;
+				used[j] = true;
+				ordered.push_back(std::move(g_customEntries[j]));
+				break;
+			}
+		}
+		// Anything not named in the ini (a fresh tag, or an edited order) is
+		// appended in the scan's own order.
+		for (size_t j = 0; j < g_customEntries.size(); ++j)
+			if (!used[j])
+				ordered.push_back(std::move(g_customEntries[j]));
+		g_customEntries = std::move(ordered);
+	}
+
 	// ---------------------------------------------------------------------
 	// Glossy / glowing shape renderers (each runs ONCE per cached state)
 	// ---------------------------------------------------------------------
@@ -5410,8 +5463,25 @@ void UpdateInputOwnership(HWND window);
 		}
 	}
 
+	// Sentinel "franchise" name under which Special\ custom tags are
+	// favorited. No real franchise uses it (the catalog's own Special world
+	// folder is empty), so it can't collide.
+	constexpr wchar_t kCustomFranchiseName[] = L"Special";
+
+	const RosterEntry* FindCustomEntry(const wchar_t* name)
+	{
+		for (const auto& entry : g_customEntries)
+		{
+			if (entry.name == name)
+				return &entry;
+		}
+		return nullptr;
+	}
+
 	const RosterEntry* FindCharacterEntry(const wchar_t* franchiseName, const wchar_t* characterName)
 	{
+		if (std::wcscmp(franchiseName, kCustomFranchiseName) == 0)
+			return FindCustomEntry(characterName);
 		for (size_t i = 0; i < kFranchiseCount; ++i)
 		{
 			if (kFranchises[i].name != franchiseName)
@@ -5630,6 +5700,16 @@ void UpdateInputOwnership(HWND window);
 					franchiseOut = kFranchises[i].name;
 					return true;
 				}
+			}
+		}
+		// Special\ custom tags aren't in kFranchises; they favorite under the
+		// sentinel name so the Favorites roster can resolve them back.
+		for (const auto& custom : g_customEntries)
+		{
+			if (&custom == entry)
+			{
+				franchiseOut = kCustomFranchiseName;
+				return true;
 			}
 		}
 		return false;
@@ -5851,12 +5931,29 @@ void UpdateInputOwnership(HWND window);
 		SaveFavoritesToIni();
 	}
 
+	// Same reorder for the Custom (Special\) roster: its display order is
+	// just g_customEntries' order, so move the element and rebuild. The
+	// negative bin/portrait ids travel with the entry, so the id -> file
+	// mapping (indexed by id, not position) stays correct.
+	void ReorderCustom(size_t from, size_t to)
+	{
+		if (from == to || from >= g_customEntries.size() || to >= g_customEntries.size())
+			return;
+		RosterEntry moved = std::move(g_customEntries[from]);
+		g_customEntries.erase(g_customEntries.begin() + from);
+		g_customEntries.insert(g_customEntries.begin() + to, std::move(moved));
+		OpenCustomRoster();
+		SaveCustomOrderToIni();
+	}
+
 	// Picks up whatever roster tile is focused so the next navigation +
-	// Confirm drops it in a new spot. Only meaningful in the Favorites
-	// roster - a real franchise's roster order comes from the game data.
+	// Confirm drops it in a new spot. Meaningful in the Favorites roster and
+	// the Custom (Special\) roster - a real franchise's roster order comes
+	// from the game data.
 	void BeginRosterReorganize()
 	{
-		if (g_app.virtualTile != VirtualTile::Favorites || g_app.rosterIndex >= g_app.rosterSlots.size())
+		if ((g_app.virtualTile != VirtualTile::Favorites && g_app.virtualTile != VirtualTile::Custom) ||
+			g_app.rosterIndex >= g_app.rosterSlots.size())
 			return;
 		g_app.reorganizingRoster = true;
 		g_app.reorganizeRosterSourceIndex = g_app.rosterIndex;
@@ -5874,7 +5971,10 @@ void UpdateInputOwnership(HWND window);
 			return;
 		const RosterSlot& movedSlot = g_app.rosterSlots[from];
 		const std::wstring name = movedSlot.entry ? movedSlot.entry->name : L"item";
-		ReorderFavorite(from, to);
+		if (g_app.virtualTile == VirtualTile::Custom)
+			ReorderCustom(from, to);
+		else
+			ReorderFavorite(from, to);
 		// The moved item now sits at the drop target's old display slot.
 		g_app.rosterIndex = std::min(to, g_app.rosterSlots.empty() ? 0 : g_app.rosterSlots.size() - 1);
 		g_app.status = L"Moved: " + name;
@@ -8968,12 +9068,16 @@ void UpdateInputOwnership(HWND window);
 				if (visual)
 					g.DrawImage(visual, circleX - kPortraitMargin, circleY - kPortraitMargin);
 
-				// Favorited-star badge: only useful while browsing a real
-				// franchise's roster (every tile in the Favorites roster is
-				// trivially favorited already, so it's skipped there; Custom
-				// entries aren't favoritable at all - see BuildCustomTagList).
-				if (g_app.virtualTile == VirtualTile::None && slot.kind != RosterSlot::Kind::Plus && slot.entry &&
-					IsFavorited(kFranchises[g_app.franchiseIndex].name,
+				// Favorited-star badge: shown while browsing a real franchise
+				// or the Special\ custom roster. The Favorites roster itself
+				// is skipped (every tile there is already favorited).
+				const wchar_t* starFranchise = nullptr;
+				if (g_app.virtualTile == VirtualTile::None)
+					starFranchise = kFranchises[g_app.franchiseIndex].name.c_str();
+				else if (g_app.virtualTile == VirtualTile::Custom)
+					starFranchise = kCustomFranchiseName;
+				if (starFranchise && slot.kind != RosterSlot::Kind::Plus && slot.entry &&
+					IsFavorited(starFranchise,
 						slot.kind == RosterSlot::Kind::Vehicle && slot.group ? slot.group->baseName : slot.entry->name,
 						slot.kind == RosterSlot::Kind::Vehicle, slot.entry->buildNumber))
 				{
@@ -9955,11 +10059,10 @@ void UpdateInputOwnership(HWND window);
 			constexpr float kHintStackGap = 20.0f;
 			const float hintCenterY = height - kHintBottomInset - kHintButtonH / 2.0f;
 			float rightEdge = width - kTopMargin;
-			// Custom entries aren't favoritable (see BuildCustomTagList), so
-			// the hint would be misleading there.
-			if (g_app.virtualTile != VirtualTile::Custom)
-				rightEdge -= DrawButtonHint(g, g_app.buttonFavorite, L"Favorite", rightEdge, hintCenterY, kHintButtonH);
-			if (g_app.virtualTile == VirtualTile::Favorites)
+			// Custom (Special\) entries are favoritable too, so the hint is
+			// shown on their roster as well.
+			rightEdge -= DrawButtonHint(g, g_app.buttonFavorite, L"Favorite", rightEdge, hintCenterY, kHintButtonH);
+			if (g_app.virtualTile == VirtualTile::Favorites || g_app.virtualTile == VirtualTile::Custom)
 			{
 				rightEdge -= kHintStackGap;
 				rightEdge -= DrawButtonHint(g, g_app.buttonReorganizeRoster, L"Organize", rightEdge, hintCenterY, kHintButtonH);
@@ -10446,7 +10549,8 @@ void PollController(HWND window)
 		// the Favorites roster (a real franchise's roster order comes from
 		// the game data) and for real franchise tiles in the world grid.
 		if ((combinedPressed & g_app.buttonReorganizeRoster) && g_app.screen == Screen::RosterList &&
-			g_app.virtualTile == VirtualTile::Favorites && !g_app.reorganizingRoster)
+			(g_app.virtualTile == VirtualTile::Favorites || g_app.virtualTile == VirtualTile::Custom) &&
+			!g_app.reorganizingRoster)
 		{
 			BeginRosterReorganize();
 			changed = true;
@@ -11472,6 +11576,22 @@ if (changed)
 	bool ResolveFavoriteTargetFromBin(int binResourceId, std::wstring& franchiseOut, std::wstring& nameOut,
 		bool& isVehicleOut, int& buildNumberOut)
 	{
+		// Special\ custom tags carry negative ids and aren't in kFranchises;
+		// they favorite under the sentinel franchise name.
+		if (binResourceId < 0)
+		{
+			for (const auto& custom : g_customEntries)
+			{
+				if (custom.binResourceId == binResourceId)
+				{
+					franchiseOut = kCustomFranchiseName;
+					nameOut = custom.name;
+					isVehicleOut = false;
+					buildNumberOut = 0;
+					return true;
+				}
+			}
+		}
 		for (size_t franchiseIndex = 0; franchiseIndex < kFranchiseCount; ++franchiseIndex)
 		{
 			for (const auto& character : kFranchises[franchiseIndex].characters)
@@ -12065,7 +12185,8 @@ if (changed)
 				if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
 					BeginMoveFromSelectedPad();
 				else if (g_app.screen == Screen::RosterList &&
-					g_app.virtualTile == VirtualTile::Favorites && !g_app.reorganizingRoster)
+					(g_app.virtualTile == VirtualTile::Favorites || g_app.virtualTile == VirtualTile::Custom) &&
+					!g_app.reorganizingRoster)
 					BeginRosterReorganize();
 				else if (g_app.screen == Screen::FranchiseList &&
 					g_app.virtualTile == VirtualTile::None && !g_app.reorganizingFranchise)
@@ -12529,6 +12650,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	// g_customEntries) has to be right before the franchise grid first
 	// builds its display list.
 	BuildCustomTagList();
+	ApplyCustomOrderFromIni();
 	g_app.port = ReadPort();
 	LoadShortcutFromIni();
 	LoadInputSettingsFromIni();
