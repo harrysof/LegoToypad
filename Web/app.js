@@ -594,6 +594,12 @@ function makeWorldTile(world, idx) {
   tile.dataset.world = idx;
   const logo = document.createElement('img');
   logo.className = 'logo';
+  // A few logos are narrow/near-square and get height-bound (read small) at
+  // the shared logo height; give them a taller box, matching the desktop's
+  // RenderFranchiseTile special cases.
+  if (world.name === 'The Simpsons' || world.name === 'Ghostbusters' || world.name === 'Scooby-Doo!') {
+    logo.classList.add('logo-big');
+  }
   logo.src = world.logo;
   logo.alt = world.name;
   tile.appendChild(logo);

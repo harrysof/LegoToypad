@@ -2517,15 +2517,19 @@ void UpdateInputOwnership(HWND window);
 		Gdiplus::Bitmap* logo = GetAssetBitmap(logoResourceId);
 		if (logo)
 		{
-			// Contain-fit the logo across most of the tile. Two world logos
+			// Contain-fit the logo across most of the tile. A few world logos
 			// read as undersized at the default fit and get a slightly larger
 			// box, still centred on the tile: Ghostbusters' near-square mark is
-			// height-bound against the wide tile, and Scooby-Doo's art carries
-			// transparent padding the contain-fit counts as usable pixels.
+			// height-bound against the wide tile, Scooby-Doo's art carries
+			// transparent padding the contain-fit counts as usable pixels, and
+			// The Simpsons' tall narrow mark is height-bound the same way but
+			// more so.
 			constexpr float logoAreaH = 84.0f;
-			const float grow =
-				(logoResourceId == WORLD_GHOSTBUSTERS_LOGO || logoResourceId == WORLD_SCOOBY_DOO_LOGO)
-				? 1.15f : 1.0f;
+			float grow = 1.0f;
+			if (logoResourceId == WORLD_GHOSTBUSTERS_LOGO || logoResourceId == WORLD_SCOOBY_DOO_LOGO)
+				grow = 1.15f;
+			else if (logoResourceId == WORLD_THE_SIMPSONS_LOGO)
+				grow = 1.3f;
 			const float boxW = (tileW - 16.0f) * grow;
 			const float boxH = logoAreaH * grow;
 			const Gdiplus::RectF box(
@@ -11303,7 +11307,24 @@ if (changed)
 			if (!firstVeh)
 				out += ",";
 			firstVeh = false;
-			out += VehicleGroupJson(*group, fav.franchise);
+			// Emit only the build that was actually favorited, not the whole
+			// family - otherwise the web client shows build 1 for a favorite
+			// pinned to build 2 or 3. Matches the desktop's Favorites roster
+			// (see OpenFavoritesRoster), which shows the exact build too.
+			const RosterEntry* build = &group->builds.front();
+			if (fav.buildNumber != 0)
+			{
+				for (const auto& candidate : group->builds)
+				{
+					if (candidate.buildNumber == fav.buildNumber)
+					{
+						build = &candidate;
+						break;
+					}
+				}
+			}
+			out += "{\"base\":" + WJson(group->baseName) + ",\"franchise\":" + WJson(fav.franchise) +
+				",\"builds\":[" + EntryJson(*build, fav.franchise) + "]}";
 		}
 		out += "]}";
 		return out;

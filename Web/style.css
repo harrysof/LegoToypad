@@ -770,7 +770,9 @@ body {
 .ability .abpanel {
   position: relative;
   width: 100%;
-  aspect-ratio: 100 / 38;
+  /* Boxed rather than the old 100:38 letterbox, so the square ability icon
+     fills the tile instead of sitting in a thin strip (portrait especially). */
+  aspect-ratio: 1.2 / 1;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -896,6 +898,12 @@ body {
   object-fit: contain;
   filter: drop-shadow(0 4px 9px rgba(0, 0, 0, 0.6));
   pointer-events: none;
+}
+
+/* Narrow/near-square world logos that get height-bound and read small at the
+   shared height (The Simpsons, Ghostbusters, Scooby-Doo!). */
+.fworld img.logo.logo-big {
+  height: clamp(56px, 8.6vh, 80px);
 }
 
 .fworld.touched {
@@ -1380,5 +1388,59 @@ body {
   text-align: center;
   white-space: pre-line;
   text-shadow: 0 2px 6px rgba(0, 0, 0, 0.7);
+}
+
+/* Large landscape displays (TVs / tablets / wide windows) ----------------
+   Deliberately last in the file: the grid rules below have the same
+   specificity as the base #franchiseGrid / #rosterGrid rules, so they must
+   come after them to win. One calmer layout for every sorting page: 3 tiles
+   per line, taller art. Portrait layout is untouched. */
+@media (min-aspect-ratio: 1.05/1) and (min-width: 760px) {
+  /* Keep the browse area from spreading edge-to-edge, so 3 columns stay a
+     comfortable size rather than stretching to fill a wide screen. */
+  .grid-wrapper {
+    max-width: 900px;
+  }
+
+  /* Keep the Abilities filter chips aligned with the narrower grid. */
+  #abilityFilterBar {
+    max-width: 900px;
+  }
+
+  /* Worlds (Default / Year 1 / Year 2 / User), the Story & Favorites
+     rosters, and the franchise roster screen all share 3-per-line. */
+  #franchiseGrid,
+  #franchiseGrid.grid-roster,
+  #rosterGrid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  /* Abilities: still 3 per line, but fixed, smaller tiles (centred) so they
+     don't stretch to fill the whole row. */
+  #franchiseGrid.grid-ability {
+    grid-template-columns: repeat(3, minmax(0, 210px));
+    justify-content: center;
+    gap: clamp(14px, 2.2vh, 26px);
+  }
+
+  /* Ability panel was 100:38 - very wide and short. Taller, so the icon
+     fills it instead of sitting in a thin strip. */
+  .ability .abpanel {
+    aspect-ratio: 1.4 / 1;
+  }
+
+  .ability .abicon {
+    max-width: 76%;
+    max-height: 76%;
+  }
+
+  .ability .ablbl {
+    font-size: clamp(14px, 2.2vh, 18px);
+  }
+
+  .fig .ring {
+    width: clamp(100px, 13vh, 140px);
+    height: clamp(100px, 13vh, 140px);
+  }
 }
 
