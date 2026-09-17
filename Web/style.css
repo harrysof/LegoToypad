@@ -142,6 +142,55 @@ body {
   display: block;
 }
 
+#topRight {
+  display: flex;
+  align-items: center;
+  gap: clamp(8px, 2vw, 16px);
+  pointer-events: none;
+}
+
+/* Toypad LED mirror toggle (topbar). Reflects /api/state's ledMirror flag. */
+.ledToggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: linear-gradient(180deg, rgba(20, 31, 42, 0.86), rgba(8, 12, 18, 0.92));
+  color: var(--ink-dim);
+  font-family: inherit;
+  font-size: clamp(9px, 1.5vw, 11px);
+  font-weight: 820;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.ledToggle .ledDot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.22);
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.ledToggle.on {
+  color: var(--ink);
+  border-color: var(--cyan);
+  box-shadow: 0 0 14px rgba(96, 243, 223, 0.34);
+}
+
+.ledToggle.on .ledDot {
+  background: var(--cyan);
+  box-shadow: 0 0 10px var(--cyan);
+}
+
+.ledToggle:active {
+  transform: scale(0.94);
+}
+
 /* Screens ---------------------------------------------------------------- */
 .screen {
   position: relative;
@@ -405,6 +454,14 @@ body {
   box-shadow: 0 14px 26px rgba(0, 0, 0, 0.40), 0 0 20px rgba(96, 243, 223, 0.34);
 }
 
+/* Abilities button uses the wordmark-style Abilities logo, so let it run wide
+   instead of being boxed into the square icon slot the others use. */
+.actbtn.wide-icon img {
+  width: auto;
+  max-width: 92%;
+  height: clamp(16px, 2.8vh, 22px);
+}
+
 /* Status message under action bar --------------------------------------- */
 .status-message {
   width: 100%;
@@ -570,6 +627,186 @@ body {
   pointer-events: none;
 }
 
+/* Sort switcher (browse screen header, mirrors the desktop shoulder cycle) */
+.sort-header {
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 clamp(8px, 2.5vw, 22px);
+}
+
+.sortArrow {
+  flex-shrink: 0;
+  width: clamp(38px, 9vw, 52px);
+  height: clamp(38px, 9vw, 52px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  background: linear-gradient(180deg, rgba(20, 31, 42, 0.92), rgba(8, 12, 18, 0.95));
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.10);
+  color: var(--ink);
+  font-size: clamp(22px, 6vw, 30px);
+  line-height: 1;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 0.08s ease, box-shadow 0.14s ease, border-color 0.14s ease;
+}
+
+.sortArrow:active {
+  transform: scale(0.9);
+}
+
+#sortBadge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 62vw;
+  padding: 6px clamp(14px, 4vw, 26px);
+  border-radius: 999px;
+  border: 1px solid var(--sort-color, var(--blue));
+  background: linear-gradient(180deg, rgba(18, 27, 36, 0.90), rgba(9, 14, 20, 0.94));
+  box-shadow: 0 0 18px var(--sort-glow, rgba(73, 183, 255, 0.34)),
+    inset 0 1px 0 rgba(255, 255, 255, 0.10);
+}
+
+#sortLabel {
+  color: var(--ink);
+  font-size: clamp(13px, 3.4vw, 19px);
+  font-weight: 860;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Ability section filter chips (Abilities sort only) -------------------- */
+#abilityFilterBar {
+  display: none;
+  flex-shrink: 0;
+  gap: 6px;
+  width: 100%;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 clamp(12px, 3vw, 32px) 8px;
+  box-sizing: border-box;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+#abilityFilterBar.visible {
+  display: flex;
+}
+
+#abilityFilterBar::-webkit-scrollbar {
+  display: none;
+}
+
+.abfilter {
+  flex-shrink: 0;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(20, 31, 42, 0.82), rgba(8, 12, 18, 0.9));
+  color: var(--ink-soft);
+  font-size: clamp(11px, 2.6vw, 13px);
+  font-weight: 760;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.abfilter.active {
+  border-color: var(--cyan);
+  color: var(--ink);
+  box-shadow: 0 0 14px rgba(96, 243, 223, 0.30);
+}
+
+/* Browse grid variants --------------------------------------------------- */
+#franchiseGrid.grid-roster {
+  grid-template-columns: repeat(auto-fill, minmax(clamp(96px, 22vw, 130px), 1fr));
+  gap: clamp(12px, 2vw, 18px) clamp(8px, 1.5vw, 14px);
+}
+
+#franchiseGrid.grid-ability {
+  grid-template-columns: repeat(auto-fill, minmax(clamp(120px, 26vw, 190px), 1fr));
+  gap: clamp(10px, 1.8vw, 18px);
+}
+
+/* Ability tile (mirrors the desktop RenderAbilityTile) ------------------- */
+.ability {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  transition: transform 0.08s ease;
+}
+
+.ability:active {
+  transform: scale(0.96);
+}
+
+.ability .abpanel {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 100 / 38;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 12px;
+  background-size: cover;
+  background-position: center;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.10);
+}
+
+.ability .abpanel::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.18), rgba(0, 0, 0, 0.42));
+}
+
+.ability .abicon {
+  position: relative;
+  z-index: 1;
+  max-width: 78%;
+  max-height: 78%;
+  object-fit: contain;
+  filter: drop-shadow(0 3px 7px rgba(0, 0, 0, 0.6));
+  pointer-events: none;
+}
+
+.ability .abletter {
+  position: relative;
+  z-index: 1;
+  color: var(--fig-color, var(--cyan));
+  font-size: clamp(28px, 6vw, 40px);
+  font-weight: 850;
+}
+
+.ability .ablbl {
+  width: 100%;
+  color: var(--ink-soft);
+  font-size: clamp(11px, 1.6vw, 13px);
+  font-weight: 700;
+  text-align: center;
+  line-height: 1.18;
+  overflow: hidden;
+}
+
+.ability.touched .abpanel {
+  border-color: var(--red);
+  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.32), 0 0 20px rgba(255, 91, 88, 0.5);
+}
+
 #worldLogo,
 #plusWorldLogo {
   height: clamp(38px, 6.5vh, 56px);
@@ -650,6 +887,25 @@ body {
   box-shadow: 0 12px 24px rgba(0, 0, 0, 0.36), 0 0 22px rgba(255, 91, 88, 0.45);
 }
 
+/* Desktop-selection mirror: the tile the desktop's cursor is on (see
+   /api/selection) gets the same cyan focus ring the web uses for a drop
+   target, so both screens read the same cursor. */
+.fworld.sel {
+  border-color: var(--cyan);
+  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.34), 0 0 0 2px var(--cyan), 0 0 24px rgba(96, 243, 223, 0.55);
+}
+
+.fig.sel .ring.bordered img,
+.fig.sel .ring.bordered .letter {
+  border-color: var(--cyan) !important;
+  box-shadow: 0 0 0 4px rgba(0, 0, 0, 0.30), 0 0 22px rgba(96, 243, 223, 0.66) !important;
+}
+
+.ability.sel .abpanel {
+  border-color: var(--cyan);
+  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.32), 0 0 0 2px var(--cyan), 0 0 22px rgba(96, 243, 223, 0.5);
+}
+
 #rosterGrid {
   width: 100%;
   height: 100%;
@@ -667,6 +923,15 @@ body {
   height: 1px;
   margin: 6px 2px;
   background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.22), transparent);
+}
+
+.gridnote {
+  grid-column: 1 / -1;
+  padding: 24px 8px;
+  color: var(--ink-dim);
+  font-size: clamp(12px, 2vw, 14px);
+  font-weight: 680;
+  text-align: center;
 }
 
 .fig {
@@ -916,6 +1181,125 @@ body {
 
 .scrollbar.visible {
   display: block;
+}
+
+/* Abilities popup (main pad screen) -------------------------------------- */
+/* Opened by the ABILITIES action button for whatever figure is loaded on the
+   selected pad. Icons mirror the desktop's abilities peek (DrawAbilitiesPeekPanel). */
+.abilitiesOverlay {
+  position: absolute;
+  inset: 0;
+  z-index: 80;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(3, 6, 10, 0.72);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+
+.abilitiesOverlay.show {
+  display: flex;
+}
+
+.abilitiesCard {
+  position: relative;
+  width: min(94vw, 640px);
+  max-height: min(80vh, 640px);
+  display: flex;
+  flex-direction: column;
+  border-radius: 18px;
+  border: 1px solid rgba(168, 120, 255, 0.6);
+  background: linear-gradient(180deg, rgba(18, 16, 30, 0.97), rgba(8, 9, 16, 0.98));
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6), 0 0 34px rgba(168, 120, 255, 0.32),
+    inset 0 1px 0 rgba(255, 255, 255, 0.10);
+  overflow: hidden;
+}
+
+.abilitiesHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+#abilitiesName {
+  color: var(--ink);
+  font-size: clamp(14px, 2.6vw, 18px);
+  font-weight: 860;
+  letter-spacing: 0.04em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.abilitiesClose {
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--ink);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.abilitiesClose:active {
+  transform: scale(0.92);
+}
+
+.abilitiesList {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(clamp(84px, 20vw, 108px), 1fr));
+  gap: clamp(10px, 2vw, 18px);
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.abilityItem {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.abilityItem img {
+  width: clamp(56px, 14vw, 76px);
+  height: clamp(56px, 14vw, 76px);
+  object-fit: contain;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.6));
+}
+
+.abilityItem .abilityPh {
+  width: clamp(56px, 14vw, 76px);
+  height: clamp(56px, 14vw, 76px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 2px solid var(--fig-color, #A878FF);
+  background: linear-gradient(180deg, rgba(23, 34, 44, 0.94), rgba(7, 11, 16, 0.96));
+  color: var(--fig-color, #A878FF);
+  font-size: clamp(24px, 6vw, 34px);
+  font-weight: 850;
+}
+
+.abilityItem .abilityItemLbl {
+  width: 100%;
+  color: var(--ink-soft);
+  font-size: clamp(10px, 1.5vw, 12px);
+  font-weight: 700;
+  text-align: center;
+  line-height: 1.16;
 }
 
 /* Loading splash ---------------------------------------------------------- */

@@ -1018,7 +1018,7 @@ bool swapConfirmBackButtons = false;
 
 	struct WebJob
 	{
-		enum class Op { State, Leds, Catalog, Load, Move, Clear, ClearAll, FavoritesGet, FavoriteToggle } op = Op::State;
+		enum class Op { State, Leds, Catalog, Load, Move, Clear, ClearAll, FavoritesGet, FavoriteToggle, SortGet, SortSet, SelectionGet, SelectionSet, LedMirrorSet } op = Op::State;
 		int a = 0; // slot index for Load/Clear; source slot for Move
 		int b = 0; // bin resource id for Load and FavoriteToggle; destination slot for Move
 		std::string result; // JSON response body, written on the UI thread
@@ -4667,6 +4667,20 @@ void UpdateInputOwnership(HWND window);
 				idx = i;
 		idx = (idx + direction + count) % count;
 		g_app.franchiseSort = *(modes.begin() + idx);
+		SaveInputSettingsToIni();
+		OpenBrowseScreen();
+		g_app.status = L"Sort: " + DescribeFranchiseSort();
+	}
+
+	// Jumps straight to a specific sort - the web remote's header arrows. It
+	// does exactly what CycleFranchiseSort does for the shoulder buttons
+	// (persist the choice, rebuild the desktop's browse screen), so the phone
+	// and the overlay always agree on which sort is active.
+	void SetFranchiseSort(AppState::FranchiseSort mode)
+	{
+		if (g_app.franchiseSort == mode)
+			return;
+		g_app.franchiseSort = mode;
 		SaveInputSettingsToIni();
 		OpenBrowseScreen();
 		g_app.status = L"Sort: " + DescribeFranchiseSort();
@@ -10911,6 +10925,14 @@ if (changed)
 		out += "\"build\":" + std::to_string(entry.buildNumber) + ",";
 		out += "\"color\":\"" + std::string(hex) + "\",";
 		out += "\"portrait\":\"" + IdUrl(entry.portraitResourceId) + "\",";
+		out += "\"abilities\":[";
+		for (size_t a = 0; a < entry.abilityIndices.size(); ++a)
+		{
+			if (a != 0)
+				out += ",";
+			out += std::to_string(entry.abilityIndices[a]);
+		}
+		out += "],";
 		out += "\"bin\":" + std::to_string(entry.binResourceId);
 		out += "}";
 		return out;
@@ -10929,9 +10951,90 @@ if (changed)
 		return out;
 	}
 
+	// The seven franchise sorts, in the order the desktop's shoulder buttons
+	// (CycleFranchiseSort) and the web remote's header arrows cycle them. The
+	// colour matches the halo DrawSortBadge paints around each badge, so the
+	// phone's sort pill reads the same as the desktop's. Favorites has no
+	// badge art of its own (its roster shows the custom_bin icon), so it
+	// borrows that icon and gets an amber tint.
+	struct WebSortInfo
+	{
+		AppState::FranchiseSort sort;
+		const wchar_t* label;
+		int iconResourceId;
+		unsigned int color;
+	};
+	const WebSortInfo kWebSorts[] = {
+		{AppState::FranchiseSort::Default,   L"Default",   kSortDefaultResourceId,   RGB(240, 244, 250)},
+		{AppState::FranchiseSort::Year1,     L"Year 1",    kSortYear1ResourceId,     RGB(126, 217, 87)},
+		{AppState::FranchiseSort::Year2,     L"Year 2",    kSortYear2ResourceId,     RGB(255, 158, 74)},
+		{AppState::FranchiseSort::Abilities, L"Abilities", kSortAbilitiesResourceId, RGB(168, 120, 255)},
+		{AppState::FranchiseSort::User,      L"User",      kSortUserResourceId,      RGB(255, 64, 64)},
+		{AppState::FranchiseSort::Favorites, L"Favorites", kCustomBinIconResourceId, RGB(247, 184, 76)},
+		{AppState::FranchiseSort::Story,     L"Story",     kSortStarterResourceId,   RGB(66, 157, 255)},
+	};
+	constexpr size_t kWebSortCount = sizeof(kWebSorts) / sizeof(kWebSorts[0]);
+
+	// The Starter Pack roster the Story sort opens on the desktop (see
+	// OpenStoryRoster): the three starter minifigs plus the Batmobile, shaped
+	// like a normal franchise {name, logo, characters, vehicles} so the web
+	// client can render it through the exact same roster-grid code path.
+	std::string BuildStoryJson()
+	{
+		std::string out = "{\"name\":" + WJson(L"Starter Pack") + ",";
+		out += "\"logo\":\"" + IdUrl(kSortStarterResourceId) + "\",";
+		out += "\"characters\":[";
+		constexpr struct { const wchar_t* franchise; const wchar_t* name; } kStoryCharacters[] = {
+			{L"DC Comics", L"Batman"},
+			{L"The Lord of the Rings", L"Gandalf"},
+			{L"The LEGO Movie", L"Wyldstyle"},
+		};
+		bool firstChar = true;
+		for (const auto& character : kStoryCharacters)
+		{
+			const RosterEntry* entry = FindCharacterEntry(character.franchise, character.name);
+			if (!entry)
+				continue;
+			if (!firstChar)
+				out += ",";
+			firstChar = false;
+			out += EntryJson(*entry, character.franchise);
+		}
+		out += "],\"vehicles\":[";
+		if (const VehicleGroup* batmobile = FindVehicleGroupEntry(L"DC Comics", L"Batmobile"))
+		{
+			if (!batmobile->builds.empty())
+				out += VehicleGroupJson(*batmobile, L"DC Comics");
+		}
+		out += "]}";
+		return out;
+	}
+
+	// The Special\ folder's user-supplied custom tags (see
+	// BuildCustomTagList), shaped like a normal franchise {name, logo,
+	// characters, vehicles} so the web client renders it through the same
+	// roster path. Characters only, so vehicles is always empty. Scanned once
+	// at startup, so it is safe to bake into the cached catalog.
+	std::string BuildCustomJson()
+	{
+		std::string out = "{\"name\":" + WJson(L"Special") + ",";
+		out += "\"logo\":\"" + IdUrl(kCustomTileResourceId != 0 ? kCustomTileResourceId : kCustomBinIconResourceId) + "\",";
+		out += "\"characters\":[";
+		for (size_t i = 0; i < g_customEntries.size(); ++i)
+		{
+			if (i != 0)
+				out += ",";
+			out += EntryJson(g_customEntries[i], L"Special");
+		}
+		out += "],\"vehicles\":[]}";
+		return out;
+	}
+
 	// The full static library description: every franchise, character and
 	// vehicle with the asset URLs and bin ids the phone UI needs to render
 	// and to request loads. Only reads const data, safe on any thread.
+	// Also carries the sort metadata (year waves, ability list, starter
+	// roster, sort badges) the web remote's sorting pages need.
 	std::string BuildCatalogJson()
 	{
 		std::string out = "{";
@@ -10954,6 +11057,58 @@ if (changed)
 		// Logo for the client-built Favorites tile at the front of the Pick-
 		// a-World grid; same custom_bin.png icon the desktop overlay uses.
 		out += "\"favoritesIcon\":\"" + IdUrl(kCustomBinIconResourceId) + "\",";
+		out += "\"customTile\":\"" + IdUrl(kCustomTileResourceId != 0 ? kCustomTileResourceId : kCustomBinIconResourceId) + "\",";
+		// Abilities panel art (Abilities.png) used by the web ability tiles;
+		// falls back to the character tile when the dedicated art is absent,
+		// exactly like RenderAbilityTile does on the desktop.
+		out += "\"abilitiesTile\":\"" + IdUrl(kAbilitiesTileResourceId != 0 ? kAbilitiesTileResourceId : kCharactersTileResourceId) + "\",";
+		// Sort switcher: the seven modes in the order the arrows cycle them,
+		// each with the label and halo colour the desktop badge uses.
+		out += "\"sorts\":[";
+		for (size_t s = 0; s < kWebSortCount; ++s)
+		{
+			char hex[16];
+			const unsigned int color = kWebSorts[s].color;
+			::snprintf(hex, sizeof hex, "#%02X%02X%02X", color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
+			out += "{\"id\":" + std::to_string(static_cast<int>(kWebSorts[s].sort)) + ",";
+			out += "\"label\":" + WJson(kWebSorts[s].label) + ",";
+			out += "\"icon\":\"" + IdUrl(kWebSorts[s].iconResourceId) + "\",";
+			out += "\"color\":\"" + std::string(hex) + "\"}";
+			if (s + 1 != kWebSortCount)
+				out += ",";
+		}
+		out += "],";
+		// Abilities browser: section filter names (after "All") and every
+		// ability the desktop grid can show. Sent with its kAbilities[] index
+		// so the client can match it against each entry's abilityIndices.
+		out += "\"abilitySections\":[";
+		for (size_t s = 0; s < kAbilitySectionCount; ++s)
+		{
+			if (s != 0)
+				out += ",";
+			out += WJson(kAbilitySectionNames[s]);
+		}
+		out += "],\"abilities\":[";
+		bool firstAbility = true;
+		for (size_t i = 0; i < kAbilityCount; ++i)
+		{
+			if (kAbilities[i].name.empty())
+				continue;
+			if (!firstAbility)
+				out += ",";
+			firstAbility = false;
+			char hex[16];
+			const unsigned int color = kAbilities[i].ringColor;
+			::snprintf(hex, sizeof hex, "#%02X%02X%02X", color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
+			out += "{\"index\":" + std::to_string(i) + ",";
+			out += "\"name\":" + WJson(kAbilities[i].name) + ",";
+			out += "\"section\":" + WJson(kAbilities[i].section) + ",";
+			out += "\"icon\":\"" + IdUrl(kAbilities[i].iconResourceId) + "\",";
+			out += "\"color\":\"" + std::string(hex) + "\"}";
+		}
+		out += "],";
+		out += "\"story\":" + BuildStoryJson() + ",";
+		out += "\"custom\":" + BuildCustomJson() + ",";
 		out += "\"pads\":[";
 		for (size_t i = 0; i < 7; ++i)
 		{
@@ -10969,6 +11124,10 @@ if (changed)
 			const Franchise& franchise = kFranchises[franchiseIndex];
 			out += "{\"name\":" + WJson(franchise.name) + ",";
 			out += "\"logo\":\"" + IdUrl(franchise.logoResourceId) + "\",";
+			// Release-wave flags for the Year 1 / Year 2 sorts (a couple of
+			// franchises ship in both, so these are independent, not exclusive).
+			out += std::string("\"year1\":") + (IsYear1FranchiseName(franchise.name) ? "true" : "false") + ",";
+			out += std::string("\"year2\":") + (IsYear2FranchiseName(franchise.name) ? "true" : "false") + ",";
 			out += "\"characters\":[";
 			for (size_t i = 0; i < franchise.characters.size(); ++i)
 			{
@@ -11053,12 +11212,177 @@ if (changed)
 			out += "\"bin\":" + std::to_string(slot.occupied ? slot.binResourceId : 0) + ",";
 			out += "\"portrait\":\"" + IdUrl(slot.portraitResourceId) + "\"}";
 		}
-		out += "],\"status\":" + WJson(g_app.status) + "}";
+		out += "],\"sort\":" + std::to_string(static_cast<int>(g_app.franchiseSort)) +
+			",\"ledMirror\":" + (g_app.ledMirrorEnabled ? "true" : "false") +
+			",\"status\":" + WJson(g_app.status) + "}";
 		job.result = out;
 		job.ok = true;
 	}
 
-	// The live LED glow for the three pad regions (left/center/right), read
+	// Current franchise sort plus the user's custom world order, so the web
+	// remote's header can mirror the desktop (including a sort changed from
+	// the desktop's own shoulder buttons) and render the User-order grid.
+	// Not cached: the order changes at runtime when the desktop reorganises.
+	std::string BuildSortJson()
+	{
+		std::string out = "{\"ok\":true,";
+		out += "\"sort\":" + std::to_string(static_cast<int>(g_app.franchiseSort)) + ",";
+		out += "\"label\":" + WJson(DescribeFranchiseSort()) + ",";
+		out += "\"userOrder\":[";
+		for (size_t i = 0; i < g_app.franchiseDisplayOrder.size(); ++i)
+		{
+			if (i != 0)
+				out += ",";
+			out += std::to_string(g_app.franchiseDisplayOrder[i]);
+		}
+		out += "]}";
+		return out;
+	}
+
+	// The tile/figure the desktop's controller is currently highlighting, in
+	// a form the web remote can match against its own tiles: `world` is a
+	// franchise index (or -1), `virtual` is "favorites"/"custom"/"" and
+	// `bin` is a roster entry's tag id. `ability` is the kAbilities index the
+	// Abilities grid is focused on (-1 when not on it). Sent on its own fast
+	// poll while the phone is browsing so the two cursors stay in step.
+	std::string BuildSelectionJson()
+	{
+		const bool onFranchiseGrid = g_app.screen == Screen::FranchiseList &&
+			g_app.franchiseSort != AppState::FranchiseSort::Abilities;
+		const bool onAbilityGrid = g_app.screen == Screen::FranchiseList &&
+			g_app.franchiseSort == AppState::FranchiseSort::Abilities;
+
+		std::string out = "{\"ok\":true,";
+		out += "\"world\":" + std::to_string(
+			(onFranchiseGrid && g_app.virtualTile == VirtualTile::None) ? static_cast<int>(g_app.franchiseIndex) : -1) + ",";
+		out += "\"virtual\":";
+		if (onFranchiseGrid && g_app.virtualTile == VirtualTile::Favorites)
+			out += WJson(L"favorites");
+		else if (onFranchiseGrid && g_app.virtualTile == VirtualTile::Custom)
+			out += WJson(L"custom");
+		else
+			out += WJson(L"");
+
+		int bin = 0;
+		if (g_app.screen == Screen::RosterList && g_app.rosterIndex < g_app.rosterSlots.size())
+		{
+			const RosterSlot& focused = g_app.rosterSlots[g_app.rosterIndex];
+			if (focused.entry)
+				bin = focused.entry->binResourceId;
+		}
+		out += ",\"bin\":" + std::to_string(bin);
+
+		int ability = -1;
+		if (onAbilityGrid)
+		{
+			if (g_abilityFilterDirty)
+				RebuildAbilityFilter();
+			if (g_app.abilityGridIndex < g_app.abilityFilteredIndices.size())
+				ability = static_cast<int>(g_app.abilityFilteredIndices[g_app.abilityGridIndex]);
+		}
+		out += ",\"ability\":" + std::to_string(ability) + "}";
+		return out;
+	}
+
+	// Web-driven selection moves: keep the desktop's browse cursor in step
+	// with the phone. Everything is guarded on the desktop already sitting on
+	// the matching screen, so a tap on the phone can never yank the desktop
+	// out of Settings, a pad action, or a different roster mid-load.
+	void ScrollFranchiseRowIntoView(size_t logicalIndex)
+	{
+		const int row = static_cast<int>(logicalIndex / kFranchiseCols);
+		while (row < g_app.franchiseTopRow)
+			--g_app.franchiseTopRow;
+		while (row >= g_app.franchiseTopRow + static_cast<int>(kFranchiseVisibleRows))
+			++g_app.franchiseTopRow;
+		if (g_app.franchiseTopRow < 0)
+			g_app.franchiseTopRow = 0;
+	}
+
+	void ApplySelectionWorld(size_t franchiseIndex)
+	{
+		if (franchiseIndex >= kFranchiseCount)
+			return;
+		if (g_app.franchiseSort == AppState::FranchiseSort::Abilities ||
+			g_app.franchiseSort == AppState::FranchiseSort::Story)
+			return;
+		if (g_app.screen != Screen::FranchiseList)
+			return;
+		RebuildFranchiseDisplay();
+		g_app.virtualTile = VirtualTile::None;
+		g_app.franchiseIndex = franchiseIndex;
+		ScrollFranchiseRowIntoView(LeadingVirtualTileCount() + FindFranchiseDisplaySlot(franchiseIndex));
+	}
+
+	void ApplySelectionVirtual(bool custom)
+	{
+		if (g_app.screen != Screen::FranchiseList)
+			return;
+		if (g_app.franchiseSort == AppState::FranchiseSort::Abilities ||
+			g_app.franchiseSort == AppState::FranchiseSort::Story)
+			return;
+		RebuildFranchiseDisplay();
+		if (custom && !g_app.showCustomTile)
+			return;
+		if (!custom && !g_app.showFavoritesTile)
+			return;
+		g_app.virtualTile = custom ? VirtualTile::Custom : VirtualTile::Favorites;
+		g_app.franchiseTopRow = 0;
+	}
+
+	void ApplySelectionBin(int binResourceId)
+	{
+		if (g_app.screen != Screen::RosterList || binResourceId == 0)
+			return;
+		for (size_t i = 0; i < g_app.rosterSlots.size(); ++i)
+		{
+			const RosterSlot& slot = g_app.rosterSlots[i];
+			if (slot.entry && slot.entry->binResourceId == binResourceId)
+			{
+				SelectRosterIndexAndScroll(i);
+				return;
+			}
+		}
+	}
+
+	void ApplySelectionAbility(size_t abilityIndex)
+	{
+		if (g_app.screen != Screen::FranchiseList ||
+			g_app.franchiseSort != AppState::FranchiseSort::Abilities)
+			return;
+		if (g_abilityFilterDirty)
+			RebuildAbilityFilter();
+		for (size_t slot = 0; slot < g_app.abilityFilteredIndices.size(); ++slot)
+		{
+			if (g_app.abilityFilteredIndices[slot] != abilityIndex)
+				continue;
+			g_app.abilityGridIndex = slot;
+			const int row = static_cast<int>(slot / kAbilityCols);
+			while (row < g_app.franchiseTopRow)
+				--g_app.franchiseTopRow;
+			while (row >= g_app.franchiseTopRow + static_cast<int>(kAbilityVisibleRows))
+				++g_app.franchiseTopRow;
+			if (g_app.franchiseTopRow < 0)
+				g_app.franchiseTopRow = 0;
+			return;
+		}
+	}
+
+	// Applies a selection change pushed from the web remote. job.a is the
+	// kind (1 world, 2 virtual, 3 bin, 4 ability), job.b the value.
+	void ApplySelectionSet(int kind, int value)
+	{
+		switch (kind)
+		{
+		case 1: ApplySelectionWorld(static_cast<size_t>(value)); break;
+		case 2: ApplySelectionVirtual(value != 0); break;
+		case 3: ApplySelectionBin(value); break;
+		case 4: ApplySelectionAbility(static_cast<size_t>(value)); break;
+		default: break;
+		}
+		if (g_mainWindow)
+			InvalidateRect(g_mainWindow, nullptr, FALSE);
+	}
 	// straight off g_app.ledRegions - AdvanceLedAnimation keeps curR/G/B and
 	// intensity current every tick regardless of whether the overlay window
 	// is visible, so this is never stale. Polled far more often than
@@ -11075,8 +11399,14 @@ if (changed)
 			if (region != 0)
 				out += ",";
 			const LedRegion& led = g_app.ledRegions[region];
+			// The wire carries raw LED drive levels against a white point of
+			// (255,110,24), so report the calibrated true colour - otherwise
+			// a white command reads as orange in the browser (see
+			// CalibrateLedColor).
+			BYTE calR, calG, calB;
+			CalibrateLedColor(led.curR, led.curG, led.curB, calR, calG, calB);
 			char hex[16];
-			::snprintf(hex, sizeof hex, "#%02X%02X%02X", led.curR, led.curG, led.curB);
+			::snprintf(hex, sizeof hex, "#%02X%02X%02X", calR, calG, calB);
 			char intensity[16];
 			::snprintf(intensity, sizeof intensity, "%.3f",
 				led.mode == LedMode::Off ? 0.0f : led.intensity);
@@ -11107,6 +11437,14 @@ if (changed)
 						return &build;
 				}
 			}
+		}
+		// Custom tags loaded from Special\ carry negative ids (see
+		// BuildCustomTagList) and aren't in kFranchises, so the web remote's
+		// LOAD for one has to resolve here too.
+		for (const auto& custom : g_customEntries)
+		{
+			if (custom.binResourceId == binResourceId)
+				return &custom;
 		}
 		return nullptr;
 	}
@@ -11246,6 +11584,37 @@ if (changed)
 			job.result = std::string("{\"ok\":true,\"favorited\":") + (favorited ? "true" : "false") + "}";
 			break;
 		}
+		case WebJob::Op::SortGet:
+			job.result = BuildSortJson();
+			job.ok = true;
+			break;
+		case WebJob::Op::SortSet:
+			if (job.a < 0 || job.a > static_cast<int>(AppState::FranchiseSort::Abilities))
+			{
+				job.result = ErrJson(L"Invalid sort.");
+				break;
+			}
+			SetFranchiseSort(static_cast<AppState::FranchiseSort>(job.a));
+			job.result = BuildSortJson();
+			job.ok = true;
+			break;
+		case WebJob::Op::SelectionGet:
+			job.result = BuildSelectionJson();
+			job.ok = true;
+			break;
+		case WebJob::Op::SelectionSet:
+			ApplySelectionSet(job.a, job.b);
+			job.result = BuildSelectionJson();
+			job.ok = true;
+			break;
+		case WebJob::Op::LedMirrorSet:
+			SetLedMirrorEnabled(job.a != 0);
+			SaveInputSettingsToIni();
+			g_app.status = L"Toypad LEDs: " + DescribeLedMirror();
+			job.result = std::string("{\"ok\":true,\"enabled\":") +
+				(g_app.ledMirrorEnabled ? "true" : "false") + "}";
+			job.ok = true;
+			break;
 		}
 		SetEvent(job.done);
 	}
@@ -11321,9 +11690,21 @@ if (changed)
 		};
 
 		// Serves any embedded resource binary by its numeric id (png/jpg/font/tag).
+		// A negative id is a custom portrait from Special\ (see
+		// BuildCustomTagList), which has no resource behind it - read the file.
 		auto serveResource = [&](int resourceId) -> void
 		{
-			std::vector<uint8_t> data = LoadResourceBytes(resourceId);
+			std::vector<uint8_t> data;
+			if (resourceId < 0)
+			{
+				const size_t pathIndex = static_cast<size_t>(-resourceId - 1);
+				if (pathIndex < g_customPortraitPaths.size())
+					data = LoadFileBytes(g_customPortraitPaths[pathIndex]);
+			}
+			else
+			{
+				data = LoadResourceBytes(resourceId);
+			}
 			if (data.empty())
 			{
 				SendHttpResponse(socket, 404, "Not Found", "Not Found", "text/plain; charset=utf-8", false);
@@ -11371,6 +11752,16 @@ if (changed)
 				const std::string body = DispatchWebJob(window, WebJob::Op::FavoritesGet, 0, 0);
 				SendHttpResponse(socket, 200, "OK", body, "application/json; charset=utf-8", false);
 			}
+			else if (request.path == "/api/sort")
+			{
+				const std::string body = DispatchWebJob(window, WebJob::Op::SortGet, 0, 0);
+				SendHttpResponse(socket, 200, "OK", body, "application/json; charset=utf-8", false);
+			}
+			else if (request.path == "/api/selection")
+			{
+				const std::string body = DispatchWebJob(window, WebJob::Op::SelectionGet, 0, 0);
+				SendHttpResponse(socket, 200, "OK", body, "application/json; charset=utf-8", false);
+			}
 			else if (request.path.rfind("/img/", 0) == 0 && request.path.size() > 5)
 			{
 				int resourceId = ::atoi(request.path.c_str() + 5);
@@ -11416,6 +11807,22 @@ if (changed)
 			{
 				const int bin = JsonInt(request.body, "bin");
 				body = DispatchWebJob(window, WebJob::Op::FavoriteToggle, 0, bin);
+			}
+			else if (request.path == "/api/sort")
+			{
+				const int sort = JsonInt(request.body, "sort");
+				body = DispatchWebJob(window, WebJob::Op::SortSet, sort, 0);
+			}
+			else if (request.path == "/api/selection")
+			{
+				const int kind = JsonInt(request.body, "kind");
+				const int value = JsonInt(request.body, "value");
+				body = DispatchWebJob(window, WebJob::Op::SelectionSet, kind, value);
+			}
+			else if (request.path == "/api/ledmirror")
+			{
+				const int enabled = JsonInt(request.body, "enabled");
+				body = DispatchWebJob(window, WebJob::Op::LedMirrorSet, enabled, 0);
 			}
 			else
 			{

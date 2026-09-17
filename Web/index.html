@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>LegoToypad Remote</title>
-<link rel="stylesheet" href="/style.css?v=21">
+<link rel="stylesheet" href="/style.css?v=22">
 </head>
 <body>
 <div id="stage">
@@ -18,7 +18,12 @@
   <img id="bgimg" alt="">
   <div id="topbar">
     <img id="wordmark" alt="">
-    <img id="byHarrysof" alt="by harrysof">
+    <div id="topRight">
+      <button id="ledToggle" class="ledToggle" type="button" title="Mirror the game's Toypad LEDs">
+        <span class="ledDot"></span>LEDS
+      </button>
+      <img id="byHarrysof" alt="by harrysof">
+    </div>
   </div>
 
   <div id="padScreen" class="screen active">
@@ -34,9 +39,14 @@
   </div>
 
   <div id="franchiseScreen" class="screen">
-    <div class="screen-header">
-      <div id="franchiseTitle">PICK A WORLD</div>
+    <div class="screen-header sort-header">
+      <button id="sortPrev" class="sortArrow" aria-label="Previous sort">&#8249;</button>
+      <div id="sortBadge">
+        <span id="sortLabel">DEFAULT</span>
+      </div>
+      <button id="sortNext" class="sortArrow" aria-label="Next sort">&#8250;</button>
     </div>
+    <div id="abilityFilterBar"></div>
     <div class="grid-wrapper">
       <div id="franchiseGrid"></div>
       <div class="scrollbar" id="franchiseScroll"><img src="" alt=""></div>
@@ -65,7 +75,17 @@
   <button id="backBtn">&#8249;</button>
   <div id="floatName"></div>
   <img id="dragGhost" class="dragGhost" alt="">
+
+  <div id="abilitiesOverlay" class="abilitiesOverlay">
+    <div class="abilitiesCard">
+      <div class="abilitiesHead">
+        <span id="abilitiesName"></span>
+        <button id="abilitiesClose" class="abilitiesClose" type="button" aria-label="Close">&#215;</button>
+      </div>
+      <div id="abilitiesList" class="abilitiesList"></div>
+    </div>
+  </div>
 </div>
-<script src="/app.js?v=21"></script>
+<script src="/app.js?v=22"></script>
 </body>
 </html>

@@ -29,6 +29,7 @@ outputs, and files are only rewritten when their content actually changes, so an
 
 import argparse
 import csv
+import hashlib
 import io
 import os
 import re
@@ -1095,6 +1096,22 @@ def generate(root: Path, out_dir: Path) -> int:
     # Emit resources.rc
     # -----------------------------------------------------------------------
     rc_lines = ['#include "GeneratedAssetTable.h"', '#include <winver.h>', ""]
+    # Fingerprint of every payload file's name+size+mtime, emitted as a
+    # comment. rc.exe reads the referenced files at compile time, but MSBuild
+    # only re-runs the resource compiler when resources.rc itself changes - so
+    # without this, editing Web/app.js (or any asset) would be silently
+    # ignored by an incremental build. The fingerprint changes the .rc bytes
+    # exactly when a payload changes, which forces the recompile and re-embed.
+    payload_fp = hashlib.sha1()
+    for symbol in sorted(symbols.by_name.values(), key=lambda s: s["name"]):
+        if symbol["path"] is None:
+            continue
+        try:
+            st = os.stat(symbol["path"])
+            payload_fp.update(("%s|%d|%d\n" % (symbol["name"], st.st_size, st.st_mtime_ns)).encode("utf-8"))
+        except OSError:
+            payload_fp.update(("%s|missing\n" % symbol["name"]).encode("utf-8"))
+    rc_lines.append("// payload-fingerprint: %s" % payload_fp.hexdigest())
     rc_lines.append("// Numeric ids are defined in GeneratedAssetTable.h; the")
     rc_lines.append("// RCDATA payloads below are the embedded asset payloads.")
     rc_lines.append("")

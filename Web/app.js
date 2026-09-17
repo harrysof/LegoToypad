@@ -58,6 +58,17 @@ let curGroup = null;       // vehicle group object for the plus picker
 let lastState = null;      // last /api/state payload
 let currentBg = null;      // current wallpaper background URL
 
+// Franchise sort ids - must match AppState::FranchiseSort in main.cpp.
+const SORT_DEFAULT = 0, SORT_USER = 1, SORT_STORY = 2, SORT_FAVORITES = 3,
+      SORT_YEAR1 = 4, SORT_YEAR2 = 5, SORT_ABILITIES = 6;
+
+let curSort = SORT_DEFAULT; // current franchise sort (mirrors the desktop)
+let userOrder = [];         // franchise indices in the user's custom order
+let abilityFilter = 0;      // 0 = All, else index into CAT.abilitySections + 1
+let plusReturn = 'roster';  // screen the build picker goes back to
+let selection = { world: -1, virtual: '', bin: 0, ability: -1 }; // desktop cursor
+let selectionTimer = null;  // fast poll for the desktop cursor while browsing
+
 const $ = (id) => document.getElementById(id);
 const pads = [];            // pad DOM elements, indexed by slot
 
@@ -213,6 +224,7 @@ function buildPads() {
     container.appendChild(pad);
     pads.push(pad);
   }
+  squareCenterPad();
 }
 
 // Update pad positions when orientation changes without rebuilding DOM
@@ -225,7 +237,32 @@ function repositionPads() {
     pads[i].style.width   = c.w + '%';
     pads[i].style.height  = c.h + '%';
   }
+  squareCenterPad();
   updateFloatName();
+}
+
+// The centre pad is a circle, but its cell is only square at the deck's
+// designed aspect ratio. On a big TV/tablet the deck can get clamped wider
+// than its aspect (see .pad-deck-card), squashing the cell into an ellipse.
+// Pin slot 1 to an explicit square (the smaller of the cell's two sides,
+// centred on the cell) so it stays round at any screen size.
+function squareCenterPad() {
+  const pad = pads[1];
+  const deck = $('pads');
+  if (!pad || !deck) return;
+  const deckW = deck.clientWidth;
+  const deckH = deck.clientHeight;
+  if (!deckW || !deckH) return;
+  const c = getPadCells()[1];
+  const cellW = (c.w / 100) * deckW;
+  const cellH = (c.h / 100) * deckH;
+  const side = Math.min(cellW, cellH);
+  const cx = ((c.x + c.w / 2) / 100) * deckW;
+  const cy = ((c.y + c.h / 2) / 100) * deckH;
+  pad.style.left = (cx - side / 2) + 'px';
+  pad.style.top = (cy - side / 2) + 'px';
+  pad.style.width = side + 'px';
+  pad.style.height = side + 'px';
 }
 
 // --- portrait auto-crop cache ---------------------------------------------
@@ -389,69 +426,430 @@ function buildActionBar() {
   // Favorites are added/removed from whatever is loaded on the selected
   // pad, next to Clear - not by holding a roster tile.
   bar.appendChild(makeActionButton(CAT.favoritesIcon, 'FAVORITE', onFavoriteTap));
+  // Abilities: shows whatever is loaded on the selected pad. Uses the app's
+  // own "Abilities" branding logo (the sort badge art), so let it run wide.
+  const abilitiesSort = (CAT.sorts || []).find((s) => s.id === SORT_ABILITIES);
+  const abilitiesLogo = (abilitiesSort && abilitiesSort.icon && !abilitiesSort.icon.endsWith('/0'))
+    ? abilitiesSort.icon : CAT.abilitiesTile;
+  const abilitiesBtn = makeActionButton(abilitiesLogo, 'ABILITIES', onAbilitiesTap);
+  abilitiesBtn.classList.add('wide-icon');
+  bar.appendChild(abilitiesBtn);
 }
 
-// --- franchise grid -------------------------------------------------------
-function buildFranchiseGrid() {
+// --- browse screen (franchise / story / favorites / ability grids) --------
+// One screen drives every "sort page": the world tile grid, the Starter Pack
+// roster, the Favorites roster and the Abilities grid all render into
+// #franchiseGrid, so the sort switcher stays put while you cycle them.
+function sortInfo(id) {
+  const list = (CAT && CAT.sorts) || [];
+  return list.find((s) => s.id === id) ||
+    { id, label: 'Default', icon: '', color: '#F0F4FA' };
+}
+
+function updateSortBar() {
+  const info = sortInfo(curSort);
+  const label = $('sortLabel');
+  const badge = $('sortBadge');
+  // Name only: the badge art (which spelled out the same word) is redundant.
+  if (label) label.textContent = (info.label || 'Default').toUpperCase();
+  if (badge) {
+    const color = info.color || '#49B7FF';
+    badge.style.setProperty('--sort-color', color);
+    badge.style.setProperty('--sort-glow', rgba(color, 0.34));
+  }
+  const bar = $('abilityFilterBar');
+  if (bar) bar.classList.toggle('visible', curSort === SORT_ABILITIES);
+}
+
+function buildAbilityFilterBar() {
+  const bar = $('abilityFilterBar');
+  bar.textContent = '';
+  const sections = ['All'].concat(CAT.abilitySections || []);
+  sections.forEach((name, i) => {
+    const chip = document.createElement('div');
+    chip.className = 'abfilter' + (i === abilityFilter ? ' active' : '');
+    chip.textContent = name;
+    chip.addEventListener('click', () => {
+      abilityFilter = i;
+      updateAbilityFilterBar();
+      if (screen === 'franchise' && curSort === SORT_ABILITIES) renderBrowse();
+    });
+    bar.appendChild(chip);
+  });
+}
+
+function updateAbilityFilterBar() {
+  const bar = $('abilityFilterBar');
+  if (!bar) return;
+  [...bar.children].forEach((chip, i) => chip.classList.toggle('active', i === abilityFilter));
+}
+
+function cycleSort(dir) {
+  const list = (CAT && CAT.sorts) || [];
+  if (!list.length) return;
+  let i = list.findIndex((s) => s.id === curSort);
+  if (i < 0) i = 0;
+  changeSort(list[(i + dir + list.length) % list.length].id);
+}
+
+async function changeSort(id) {
+  const previous = curSort;
+  curSort = id;
+  try {
+    const res = await fetch('/api/sort', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sort: Number(id) }),
+    });
+    const data = await res.json();
+    if (data && data.ok) {
+      curSort = data.sort;
+      if (Array.isArray(data.userOrder)) userOrder = data.userOrder;
+    }
+  } catch (e) {
+    curSort = previous;
+    setStatusMessage('Could not change the sort.', 'error');
+  }
+  renderBrowse();
+}
+
+async function refreshSortData() {
+  try {
+    const data = await api('/api/sort');
+    if (data && typeof data.sort === 'number') curSort = data.sort;
+    if (data && Array.isArray(data.userOrder)) userOrder = data.userOrder;
+  } catch (e) { /* keep whatever we had */ }
+}
+
+async function renderBrowse() {
   const grid = $('franchiseGrid');
+  if (!grid || !CAT) return;
+  grid.scrollTop = 0;
+  grid.className = '';
   grid.textContent = '';
 
-  // Favorites tile, first in the grid - same custom_bin.png icon the
-  // desktop overlay's own Favorites tile uses.
-  const favTile = document.createElement('div');
-  favTile.className = 'fworld';
-  const favLogo = document.createElement('img');
-  favLogo.className = 'logo';
-  favLogo.src = CAT.favoritesIcon;
-  favLogo.alt = 'Favorites';
-  favTile.appendChild(favLogo);
-  favTile.addEventListener('click', () => onFavoritesTap(favTile));
-  grid.appendChild(favTile);
-
-  CAT.franchises.forEach((world, idx) => {
-    const tile = document.createElement('div');
-    tile.className = 'fworld';
-    const logo = document.createElement('img');
-    logo.className = 'logo';
-    logo.src = world.logo;
-    logo.alt = world.name;
-    tile.appendChild(logo);
-    tile.addEventListener('click', () => onWorldTap(idx, tile));
-    grid.appendChild(tile);
-  });
+  if (curSort === SORT_ABILITIES) {
+    grid.classList.add('grid-ability');
+    renderAbilityGrid(grid);
+  } else if (curSort === SORT_STORY) {
+    grid.classList.add('grid-roster');
+    curWorld = CAT.story || { name: 'Starter Pack', logo: '', characters: [], vehicles: [] };
+    renderRosterInto(grid, curWorld);
+  } else if (curSort === SORT_FAVORITES) {
+    grid.classList.add('grid-roster');
+    await renderFavoritesInto(grid);
+  } else {
+    if (curSort === SORT_USER && !userOrder.length) await refreshSortData();
+    renderWorldGrid(grid);
+  }
+  // Updated last: refreshSortData() above may have changed curSort.
+  updateSortBar();
+  updateAbilityFilterBar();
   wireScroller(grid, $('franchiseScroll'));
+  applySelectionHighlight();
+}
+
+function renderWorldGrid(grid) {
+  // The favorites and Special tiles lead the Default and User grids (the
+  // desktop shows them on its custom-order sort too); the year waves are
+  // pure world lists.
+  if (curSort === SORT_DEFAULT || curSort === SORT_USER) {
+    grid.appendChild(makeFavoriteTile());
+    if (CAT.custom && (CAT.custom.characters || []).length) grid.appendChild(makeCustomTile());
+  }
+  let worlds = CAT.franchises.map((world, idx) => ({ world, idx }));
+  if (curSort === SORT_YEAR1) {
+    worlds = worlds.filter((x) => x.world.year1);
+  } else if (curSort === SORT_YEAR2) {
+    worlds = worlds.filter((x) => x.world.year2);
+  } else if (curSort === SORT_USER && userOrder.length) {
+    worlds = userOrder.map((idx) => ({ world: CAT.franchises[idx], idx })).filter((x) => x.world);
+  }
+  if (!worlds.length) {
+    grid.appendChild(makeEmptyNote('No worlds in this sort.'));
+    return;
+  }
+  worlds.forEach(({ world, idx }) => grid.appendChild(makeWorldTile(world, idx)));
+}
+
+function makeWorldTile(world, idx) {
+  const tile = document.createElement('div');
+  tile.className = 'fworld';
+  tile.dataset.world = idx;
+  const logo = document.createElement('img');
+  logo.className = 'logo';
+  logo.src = world.logo;
+  logo.alt = world.name;
+  tile.appendChild(logo);
+  tile.addEventListener('click', () => {
+    pushSelection(1, idx);
+    onWorldTap(idx, tile);
+  });
+  return tile;
+}
+
+function makeFavoriteTile() {
+  const tile = document.createElement('div');
+  tile.className = 'fworld';
+  tile.dataset.virtual = 'favorites';
+  const logo = document.createElement('img');
+  logo.className = 'logo';
+  logo.src = CAT.favoritesIcon;
+  logo.alt = 'Favorites';
+  tile.appendChild(logo);
+  tile.addEventListener('click', () => {
+    pushSelection(2, 0);
+    onFavoritesTap(tile);
+  });
+  return tile;
+}
+
+function makeCustomTile() {
+  const tile = document.createElement('div');
+  tile.className = 'fworld';
+  tile.dataset.virtual = 'custom';
+  const logo = document.createElement('img');
+  logo.className = 'logo';
+  logo.src = CAT.customTile || CAT.custom.logo;
+  logo.alt = 'Special';
+  tile.appendChild(logo);
+  tile.addEventListener('click', () => {
+    pushSelection(2, 1);
+    openCustomRoster();
+  });
+  return tile;
+}
+
+function openCustomRoster() {
+  if (!CAT.custom) return;
+  curWorld = CAT.custom;
+  setWorldLogo(CAT.custom.logo);
+  buildRoster(curWorld);
+  setScreen('roster');
+}
+
+async function renderFavoritesInto(grid) {
+  let world;
+  try {
+    world = await api('/api/favorites');
+  } catch (e) {
+    grid.appendChild(makeEmptyNote('Could not load favorites.'));
+    return;
+  }
+  curWorld = world;
+  renderRosterInto(grid, world);
+}
+
+function renderAbilityGrid(grid) {
+  const abilities = (CAT.abilities || []).filter((a) => {
+    if (abilityFilter === 0) return true;
+    return a.section === (CAT.abilitySections || [])[abilityFilter - 1];
+  });
+  if (!abilities.length) {
+    grid.appendChild(makeEmptyNote('No abilities in this filter.'));
+    return;
+  }
+  abilities.forEach((a) => grid.appendChild(makeAbilityTile(a)));
+}
+
+function makeAbilityTile(ability) {
+  const tile = document.createElement('div');
+  tile.className = 'ability';
+  tile.dataset.ability = ability.index;
+  const panel = document.createElement('div');
+  panel.className = 'abpanel';
+  if (CAT.abilitiesTile) panel.style.backgroundImage = `url(${CAT.abilitiesTile})`;
+
+  const hasIcon = ability.icon && !ability.icon.endsWith('/0');
+  if (hasIcon) {
+    const img = document.createElement('img');
+    img.className = 'abicon';
+    img.alt = ability.name;
+    img.src = ability.icon;
+    panel.appendChild(img);
+  } else {
+    const letter = document.createElement('span');
+    letter.className = 'abletter';
+    letter.style.setProperty('--fig-color', ability.color || '#60F3DF');
+    letter.textContent = (ability.name || '?').charAt(0);
+    panel.appendChild(letter);
+  }
+  tile.appendChild(panel);
+
+  const lbl = document.createElement('div');
+  lbl.className = 'ablbl';
+  lbl.textContent = ability.name;
+  tile.appendChild(lbl);
+
+  tile.addEventListener('click', () => {
+    highlightTouched(tile);
+    pushSelection(4, ability.index);
+    openAbilityRoster(ability);
+  });
+  return tile;
+}
+
+// Every character / vehicle build that carries this ability, assembled into
+// a synthetic "world" so the normal roster renderer can show it - exactly
+// what OpenAbilityRoster does on the desktop.
+function openAbilityRoster(ability) {
+  const idx = ability.index;
+  const characters = [];
+  const vehicles = [];
+  CAT.franchises.forEach((world) => {
+    (world.characters || []).forEach((c) => {
+      if ((c.abilities || []).includes(idx)) characters.push(c);
+    });
+    (world.vehicles || []).forEach((group) => {
+      const builds = (group.builds || []).filter((b) => (b.abilities || []).includes(idx));
+      if (builds.length) vehicles.push({ base: group.base, franchise: group.franchise, builds });
+    });
+  });
+  curWorld = {
+    name: ability.name,
+    logo: ability.icon && !ability.icon.endsWith('/0') ? ability.icon : '',
+    characters,
+    vehicles,
+  };
+  setWorldLogo(curWorld.logo);
+  buildRoster(curWorld);
+  setScreen('roster');
+}
+
+function makeEmptyNote(text) {
+  const el = document.createElement('div');
+  el.className = 'gridnote';
+  el.textContent = text;
+  return el;
+}
+
+function setWorldLogo(url) {
+  const el = $('worldLogo');
+  if (!el) return;
+  const has = url && !url.endsWith('/0');
+  el.style.display = has ? '' : 'none';
+  if (has) el.src = url;
+}
+
+// --- desktop cursor sync --------------------------------------------------
+// The desktop's highlighted tile is mirrored here (poll) and a tap on the
+// phone pushes its tile back to the desktop (push), so both cursors stay in
+// step. Selection kinds match ApplySelectionSet in main.cpp:
+//   1 world (franchise index), 2 virtual (0 favorites / 1 custom),
+//   3 roster tag id, 4 ability index.
+function applySelectionHighlight() {
+  const sel = selection || {};
+  document.querySelectorAll('.fworld.sel, .fig.sel, .ability.sel')
+    .forEach((el) => el.classList.remove('sel'));
+  if (sel.world >= 0) {
+    const el = document.querySelector(`.fworld[data-world="${sel.world}"]`);
+    if (el) el.classList.add('sel');
+  } else if (sel.virtual) {
+    const el = document.querySelector(`.fworld[data-virtual="${sel.virtual}"]`);
+    if (el) el.classList.add('sel');
+  }
+  if (sel.bin) {
+    const el = document.querySelector(`.fig[data-bin="${sel.bin}"]`);
+    if (el) el.classList.add('sel');
+  }
+  if (sel.ability >= 0) {
+    const el = document.querySelector(`.ability[data-ability="${sel.ability}"]`);
+    if (el) el.classList.add('sel');
+  }
+}
+
+function pushSelection(kind, value) {
+  if (kind === 1) selection = { ...selection, world: value, virtual: '' };
+  else if (kind === 2) selection = { ...selection, world: -1, virtual: value ? 'custom' : 'favorites' };
+  else if (kind === 3) selection = { ...selection, bin: value };
+  else if (kind === 4) selection = { ...selection, ability: value };
+  applySelectionHighlight();
+  fetch('/api/selection', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind, value }),
+  }).catch(() => {});
+}
+
+async function pollSelection() {
+  // Fast while a browsable screen is up (the cursor moves a lot), slow
+  // otherwise, so an idle phone doesn't hammer the desktop.
+  const browsing = screen === 'franchise' || screen === 'roster';
+  try {
+    const sel = await api('/api/selection');
+    if (sel && sel.ok) {
+      selection = sel;
+      if (browsing) applySelectionHighlight();
+    }
+  } catch (e) { /* keep the last highlight */ }
+  selectionTimer = setTimeout(pollSelection, browsing ? 350 : 1500);
+}
+
+function startSelectionPolling() {
+  if (!selectionTimer) pollSelection();
+}
+
+// --- LED mirror toggle ----------------------------------------------------
+function updateLedToggle() {
+  const btn = $('ledToggle');
+  if (!btn) return;
+  btn.classList.toggle('on', !!(lastState && lastState.ledMirror));
+}
+
+async function onLedToggle() {
+  const next = !(lastState && lastState.ledMirror);
+  try {
+    const res = await fetch('/api/ledmirror', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: next ? 1 : 0 }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error('failed');
+    if (lastState) lastState.ledMirror = data.enabled;
+    updateLedToggle();
+    setStatusMessage(data.enabled ? 'Toypad LED mirror on' : 'Toypad LED mirror off', 'success');
+  } catch (e) {
+    setStatusMessage('Could not change the LED mirror.', 'error');
+  }
 }
 
 // --- roster grid ----------------------------------------------------------
 function buildRoster(world) {
   const grid = $('rosterGrid');
   grid.textContent = '';
+  renderRosterInto(grid, world);
+  wireScroller(grid, $('rosterScroll'));
+  applySelectionHighlight();
+}
 
-  const chars = world.characters;
-  const vehs = world.vehicles.length ? world.vehicles : [];
-
+// Shared by the roster screen and the browse screen's Story / Favorites
+// pages. Only the default (build 1) tile is shown per vehicle, same as the
+// desktop overlay; its alternates are revealed through the build picker when
+// the tile itself is pressed, so there's no separate "+" grid slot.
+function renderRosterInto(grid, world) {
+  const chars = (world && world.characters) || [];
+  const vehs = (world && world.vehicles) || [];
+  if (!chars.length && !vehs.length) {
+    grid.appendChild(makeEmptyNote('Nothing here yet.'));
+    return;
+  }
   chars.forEach((e) => grid.appendChild(makeFig(e)));
-
   if (chars.length && vehs.length) {
     const sep = document.createElement('div');
     sep.className = 'rowsep';
     grid.appendChild(sep);
   }
-
-  // Only the default (build 1) tile is shown per vehicle, same as the
-  // desktop overlay; its alternates are revealed through the build picker
-  // when the tile itself is pressed, so there's no separate "+" grid slot.
   vehs.forEach((group) => {
     const entry = group.builds[0];
     grid.appendChild(makeFig(entry, group.builds.length > 1 ? group : null));
   });
-
-  wireScroller(grid, $('rosterScroll'));
 }
 
 function makeFig(entry, group) {
   const fig = document.createElement('div');
   fig.className = 'fig';
+  fig.dataset.bin = entry.bin;
   const ring = document.createElement('div');
   ring.className = 'ring bordered';
   ring.style.setProperty('--fig-color', entry.color);
@@ -476,6 +874,7 @@ function makeFig(entry, group) {
 
   fig.addEventListener('click', () => {
     highlightTouched(fig);
+    pushSelection(3, entry.bin);
     if (group) {
       openPlus(group);
     } else {
@@ -498,22 +897,34 @@ function buildPlus(group) {
 }
 
 // --- scrollbars -----------------------------------------------------------
+// Wired once per scroller element; the grid contents are rebuilt on every
+// sort change, so re-adding a listener each time would leak handlers.
 function wireScroller(scroller, sb) {
   sb.querySelector('img').src = CAT.scrollBar;
-  const toggle = () => {
-    const can = scroller.scrollHeight > scroller.clientHeight;
-    sb.classList.toggle('visible', can);
-    drawThumb(scroller, sb);
-  };
-  scroller.addEventListener('scroll', () => drawThumb(scroller, sb));
-  window.addEventListener('orientationchange', () => setTimeout(toggle, 300));
-  window.addEventListener('resize', toggle);
-  toggle();
+  scroller._scrollbar = sb;
+  if (!scroller._scrollerWired) {
+    scroller._scrollerWired = true;
+    scroller.addEventListener('scroll', () => drawThumb(scroller, scroller._scrollbar));
+  }
+  updateScroller(scroller);
+}
+
+function updateScroller(scroller) {
+  const sb = scroller && scroller._scrollbar;
+  if (!sb) return;
+  const can = scroller.scrollHeight > scroller.clientHeight + 1;
+  sb.classList.toggle('visible', can);
+  drawThumb(scroller, sb);
+}
+
+function updateAllScrollers() {
+  updateScroller($('franchiseGrid'));
+  updateScroller($('rosterGrid'));
 }
 
 function drawThumb(scroller, sb) {
   const img = sb.querySelector('img');
-  const ratio = scroller.clientHeight / scroller.scrollHeight;
+  const ratio = scroller.clientHeight / Math.max(1, scroller.scrollHeight);
   const trackH = sb.clientHeight;
   const thumbH = Math.max(22, Math.round(trackH * ratio));
   const scrollable = scroller.scrollHeight - scroller.clientHeight;
@@ -525,13 +936,18 @@ function drawThumb(scroller, sb) {
 // --- interaction ----------------------------------------------------------
 function setScreen(s) {
   screen = s;
+  closeAbilities();
   $('padScreen').classList.toggle('active', s === 'pad');
   $('franchiseScreen').classList.toggle('active', s === 'franchise');
   $('rosterScreen').classList.toggle('active', s === 'roster');
   $('plusScreen').classList.toggle('active', s === 'plus');
   $('backBtn').classList.toggle('visible', s !== 'pad');
   $('floatName').classList.remove('show');
-  if (s === 'pad') updateFloatName();
+  if (s === 'pad') {
+    squareCenterPad();
+    updateFloatName();
+  }
+  if (s === 'franchise') renderBrowse();
 }
 
 function onPadTap(slot) {
@@ -599,30 +1015,100 @@ async function onFavoriteTap(btn) {
   );
 }
 
+// Finds a catalog entry (character or vehicle build) by its tag id, so the
+// pad's loaded figure can be resolved back to its abilities[] list.
+function findEntryByBin(bin) {
+  for (const world of CAT.franchises || []) {
+    for (const c of world.characters || []) if (c.bin === bin) return c;
+    for (const g of world.vehicles || []) {
+      for (const b of g.builds || []) if (b.bin === bin) return b;
+    }
+  }
+  if (CAT.custom) {
+    for (const c of CAT.custom.characters || []) if (c.bin === bin) return c;
+  }
+  return null;
+}
+
+function abilityByIndex(index) {
+  return (CAT.abilities || []).find((a) => a.index === index) || null;
+}
+
+// ABILITIES button: show the abilities of whatever is loaded on the selected
+// pad, the web counterpart to the desktop's abilities peek.
+function onAbilitiesTap(btn) {
+  tapAnimate(btn);
+  if (curSlot === null) {
+    setStatusMessage('Tap a pad first to select a slot.', 'warn');
+    return;
+  }
+  const pad = lastState && lastState.pads ? lastState.pads[curSlot] : null;
+  if (!pad || !pad.occupied) {
+    setStatusMessage('Nothing on this pad to show abilities for.', 'warn');
+    return;
+  }
+  const entry = findEntryByBin(pad.bin);
+  const indices = (entry && entry.abilities) || [];
+  if (!indices.length) {
+    setStatusMessage(`"${pad.name}" has no abilities.`, 'warn');
+    return;
+  }
+  openAbilities(pad.name, indices);
+}
+
+function openAbilities(name, indices) {
+  $('abilitiesName').textContent = name;
+  const list = $('abilitiesList');
+  list.textContent = '';
+  indices.forEach((index) => {
+    const ability = abilityByIndex(index);
+    if (!ability) return;
+    const item = document.createElement('div');
+    item.className = 'abilityItem';
+    const hasIcon = ability.icon && !ability.icon.endsWith('/0');
+    if (hasIcon) {
+      const img = document.createElement('img');
+      img.src = ability.icon;
+      img.alt = ability.name;
+      item.appendChild(img);
+    } else {
+      const ph = document.createElement('span');
+      ph.className = 'abilityPh';
+      ph.style.setProperty('--fig-color', ability.color || '#A878FF');
+      ph.textContent = (ability.name || '?').charAt(0);
+      item.appendChild(ph);
+    }
+    const lbl = document.createElement('div');
+    lbl.className = 'abilityItemLbl';
+    lbl.textContent = ability.name;
+    item.appendChild(lbl);
+    list.appendChild(item);
+  });
+  $('abilitiesOverlay').classList.add('show');
+}
+
+function closeAbilities() {
+  const overlay = $('abilitiesOverlay');
+  if (overlay) overlay.classList.remove('show');
+}
+
 function onWorldTap(idx, tile) {
   curWorld = CAT.franchises[idx];
   highlightTouched(tile);
-  $('worldLogo').src = curWorld.logo;
+  setWorldLogo(curWorld.logo);
   buildRoster(curWorld);
   setScreen('roster');
 }
 
-async function onFavoritesTap(tile) {
+// The favorites tile now switches the browse screen to the Favorites sort,
+// whose page renders the same roster inline (still synced with the desktop).
+function onFavoritesTap(tile) {
   highlightTouched(tile);
-  let world;
-  try {
-    world = await api('/api/favorites');
-  } catch (e) {
-    setStatusMessage('Could not load favorites.', 'error');
-    return;
-  }
-  curWorld = world;
-  $('worldLogo').src = curWorld.logo;
-  buildRoster(curWorld);
-  setScreen('roster');
+  changeSort(SORT_FAVORITES);
 }
 
 function openPlus(group) {
+  plusReturn = screen === 'plus' ? plusReturn : screen;
   curGroup = group;
   buildPlus(group);
   setScreen('plus');
@@ -638,10 +1124,18 @@ async function getState() {
   try {
     const s = await api('/api/state');
     if (s && s.pads) refreshPads(s);
+    updateLedToggle();
     if (s && s.background && s.background !== currentBg) {
       currentBg = s.background;
       const bg = $('bgimg');
       if (bg) bg.src = s.background;
+    }
+    // Keep the sort page in step with the desktop, which can change it from
+    // its own shoulder buttons while this page is open.
+    if (s && typeof s.sort === 'number' && s.sort !== curSort) {
+      curSort = s.sort;
+      if (screen === 'franchise') renderBrowse();
+      else updateSortBar();
     }
     return s;
   } catch (e) {
@@ -761,7 +1255,7 @@ function goBack() {
   } else if (screen === 'roster') {
     setScreen('franchise');
   } else if (screen === 'plus') {
-    setScreen('roster');
+    setScreen(plusReturn);
   }
 }
 
@@ -783,11 +1277,24 @@ async function boot() {
     updateFloatName();
   });
   window.addEventListener('resize', updateFloatName);
+  window.addEventListener('resize', squareCenterPad);
   window.addEventListener('orientationchange', () => setTimeout(() => {
     repositionPads();
     updateFloatName();
   }, 200));
+  window.addEventListener('resize', updateAllScrollers);
+  window.addEventListener('orientationchange', () => setTimeout(updateAllScrollers, 300));
   $('backBtn').addEventListener('click', goBack);
+  $('sortPrev').addEventListener('click', () => cycleSort(-1));
+  $('sortNext').addEventListener('click', () => cycleSort(+1));
+  $('ledToggle').addEventListener('click', onLedToggle);
+  $('abilitiesClose').addEventListener('click', closeAbilities);
+  $('abilitiesOverlay').addEventListener('click', (e) => {
+    if (e.target === $('abilitiesOverlay')) closeAbilities();
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeAbilities();
+  });
 
   setLoading(true, 'Connecting to LegoToypad…');
   try {
@@ -807,11 +1314,12 @@ async function boot() {
 
   buildPads();
   buildActionBar();
-  buildFranchiseGrid();
+  buildAbilityFilterBar();
 
   setScreen('pad');
   await getState();
   startLedPolling();
+  startSelectionPolling();
   setStatusMessage('Tap a pad to select, double-tap to browse characters');
   setTimeout(() => setLoading(false), 350);
   setInterval(getState, 3000);
