@@ -5167,8 +5167,19 @@ void UpdateInputOwnership(HWND window);
 
 		if (dy != 0)
 		{
+			// Rows are centered, not left-anchored (see
+			// GetRosterRowColumnOffset), so a partial last row sits under the
+			// middle of the row above. Vertical moves must track the item's
+			// on-screen column, not its left-anchored index - otherwise going
+			// up from a centered row lands on whatever is left of it. Work in
+			// pixels using the same offset the renderer uses so the two agree.
+			const int currentX = GetRosterRowColumnOffset(pos.row) +
+				static_cast<int>(pos.col) * kRosterPitchX;
 			pos.row = (pos.row + static_cast<size_t>(dy) + rows) % rows;
-			pos.col = std::min(pos.col, GetRosterVisualRowItemCount(pos.row) - 1);
+			const size_t count = GetRosterVisualRowItemCount(pos.row);
+			const int targetX = currentX - GetRosterRowColumnOffset(pos.row);
+			const long target = std::lround(static_cast<double>(targetX) / kRosterPitchX);
+			pos.col = static_cast<size_t>(std::clamp(target, 0L, static_cast<long>(count) - 1));
 		}
 		if (dx != 0)
 		{
@@ -10665,7 +10676,10 @@ if (changed)
 
 	std::string IdUrl(int resourceId)
 	{
-		return "/img/" + std::to_string(resourceId);
+		// The ?v= token is the embedded-art fingerprint: resource ids can
+		// shift between builds, so without it a browser that cached
+		// /img/<id> could serve a different image that later reused that id.
+		return "/img/" + std::to_string(resourceId) + "?v=" + kAssetFingerprint;
 	}
 
 	// Case-insensitive scan for common virtual / VPN / tunnel-adapter markers in

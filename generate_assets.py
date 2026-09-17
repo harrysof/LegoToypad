@@ -1095,23 +1095,32 @@ def generate(root: Path, out_dir: Path) -> int:
     # -----------------------------------------------------------------------
     # Emit resources.rc
     # -----------------------------------------------------------------------
-    rc_lines = ['#include "GeneratedAssetTable.h"', '#include <winver.h>', ""]
-    # Fingerprint of every payload file's name+size+mtime, emitted as a
-    # comment. rc.exe reads the referenced files at compile time, but MSBuild
-    # only re-runs the resource compiler when resources.rc itself changes - so
-    # without this, editing Web/app.js (or any asset) would be silently
-    # ignored by an incremental build. The fingerprint changes the .rc bytes
-    # exactly when a payload changes, which forces the recompile and re-embed.
+    # Fingerprint of every payload file's name+size+mtime. It is emitted both
+    # as a comment in resources.rc (so MSBuild re-runs rc.exe when any payload
+    # - including Web/app.js - changes, which it otherwise can't see) and as a
+    # C++ constant (so the web remote can cache-bust /img/<id> URLs: resource
+    # ids can shift between builds, and a browser caching by URL alone would
+    # then serve the wrong image under a reused id).
     payload_fp = hashlib.sha1()
+    asset_fp = hashlib.sha1()
     for symbol in sorted(symbols.by_name.values(), key=lambda s: s["name"]):
         if symbol["path"] is None:
             continue
         try:
             st = os.stat(symbol["path"])
-            payload_fp.update(("%s|%d|%d\n" % (symbol["name"], st.st_size, st.st_mtime_ns)).encode("utf-8"))
+            entry = ("%s|%d|%d\n" % (symbol["name"], st.st_size, st.st_mtime_ns)).encode("utf-8")
         except OSError:
-            payload_fp.update(("%s|missing\n" % symbol["name"]).encode("utf-8"))
-    rc_lines.append("// payload-fingerprint: %s" % payload_fp.hexdigest())
+            entry = ("%s|missing\n" % symbol["name"]).encode("utf-8")
+        payload_fp.update(entry)
+        # The URL version covers only the embedded art/tags, not the web UI
+        # files themselves - editing app.js shouldn't bust every cached image.
+        if not symbol["name"].startswith("WEB_"):
+            asset_fp.update(entry)
+    payload_fp_hex = payload_fp.hexdigest()
+    asset_fp_hex = asset_fp.hexdigest()
+
+    rc_lines = ['#include "GeneratedAssetTable.h"', '#include <winver.h>', ""]
+    rc_lines.append("// payload-fingerprint: %s" % payload_fp_hex)
     rc_lines.append("// Numeric ids are defined in GeneratedAssetTable.h; the")
     rc_lines.append("// RCDATA payloads below are the embedded asset payloads.")
     rc_lines.append("")
@@ -1269,6 +1278,9 @@ def generate(root: Path, out_dir: Path) -> int:
     header.append("// catalog's \"version\" field) - kept in lockstep with APP_VERSION")
     header.append("// below, which also stamps the exe's own FILEVERSION/ProductVersion.")
     header.append("extern const wchar_t kAppVersion[];")
+    header.append("// Changes whenever any embedded payload changes; appended to")
+    header.append("// resource URLs so the browser never serves a stale /img/<id>.")
+    header.append("extern const char kAssetFingerprint[];")
     header.append("// [style][button]; style order Xbox, DualShock4, Switch, button")
     header.append("// order as in kButtonNames. 0 = no icon bundled for that button.")
     header.append("extern const int kControllerIconResourceIds[%d][%d];"
@@ -1325,6 +1337,7 @@ def generate(root: Path, out_dir: Path) -> int:
     cpp.append("const int kSortAbilitiesResourceId = %s;" % (sort_abilities_sym["name"] if sort_abilities_sym else "0"))
     cpp.append("const int kAbilitiesTileResourceId = %s;" % (abilities_tile_sym["name"] if abilities_tile_sym else "0"))
     cpp.append("const wchar_t kAppVersion[] = L\"%s\";" % APP_VERSION)
+    cpp.append("const char kAssetFingerprint[] = \"%s\";" % asset_fp_hex)
     cpp.append("")
     cpp.append("const int kControllerIconResourceIds[%d][%d] = {"
                % (len(controller_icon_styles), len(controller_icon_buttons)))

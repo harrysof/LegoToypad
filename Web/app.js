@@ -80,6 +80,12 @@ function rgba(hex, a) {
   return `rgba(${r},${g},${b},${a})`;
 }
 
+// True when a resource URL points at real art. Resource URLs carry a ?v=
+// cache-bust token, so test the numeric id rather than the string suffix.
+function hasArt(url) {
+  return !!url && !/\/0(\?|$)/.test(url);
+}
+
 function getPadName(slot) {
   const names = [
     'left upper pad',
@@ -269,7 +275,7 @@ function squareCenterPad() {
 const portraitCropCache = new Map();
 
 function applyCroppedPortrait(imgElement, url) {
-  if (!url || url.endsWith('/0')) {
+  if (!hasArt(url)) {
     imgElement.src = url || '';
     return;
   }
@@ -422,17 +428,22 @@ function makeActionButton(iconUrl, label, onTap) {
 function buildActionBar() {
   const bar = $('actionBar');
   bar.textContent = '';
-  bar.appendChild(makeActionButton(CAT.clearBtn, 'CLEAR', onClearTap));
+  // CLEAR: icon only (the broom art reads on its own), drawn larger.
+  const clearBtn = makeActionButton(CAT.clearBtn, 'CLEAR', onClearTap);
+  clearBtn.classList.add('icon-only', 'big-icon');
+  bar.appendChild(clearBtn);
   // Favorites are added/removed from whatever is loaded on the selected
-  // pad, next to Clear - not by holding a roster tile.
-  bar.appendChild(makeActionButton(CAT.favoritesIcon, 'FAVORITE', onFavoriteTap));
+  // pad, next to Clear - not by holding a roster tile. Icon only, like Clear.
+  const favBtn = makeActionButton(CAT.favoritesIcon, 'FAVORITE', onFavoriteTap);
+  favBtn.classList.add('icon-only', 'big-icon');
+  bar.appendChild(favBtn);
   // Abilities: shows whatever is loaded on the selected pad. Uses the app's
   // own "Abilities" branding logo (the sort badge art), so let it run wide.
   const abilitiesSort = (CAT.sorts || []).find((s) => s.id === SORT_ABILITIES);
-  const abilitiesLogo = (abilitiesSort && abilitiesSort.icon && !abilitiesSort.icon.endsWith('/0'))
+  const abilitiesLogo = (abilitiesSort && hasArt(abilitiesSort.icon))
     ? abilitiesSort.icon : CAT.abilitiesTile;
   const abilitiesBtn = makeActionButton(abilitiesLogo, 'ABILITIES', onAbilitiesTap);
-  abilitiesBtn.classList.add('wide-icon');
+  abilitiesBtn.classList.add('wide-icon', 'icon-only');
   bar.appendChild(abilitiesBtn);
 }
 
@@ -448,10 +459,15 @@ function sortInfo(id) {
 
 function updateSortBar() {
   const info = sortInfo(curSort);
-  const label = $('sortLabel');
+  const icon = $('sortIcon');
   const badge = $('sortBadge');
-  // Name only: the badge art (which spelled out the same word) is redundant.
-  if (label) label.textContent = (info.label || 'Default').toUpperCase();
+  // The badge art already spells out the sort name, so show it alone (no
+  // separate text label).
+  if (icon) {
+    const hasIcon = hasArt(info.icon);
+    icon.style.display = hasIcon ? '' : 'none';
+    if (hasIcon) icon.src = info.icon;
+  }
   if (badge) {
     const color = info.color || '#49B7FF';
     badge.style.setProperty('--sort-color', color);
@@ -660,7 +676,7 @@ function makeAbilityTile(ability) {
   panel.className = 'abpanel';
   if (CAT.abilitiesTile) panel.style.backgroundImage = `url(${CAT.abilitiesTile})`;
 
-  const hasIcon = ability.icon && !ability.icon.endsWith('/0');
+  const hasIcon = hasArt(ability.icon);
   if (hasIcon) {
     const img = document.createElement('img');
     img.className = 'abicon';
@@ -707,7 +723,7 @@ function openAbilityRoster(ability) {
   });
   curWorld = {
     name: ability.name,
-    logo: ability.icon && !ability.icon.endsWith('/0') ? ability.icon : '',
+    logo: hasArt(ability.icon) ? ability.icon : '',
     characters,
     vehicles,
   };
@@ -726,7 +742,7 @@ function makeEmptyNote(text) {
 function setWorldLogo(url) {
   const el = $('worldLogo');
   if (!el) return;
-  const has = url && !url.endsWith('/0');
+  const has = hasArt(url);
   el.style.display = has ? '' : 'none';
   if (has) el.src = url;
 }
@@ -824,9 +840,11 @@ function buildRoster(world) {
 }
 
 // Shared by the roster screen and the browse screen's Story / Favorites
-// pages. Only the default (build 1) tile is shown per vehicle, same as the
-// desktop overlay; its alternates are revealed through the build picker when
-// the tile itself is pressed, so there's no separate "+" grid slot.
+// pages. Characters and vehicles flow together in one continuous grid - no
+// separator row (the desktop breaks the two sections apart; the web doesn't).
+// Only the default (build 1) tile is shown per vehicle, same as the desktop
+// overlay; its alternates are revealed through the build picker when the tile
+// itself is pressed, so there's no separate "+" grid slot.
 function renderRosterInto(grid, world) {
   const chars = (world && world.characters) || [];
   const vehs = (world && world.vehicles) || [];
@@ -835,11 +853,6 @@ function renderRosterInto(grid, world) {
     return;
   }
   chars.forEach((e) => grid.appendChild(makeFig(e)));
-  if (chars.length && vehs.length) {
-    const sep = document.createElement('div');
-    sep.className = 'rowsep';
-    grid.appendChild(sep);
-  }
   vehs.forEach((group) => {
     const entry = group.builds[0];
     grid.appendChild(makeFig(entry, group.builds.length > 1 ? group : null));
@@ -853,7 +866,7 @@ function makeFig(entry, group) {
   const ring = document.createElement('div');
   ring.className = 'ring bordered';
   ring.style.setProperty('--fig-color', entry.color);
-  const hasPortrait = entry.portrait && !entry.portrait.endsWith('/0');
+  const hasPortrait = hasArt(entry.portrait);
   if (hasPortrait) {
     const img = document.createElement('img');
     img.alt = entry.name;
@@ -1065,7 +1078,7 @@ function openAbilities(name, indices) {
     if (!ability) return;
     const item = document.createElement('div');
     item.className = 'abilityItem';
-    const hasIcon = ability.icon && !ability.icon.endsWith('/0');
+    const hasIcon = hasArt(ability.icon);
     if (hasIcon) {
       const img = document.createElement('img');
       img.src = ability.icon;
