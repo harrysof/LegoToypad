@@ -6444,7 +6444,25 @@ void UpdateInputOwnership(HWND window);
 			SendInput(2, alt, sizeof(INPUT));
 			SetForegroundWindow(target);
 		}
+		// Last resort: the shell's own Alt-Tab switch, which is exempt from
+		// the foreground lock.
+		if (GetForegroundWindow() != target)
+			SwitchToThisWindow(target, TRUE);
+
+		// Being the active window is not the same as having the keyboard:
+		// after the attach dance above the picker could end up active with
+		// no focus window at all, so every key press went nowhere until it
+		// was clicked. Our own window gets the focus explicitly.
+		if (GetWindowThreadProcessId(target, nullptr) == GetCurrentThreadId() &&
+			GetForegroundWindow() == target)
+			SetFocus(target);
 	}
+
+	// Ticks left in which a freshly shown overlay keeps asking for the
+	// foreground. Windows can refuse the first request (another app was in
+	// front and still owns the foreground lock), and a picker without focus
+	// is useless: keys go to that other app and the mouse is the only way in.
+	int g_focusRetryTicks = 0;
 
 	// ---------------------------------------------------------------------
 	// Dimensions Recompiled
@@ -6629,6 +6647,7 @@ void UpdateInputOwnership(HWND window);
 		Paint(window);
 		ShowWindow(window, SW_SHOW);
 		ForceForegroundWindow(window);
+		g_focusRetryTicks = 30; // ~0.5 s at the visible tick rate
 		InvalidateRect(window, nullptr, FALSE);
 	}
 
@@ -12976,6 +12995,17 @@ if (changed)
 			return 0;
 		case kTickMessage:
 		{
+			if (g_focusRetryTicks > 0)
+			{
+				if (!g_app.overlayVisible || g_overlayHiding ||
+					(GetForegroundWindow() == window && GetFocus() == window))
+					g_focusRetryTicks = 0;
+				else
+				{
+					--g_focusRetryTicks;
+					ForceForegroundWindow(window);
+				}
+			}
 			// Clear the in-flight flag first: the pacing thread may queue the
 			// next tick while this one is still running, and that is fine -
 			// what must not happen is a backlog building up behind a slow
