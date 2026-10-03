@@ -112,6 +112,23 @@ shortcut, so both work at once. Change the toggle from **Settings -> Toggle
 shortcut**. With no controller connected, the on-screen button hints switch to
 these keys automatically.
 
+Every key in the table except the toggle can be changed under **Settings ->
+Keyboard keys**: pick a row, press the new key (Esc cancels, Backspace restores
+the default). A key that is already used swaps with the other action. Esc always
+works as Back unless you give it to another action.
+
+### Window size
+
+**Settings -> Window size** shrinks the whole picker to 90/80/70/60% (handy on a
+small second monitor). The layout is unchanged, just smaller.
+
+### Dimensions Recompiled
+
+When the recompiled PC port (`legodimensions.exe`) is running, the picker opens
+on the game's monitor and closing it always puts focus back into the game, so
+you never need the mouse to click back in. **Settings -> System** shows whether
+the game was found. Without it, everything works as before.
+
 ## Setup
 
 1. Run `LegoToypad.exe`.
