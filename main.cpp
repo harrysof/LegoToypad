@@ -132,6 +132,7 @@ constexpr int kOverlayWidth = 900;
 		Abilities,
 		PrevSort,
 		NextSort,
+		SneakPeek,
 		Count,
 	};
 	constexpr size_t kKeyActionCount = static_cast<size_t>(KeyAction::Count);
@@ -158,6 +159,10 @@ constexpr int kOverlayWidth = 900;
 		{L"Show abilities (hold)", L"KeyAbilities", 'Z'},
 		{L"Previous sort", L"KeyPrevSort", VK_OEM_4},
 		{L"Next sort", L"KeyNextSort", VK_OEM_6},
+		// Read with GetAsyncKeyState while the picker is hidden, not from
+		// window messages, so it never takes the key away from the game.
+		// That is also why a bare modifier is fine here.
+		{L"Sneak peek (hold)", L"KeySneakPeek", VK_LSHIFT},
 	}};
 
 	constexpr std::array<UINT, kKeyActionCount> DefaultKeyBindings()
@@ -6463,6 +6468,12 @@ void UpdateInputOwnership(HWND window);
 	// front and still owns the foreground lock), and a picker without focus
 	// is useless: keys go to that other app and the mouse is the only way in.
 	int g_focusRetryTicks = 0;
+	// False when the picker is going away because the player switched to
+	// something else: focus then stays where they put it.
+	bool g_returnFocusOnHide = true;
+	// Set while FinishOverlayHide hands focus to the game, so the
+	// deactivation that causes is not mistaken for the player leaving.
+	bool g_handingFocusBack = false;
 
 	// ---------------------------------------------------------------------
 	// Dimensions Recompiled
@@ -6647,6 +6658,7 @@ void UpdateInputOwnership(HWND window);
 		Paint(window);
 		ShowWindow(window, SW_SHOW);
 		ForceForegroundWindow(window);
+		g_returnFocusOnHide = true;
 		g_focusRetryTicks = 30; // ~0.5 s at the visible tick rate
 		InvalidateRect(window, nullptr, FALSE);
 	}
@@ -6679,7 +6691,8 @@ void UpdateInputOwnership(HWND window);
 		// foreground on; once it is hidden Windows has already given focus
 		// to whatever was next in line and is free to refuse the request -
 		// which left players outside the game, reaching for the mouse.
-		const HWND returnTo = FocusReturnTarget();
+		const HWND returnTo = g_returnFocusOnHide ? FocusReturnTarget() : nullptr;
+		g_handingFocusBack = true;
 		if (returnTo)
 			ForceForegroundWindow(returnTo);
 		ShowWindow(window, SW_HIDE);
@@ -6692,6 +6705,8 @@ void UpdateInputOwnership(HWND window);
 
 		if (returnTo && GetForegroundWindow() != returnTo)
 			ForceForegroundWindow(returnTo);
+		g_handingFocusBack = false;
+		g_returnFocusOnHide = true;
 	}
 
 	void ToggleOverlay(HWND window)
@@ -6799,6 +6814,10 @@ void UpdateInputOwnership(HWND window);
 		case VK_DOWN: return L"Down";
 		case VK_LEFT: return L"Left";
 		case VK_RIGHT: return L"Right";
+		case VK_LSHIFT: return L"Left Shift";
+		case VK_RSHIFT: return L"Right Shift";
+		case VK_LCONTROL: return L"Left Ctrl";
+		case VK_RCONTROL: return L"Right Ctrl";
 		default: break;
 		}
 		return DescribeKeyboardKey(0, key);
@@ -7840,7 +7859,7 @@ void UpdateInputOwnership(HWND window);
 		// says nothing about how the HUD is summoned - and the row for the
 		// binding itself sits several categories further down the list.
 		return std::wstring(size) + L" (hold " +
-			DescribeControllerMask(g_app.buttonSneakPeek) + L")";
+			DescribeControllerMask(g_app.buttonSneakPeek) + L" / " + KeyLabel(KeyAction::SneakPeek) + L")";
 	}
 
 	void CycleSneakPeek(int direction)
@@ -9008,16 +9027,32 @@ void UpdateInputOwnership(HWND window);
 	// across all pads. The HUD is strictly a hold: it comes up while the
 	// binding is down and goes away when it is released, and it never
 	// competes with the picker - the overlay being up suppresses it entirely.
+	// The keyboard hold is global (the picker is hidden, so it has no focus
+	// to read keys from). With Dimensions Recompiled running it only counts
+	// while the game is in front, so holding Shift in a browser or a chat
+	// window does not pop the HUD up over it.
+	bool KeyboardSneakPeekHeld()
+	{
+		const UINT key = g_app.keyBindings[static_cast<size_t>(KeyAction::SneakPeek)];
+		if (key == 0 || (GetAsyncKeyState(static_cast<int>(key)) & 0x8000) == 0)
+			return false;
+		if (!IsRecompiledRunning())
+			return true;
+		DWORD pid = 0;
+		GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+		return IsRecompiledProcess(pid);
+	}
+
 	void UpdatePeekHold(bool anyConnected, ButtonMask heldButtons)
 	{
+		const bool controllerWants = g_app.buttonSneakPeek != 0 && anyConnected &&
+			(heldButtons & g_app.buttonSneakPeek) == g_app.buttonSneakPeek;
 		const bool wants = g_app.peekSizeChoice != 0 &&
-			g_app.buttonSneakPeek != 0 &&
-			anyConnected &&
 			!g_app.overlayVisible &&
 			!g_app.capturingShortcut &&
 			g_app.capturingBindingIndex < 0 &&
 			g_app.capturingKeyIndex < 0 &&
-			(heldButtons & g_app.buttonSneakPeek) == g_app.buttonSneakPeek;
+			(controllerWants || KeyboardSneakPeekHeld());
 		if (wants)
 			ShowPeekWindow();
 		else
@@ -12635,6 +12670,18 @@ if (changed)
 					CancelKeyCapture();
 				else if (wParam == VK_BACK)
 					ApplyKeyBinding(index, kKeyActions[index].defaultKey);
+				else if (index == static_cast<size_t>(KeyAction::SneakPeek) &&
+					(wParam == VK_SHIFT || wParam == VK_CONTROL))
+				{
+					// WM_KEYDOWN only says "Shift"/"Ctrl"; the scan code and
+					// the extended bit tell left from right.
+					const UINT scan = (static_cast<UINT>(lParam) >> 16) & 0xFF;
+					const bool extended = (lParam & (1 << 24)) != 0;
+					const UINT sided = wParam == VK_SHIFT
+						? MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX)
+						: (extended ? VK_RCONTROL : VK_LCONTROL);
+					ApplyKeyBinding(index, sided);
+				}
 				else if (!IsModifierKey(wParam))
 					ApplyKeyBinding(index, static_cast<UINT>(wParam));
 				InvalidateRect(window, nullptr, FALSE);
@@ -13086,6 +13133,17 @@ if (changed)
 		}
 		case WM_ACTIVATE:
 			UpdateInputOwnership(window);
+			return 0;
+		case WM_ACTIVATEAPP:
+			// Another program took the foreground (Alt+Tab, a click on
+			// another window): the picker gets out of the way like a tray
+			// app should, and leaves focus with whatever was chosen.
+			if (!wParam && g_app.overlayVisible && !g_overlayHiding && !g_handingFocusBack)
+			{
+				g_focusRetryTicks = 0;
+				g_returnFocusOnHide = false;
+				HideOverlay(window);
+			}
 			return 0;
 		case WM_SIZE:
 			ApplyWindowCornerRadius(window);
