@@ -6474,6 +6474,10 @@ void UpdateInputOwnership(HWND window);
 	// Set while FinishOverlayHide hands focus to the game, so the
 	// deactivation that causes is not mistaken for the player leaving.
 	bool g_handingFocusBack = false;
+	// Whether the picker has held the foreground since it was last shown.
+	// Until it has, another app being in front just means the focus grab
+	// is still being retried, not that the player left.
+	bool g_hadFocusSinceShow = false;
 
 	// ---------------------------------------------------------------------
 	// Dimensions Recompiled
@@ -6659,6 +6663,7 @@ void UpdateInputOwnership(HWND window);
 		ShowWindow(window, SW_SHOW);
 		ForceForegroundWindow(window);
 		g_returnFocusOnHide = true;
+		g_hadFocusSinceShow = GetForegroundWindow() == window;
 		g_focusRetryTicks = 30; // ~0.5 s at the visible tick rate
 		InvalidateRect(window, nullptr, FALSE);
 	}
@@ -13051,6 +13056,25 @@ if (changed)
 				{
 					--g_focusRetryTicks;
 					ForceForegroundWindow(window);
+				}
+			}
+			// Polled rather than left to WM_ACTIVATEAPP alone: the Alt+Tab
+			// switcher and the Start menu take the foreground without that
+			// message reliably reaching a layered tool window. Anything in
+			// front that is not this process means the player went elsewhere.
+			if (g_app.overlayVisible && !g_overlayHiding && !g_handingFocusBack)
+			{
+				const HWND foreground = GetForegroundWindow();
+				DWORD foregroundPid = 0;
+				if (foreground)
+					GetWindowThreadProcessId(foreground, &foregroundPid);
+				if (foregroundPid == GetCurrentProcessId())
+					g_hadFocusSinceShow = true;
+				else if (g_hadFocusSinceShow && foreground)
+				{
+					g_focusRetryTicks = 0;
+					g_returnFocusOnHide = false;
+					HideOverlay(window);
 				}
 			}
 			// Clear the in-flight flag first: the pacing thread may queue the
