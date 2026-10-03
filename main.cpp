@@ -104,6 +104,74 @@ constexpr int kOverlayWidth = 900;
 	constexpr int kOpacityFloorPercent = 20; // below this the window becomes hard to see
 	constexpr int kSettingsPercentStep = 15;
 	constexpr int kWindowCornerRadius = 20;
+	// Window size, as a percentage of the kOverlayWidth x kOverlayHeight
+	// layout. Every screen is still laid out and drawn at full size; the
+	// finished frame is shrunk once at present time (see Paint) and mouse
+	// positions are scaled back up (LayoutPointFromClient), so none of the
+	// layout code has to know the window is smaller.
+	constexpr std::array<int, 5> kWindowScaleChoices = {60, 70, 80, 90, 100};
+	constexpr int kDefaultWindowScalePercent = 100;
+
+	// Keyboard bindings for the picker's own actions, persisted in
+	// [Keyboard] as virtual-key codes and remappable from Settings. Unlike
+	// the toggle shortcut these are plain keys: they are only read while the
+	// overlay has focus, so they can never steal a key from another program.
+	enum class KeyAction
+	{
+		Up,
+		Down,
+		Left,
+		Right,
+		Confirm,
+		Back,
+		SettingsFavorite,
+		MoveOrganize,
+		QuickLoad,
+		QuickClear,
+		LedDemo,
+		Abilities,
+		PrevSort,
+		NextSort,
+		Count,
+	};
+	constexpr size_t kKeyActionCount = static_cast<size_t>(KeyAction::Count);
+
+	struct KeyActionInfo
+	{
+		const wchar_t* label;  // Settings row / status text
+		const wchar_t* iniKey; // [Keyboard] key it persists under
+		UINT defaultKey;
+	};
+
+	constexpr std::array<KeyActionInfo, kKeyActionCount> kKeyActions = {{
+		{L"Up", L"KeyUp", VK_UP},
+		{L"Down", L"KeyDown", VK_DOWN},
+		{L"Left", L"KeyLeft", VK_LEFT},
+		{L"Right", L"KeyRight", VK_RIGHT},
+		{L"Confirm", L"KeyConfirm", VK_RETURN},
+		{L"Back", L"KeyBack", VK_ESCAPE},
+		{L"Settings / Favorite", L"KeySettingsFavorite", 'S'},
+		{L"Move / Organize", L"KeyMoveOrganize", 'M'},
+		{L"Quick load", L"KeyQuickLoad", 'L'},
+		{L"Quick clear", L"KeyQuickClear", 'C'},
+		{L"LED demo", L"KeyLedDemo", 'G'},
+		{L"Show abilities (hold)", L"KeyAbilities", 'Z'},
+		{L"Previous sort", L"KeyPrevSort", VK_OEM_4},
+		{L"Next sort", L"KeyNextSort", VK_OEM_6},
+	}};
+
+	constexpr std::array<UINT, kKeyActionCount> DefaultKeyBindings()
+	{
+		std::array<UINT, kKeyActionCount> keys{};
+		for (size_t i = 0; i < kKeyActionCount; ++i)
+			keys[i] = kKeyActions[i].defaultKey;
+		return keys;
+	}
+
+	// The game window the picker hands focus back to. The recompiled PC port
+	// is a native exe, so it is found by process name rather than through an
+	// emulator listener.
+	constexpr wchar_t kRecompiledExeName[] = L"legodimensions.exe";
 	// kAppVersion itself now comes from GeneratedAssetTable (generated from
 	// generate_assets.py's APP_VERSION) so the web UI's version string can
 	// never drift from the exe's own FILEVERSION/ProductVersion again.
@@ -434,6 +502,13 @@ bool swapConfirmBackButtons = false;
 		// Index into kBindableActions while capturing a new button for one
 		// of them from Settings; -1 when no binding capture is running.
 		int capturingBindingIndex = -1;
+		// Keyboard keys for the picker's actions, indexed by KeyAction.
+		std::array<UINT, kKeyActionCount> keyBindings = DefaultKeyBindings();
+		// Index into kKeyActions while capturing a new key from Settings;
+		// -1 when no key capture is running.
+		int capturingKeyIndex = -1;
+		// Window size in percent, one of kWindowScaleChoices.
+		int windowScalePercent = kDefaultWindowScalePercent;
 		// Which pad's button labels the UI uses. 0 = Auto (follow whatever
 		// is connected), 1..4 = pinned to one style.
 		size_t buttonStyleChoice = 0;
@@ -918,9 +993,12 @@ bool swapConfirmBackButtons = false;
 		ConfirmStyle,
 		ButtonStyle,
 		Binding,        // uses bindingIndex
+		KeyBinding,     // uses bindingIndex, into kKeyActions
+		RecompiledStatus, // read-only: is Dimensions Recompiled running
 		Background,
 		PadSkin,
 		Opacity,
+		WindowSize,
 		WindowPlacement,
 		SneakPeek,
 		LedMirror,
@@ -1064,6 +1142,10 @@ void UpdateInputOwnership(HWND window);
 	void CancelShortcutCapture();
 	void BeginBindingCapture(size_t actionIndex);
 	void CancelBindingCapture();
+	void CancelKeyCapture();
+	std::wstring KeyLabel(KeyAction action);
+	HWND FindRecompiledWindow();
+	bool IsRecompiledRunning();
 	void ResetSettingsToDefaults();
 	void ApplyOverlayTransparency(HWND window);
 	int CurrentBackgroundResourceId();
@@ -3071,16 +3153,16 @@ void UpdateInputOwnership(HWND window);
 		if (mask == 0)
 			return {};
 		if (mask == g_app.buttonFavorite || mask == g_app.buttonSettings)
-			return L"S";
+			return KeyLabel(KeyAction::SettingsFavorite);
 		if (mask == g_app.buttonMoveActive || mask == g_app.buttonReorganizeRoster ||
 			mask == g_app.buttonReorganizeFranchise)
-			return L"M";
+			return KeyLabel(KeyAction::MoveOrganize);
 		if (mask == g_app.buttonAbilitiesPeek)
-			return L"Z";
+			return KeyLabel(KeyAction::Abilities);
 		if (mask == g_app.buttonQuickLoad)
-			return L"L";
+			return KeyLabel(KeyAction::QuickLoad);
 		if (mask == g_app.buttonQuickClear)
-			return L"C";
+			return KeyLabel(KeyAction::QuickClear);
 		return {};
 	}
 
@@ -3153,9 +3235,9 @@ void UpdateInputOwnership(HWND window);
 		float cursor = leftX;
 		if (UseKeyboardHints())
 		{
-			cursor += DrawHintKeycap(g, L"[", cursor, centerY - h / 2.0f, h, true);
+			cursor += DrawHintKeycap(g, KeyLabel(KeyAction::PrevSort), cursor, centerY - h / 2.0f, h, true);
 			cursor += kIconGap;
-			cursor += DrawHintKeycap(g, L"]", cursor, centerY - h / 2.0f, h, true);
+			cursor += DrawHintKeycap(g, KeyLabel(KeyAction::NextSort), cursor, centerY - h / 2.0f, h, true);
 		}
 		else
 		{
@@ -3368,6 +3450,15 @@ void UpdateInputOwnership(HWND window);
 			"; The Settings row cycles 100/92/85/75/65/55/45; hand-edited values are\n"
 			"; clamped to 20-100 so the window can never become impossible to see.\n"
 			"Opacity=92\n"
+			"; Scale is the window size as a percentage of the full 900x610 layout.\n"
+			"; The Settings row offers 100/90/80/70/60.\n"
+			"Scale=100\n"
+			"\n"
+			"; Keyboard keys for the picker's own actions, as virtual-key codes\n"
+			"; (Enter=13, Esc=27, arrows=37-40, letters = their capital ASCII code).\n"
+			"; Easiest to set them from the in-app Settings screen. Missing keys keep\n"
+			"; their defaults.\n"
+			"[Keyboard]\n"
 			"\n"
 			"[Web]\n"
 			"; Web remote serves the same Toypad UI to a phone browser on your local\n"
@@ -3903,6 +3994,77 @@ void UpdateInputOwnership(HWND window);
 			std::to_wstring(g_app.savedWindowY).c_str(), iniPath.c_str());
 		WritePrivateProfileStringW(L"Window", L"Opacity",
 			std::to_wstring(g_app.opacityPercent).c_str(), iniPath.c_str());
+		WritePrivateProfileStringW(L"Window", L"Scale",
+			std::to_wstring(g_app.windowScalePercent).c_str(), iniPath.c_str());
+	}
+
+	void SaveKeyBindingsToIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		for (size_t i = 0; i < kKeyActionCount; ++i)
+		{
+			WritePrivateProfileStringW(L"Keyboard", kKeyActions[i].iniKey,
+				std::to_wstring(g_app.keyBindings[i]).c_str(), iniPath.c_str());
+		}
+	}
+
+	void LoadKeyBindingsFromIni()
+	{
+		const auto iniPath = GetExecutableDirectory() / L"LegoToypad.ini";
+		for (size_t i = 0; i < kKeyActionCount; ++i)
+		{
+			const UINT key = GetPrivateProfileIntW(L"Keyboard", kKeyActions[i].iniKey,
+				kKeyActions[i].defaultKey, iniPath.c_str());
+			g_app.keyBindings[i] = (key > 0 && key < 256) ? key : kKeyActions[i].defaultKey;
+		}
+		// A hand-edited file can bind one key twice. The later action loses
+		// its key rather than both firing from one press.
+		for (size_t i = 0; i < kKeyActionCount; ++i)
+		{
+			for (size_t j = 0; j < i; ++j)
+			{
+				if (g_app.keyBindings[i] != 0 && g_app.keyBindings[i] == g_app.keyBindings[j])
+					g_app.keyBindings[i] = 0;
+			}
+		}
+	}
+
+	// Snaps to the nearest offered size, so a hand-edited 73 still behaves
+	// like a value the Settings row can step from.
+	int SnapWindowScale(int percent)
+	{
+		int best = kDefaultWindowScalePercent;
+		for (const int choice : kWindowScaleChoices)
+		{
+			if (std::abs(choice - percent) < std::abs(best - percent))
+				best = choice;
+		}
+		return best;
+	}
+
+	int ScaledOverlayWidth()
+	{
+		return (kOverlayWidth * g_app.windowScalePercent + 50) / 100;
+	}
+
+	int ScaledOverlayHeight()
+	{
+		return (kOverlayHeight * g_app.windowScalePercent + 50) / 100;
+	}
+
+	// Client (window) pixels back to layout pixels: the inverse of the
+	// present-time shrink in Paint.
+	POINT LayoutPointFromClient(POINT client)
+	{
+		if (g_app.windowScalePercent == 100)
+			return client;
+		return POINT{client.x * 100 / g_app.windowScalePercent, client.y * 100 / g_app.windowScalePercent};
+	}
+
+	POINT LayoutPointFromLParam(LPARAM lParam)
+	{
+		return LayoutPointFromClient(
+			POINT{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))});
 	}
 
 	void LoadWindowSettingsFromIni()
@@ -3927,6 +4089,8 @@ void UpdateInputOwnership(HWND window);
 		// nobody can see well enough to fix the setting from.
 		g_app.opacityPercent = std::clamp(static_cast<int>(GetPrivateProfileIntW(
 			L"Window", L"Opacity", kDefaultOpacityPercent, iniPath.c_str())), kOpacityFloorPercent, 100);
+		g_app.windowScalePercent = SnapWindowScale(static_cast<int>(GetPrivateProfileIntW(
+			L"Window", L"Scale", kDefaultWindowScalePercent, iniPath.c_str())));
 	}
 
 	std::wstring DescribeWindowPlacement()
@@ -6143,6 +6307,11 @@ void UpdateInputOwnership(HWND window);
 			CancelBindingCapture();
 			return;
 		}
+		if (g_app.capturingKeyIndex >= 0)
+		{
+			CancelKeyCapture();
+			return;
+		}
 		switch (g_app.screen)
 		{
 		case Screen::PadViewer:
@@ -6253,10 +6422,107 @@ void UpdateInputOwnership(HWND window);
 
 		if (attach)
 			AttachThreadInput(thisThread, foregroundThread, TRUE);
+		if (IsIconic(target))
+			ShowWindow(target, SW_RESTORE);
+		BringWindowToTop(target);
 		SetForegroundWindow(target);
 		SetActiveWindow(target);
 		if (attach)
 			AttachThreadInput(thisThread, foregroundThread, FALSE);
+
+		// Still refused: Windows only lets the process that received the
+		// last input event change the foreground. A synthetic Alt tap makes
+		// this process that one, and the retry then goes through.
+		if (GetForegroundWindow() != target)
+		{
+			INPUT alt[2]{};
+			alt[0].type = INPUT_KEYBOARD;
+			alt[0].ki.wVk = VK_MENU;
+			alt[1].type = INPUT_KEYBOARD;
+			alt[1].ki.wVk = VK_MENU;
+			alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
+			SendInput(2, alt, sizeof(INPUT));
+			SetForegroundWindow(target);
+		}
+	}
+
+	// ---------------------------------------------------------------------
+	// Dimensions Recompiled
+	// ---------------------------------------------------------------------
+	// When the recompiled PC port is running, its window is where the player
+	// wants to be after closing the picker - whatever happened to have focus
+	// when the picker was opened (a second monitor, the tray, a browser).
+	// Without it running, the picker behaves exactly as before.
+
+	struct RecompiledSearch
+	{
+		HWND found = nullptr;
+	};
+
+	bool IsRecompiledProcess(DWORD pid)
+	{
+		static DWORD s_lastMatchPid = 0;
+		if (pid != 0 && pid == s_lastMatchPid)
+			return true;
+		HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+		if (!process)
+			return false;
+		std::array<wchar_t, MAX_PATH> buffer{};
+		DWORD size = static_cast<DWORD>(buffer.size());
+		const bool ok = QueryFullProcessImageNameW(process, 0, buffer.data(), &size) != 0;
+		CloseHandle(process);
+		if (!ok)
+			return false;
+		const std::filesystem::path image(std::wstring(buffer.data(), size));
+		if (_wcsicmp(image.filename().c_str(), kRecompiledExeName) != 0)
+			return false;
+		s_lastMatchPid = pid;
+		return true;
+	}
+
+	BOOL CALLBACK FindRecompiledWindowProc(HWND window, LPARAM param)
+	{
+		// The game's main window: visible, top-level, not owned by anything
+		// (which skips its console and message boxes' owners).
+		if (!IsWindowVisible(window) || GetWindow(window, GW_OWNER) != nullptr)
+			return TRUE;
+		DWORD pid = 0;
+		GetWindowThreadProcessId(window, &pid);
+		if (pid == 0 || pid == GetCurrentProcessId() || !IsRecompiledProcess(pid))
+			return TRUE;
+		reinterpret_cast<RecompiledSearch*>(param)->found = window;
+		return FALSE;
+	}
+
+	HWND FindRecompiledWindow()
+	{
+		RecompiledSearch search;
+		EnumWindows(FindRecompiledWindowProc, reinterpret_cast<LPARAM>(&search));
+		return search.found;
+	}
+
+	// Cached for the Settings row, which is repainted every frame.
+	bool IsRecompiledRunning()
+	{
+		static DWORD s_checkedAt = 0;
+		static bool s_running = false;
+		const DWORD now = GetTickCount();
+		if (s_checkedAt == 0 || now - s_checkedAt > 1000)
+		{
+			s_running = FindRecompiledWindow() != nullptr;
+			s_checkedAt = now == 0 ? 1 : now;
+		}
+		return s_running;
+	}
+
+	// The window focus goes back to when the picker closes.
+	HWND FocusReturnTarget()
+	{
+		if (HWND recompiled = FindRecompiledWindow())
+			return recompiled;
+		if (g_app.previousForegroundWindow && IsWindow(g_app.previousForegroundWindow))
+			return g_app.previousForegroundWindow;
+		return nullptr;
 	}
 
 	void PositionOverlayWindow(HWND window)
@@ -6265,14 +6531,16 @@ void UpdateInputOwnership(HWND window);
 			? g_app.previousForegroundWindow
 			: window;
 		HMONITOR monitor = MonitorFromWindow(reference, MONITOR_DEFAULTTONEAREST);
+		const int overlayWidth = ScaledOverlayWidth();
+		const int overlayHeight = ScaledOverlayHeight();
 		MONITORINFO info{};
 		info.cbSize = sizeof(info);
 		GetMonitorInfoW(monitor, &info);
 
 		const int monitorWidth = info.rcMonitor.right - info.rcMonitor.left;
 		const int monitorHeight = info.rcMonitor.bottom - info.rcMonitor.top;
-		int x = info.rcMonitor.left + (monitorWidth - kOverlayWidth) / 2;
-		int y = info.rcMonitor.top + (monitorHeight - kOverlayHeight) / 2;
+		int x = info.rcMonitor.left + (monitorWidth - overlayWidth) / 2;
+		int y = info.rcMonitor.top + (monitorHeight - overlayHeight) / 2;
 
 		// A draggable overlay comes back exactly where it was dropped, but
 		// only if enough of it would still be reachable there. A monitor
@@ -6286,7 +6554,7 @@ void UpdateInputOwnership(HWND window);
 		if (g_app.windowDraggable && g_app.hasSavedWindowPos)
 		{
 			const RECT remembered{g_app.savedWindowX, g_app.savedWindowY,
-				g_app.savedWindowX + kOverlayWidth, g_app.savedWindowY + kOverlayHeight};
+				g_app.savedWindowX + overlayWidth, g_app.savedWindowY + overlayHeight};
 			if (HMONITOR savedMonitor = MonitorFromRect(&remembered, MONITOR_DEFAULTTONULL))
 			{
 				MONITORINFO savedInfo{};
@@ -6297,10 +6565,10 @@ void UpdateInputOwnership(HWND window);
 					// on that monitor in both axes.
 					constexpr int kMinVisible = 160;
 					x = std::clamp(g_app.savedWindowX,
-						static_cast<int>(savedInfo.rcMonitor.left) - (kOverlayWidth - kMinVisible),
+						static_cast<int>(savedInfo.rcMonitor.left) - (overlayWidth - kMinVisible),
 						static_cast<int>(savedInfo.rcMonitor.right) - kMinVisible);
 					y = std::clamp(g_app.savedWindowY,
-						static_cast<int>(savedInfo.rcMonitor.top) - (kOverlayHeight - kMinVisible),
+						static_cast<int>(savedInfo.rcMonitor.top) - (overlayHeight - kMinVisible),
 						static_cast<int>(savedInfo.rcMonitor.bottom) - kMinVisible);
 				}
 				else
@@ -6310,7 +6578,7 @@ void UpdateInputOwnership(HWND window);
 				}
 			}
 		}
-		SetWindowPos(window, HWND_TOPMOST, x, y, kOverlayWidth, kOverlayHeight, SWP_NOACTIVATE);
+		SetWindowPos(window, HWND_TOPMOST, x, y, overlayWidth, overlayHeight, SWP_NOACTIVATE);
 	}
 
 	void ShowOverlay(HWND window)
@@ -6331,7 +6599,9 @@ void UpdateInputOwnership(HWND window);
 		}
 
 		const HWND currentForeground = GetForegroundWindow();
-		if (currentForeground && currentForeground != window)
+		if (HWND recompiled = FindRecompiledWindow())
+			g_app.previousForegroundWindow = recompiled; // also centres the picker on the game's monitor
+		else if (currentForeground && currentForeground != window)
 			g_app.previousForegroundWindow = currentForeground;
 
 		// Two views of the same seven pads on screen at once reads as a bug,
@@ -6375,6 +6645,7 @@ void UpdateInputOwnership(HWND window);
 		g_overlayHiding = true;
 		g_app.capturingShortcut = false;
 		g_app.capturingBindingIndex = -1;
+		g_app.capturingKeyIndex = -1;
 		BeginWindowFade(true, CurrentShownFraction());
 		InvalidateRect(window, nullptr, FALSE);
 	}
@@ -6384,6 +6655,14 @@ void UpdateInputOwnership(HWND window);
 		if (!g_overlayHiding)
 			return;
 		g_overlayHiding = false;
+		// Focus goes to the game BEFORE the picker hides. While the picker
+		// is still the foreground window this process is allowed to hand the
+		// foreground on; once it is hidden Windows has already given focus
+		// to whatever was next in line and is free to refuse the request -
+		// which left players outside the game, reaching for the mouse.
+		const HWND returnTo = FocusReturnTarget();
+		if (returnTo)
+			ForceForegroundWindow(returnTo);
 		ShowWindow(window, SW_HIDE);
 		g_app.overlayVisible = false;
 		g_tickIntervalMs.store(kTickIntervalHiddenMs, std::memory_order_relaxed);
@@ -6392,8 +6671,8 @@ void UpdateInputOwnership(HWND window);
 		// very button press that closed it never reaches the game either.
 		UpdateInputOwnership(window);
 
-		if (g_app.previousForegroundWindow && IsWindow(g_app.previousForegroundWindow))
-			ForceForegroundWindow(g_app.previousForegroundWindow);
+		if (returnTo && GetForegroundWindow() != returnTo)
+			ForceForegroundWindow(returnTo);
 	}
 
 	void ToggleOverlay(HWND window)
@@ -6484,6 +6763,122 @@ void UpdateInputOwnership(HWND window);
 		g_app.status = L"Button binding unchanged.";
 	}
 
+	// ---------------------------------------------------------------------
+	// Keyboard key capture (the per-action key rows in Settings)
+	// ---------------------------------------------------------------------
+
+	std::wstring KeyLabel(KeyAction action)
+	{
+		const UINT key = g_app.keyBindings[static_cast<size_t>(action)];
+		if (key == 0)
+			return L"-";
+		switch (key)
+		{
+		case VK_RETURN: return L"Enter";
+		case VK_ESCAPE: return L"Esc";
+		case VK_UP: return L"Up";
+		case VK_DOWN: return L"Down";
+		case VK_LEFT: return L"Left";
+		case VK_RIGHT: return L"Right";
+		default: break;
+		}
+		return DescribeKeyboardKey(0, key);
+	}
+
+	// The action bound to `key`, or Count when it is not bound.
+	KeyAction KeyActionFor(UINT key)
+	{
+		for (size_t i = 0; i < kKeyActionCount; ++i)
+		{
+			if (g_app.keyBindings[i] == key)
+				return static_cast<KeyAction>(i);
+		}
+		return KeyAction::Count;
+	}
+
+	bool IsModifierKey(WPARAM key)
+	{
+		switch (key)
+		{
+		case VK_SHIFT: case VK_CONTROL: case VK_MENU:
+		case VK_LSHIFT: case VK_RSHIFT: case VK_LCONTROL: case VK_RCONTROL:
+		case VK_LMENU: case VK_RMENU: case VK_LWIN: case VK_RWIN:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	void BeginKeyCapture(size_t actionIndex)
+	{
+		g_app.capturingKeyIndex = static_cast<int>(actionIndex);
+		g_app.status = std::wstring(L"Press the new key for \"") + kKeyActions[actionIndex].label +
+			L"\". Esc cancels, Backspace restores the default.";
+	}
+
+	void CancelKeyCapture()
+	{
+		g_app.capturingKeyIndex = -1;
+		g_app.status = L"Keyboard key unchanged.";
+	}
+
+	// A key already used by another action is swapped rather than refused:
+	// that action takes over the key this one gave up, so nothing ever ends
+	// up unbound by accident.
+	void ApplyKeyBinding(size_t actionIndex, UINT key)
+	{
+		const UINT previous = g_app.keyBindings[actionIndex];
+		std::wstring swapped;
+		for (size_t i = 0; i < kKeyActionCount; ++i)
+		{
+			if (i != actionIndex && g_app.keyBindings[i] == key)
+			{
+				g_app.keyBindings[i] = previous;
+				swapped = std::wstring(L" (swapped with \"") + kKeyActions[i].label + L"\")";
+			}
+		}
+		g_app.keyBindings[actionIndex] = key;
+		g_app.capturingKeyIndex = -1;
+		SaveKeyBindingsToIni();
+		g_app.status = std::wstring(kKeyActions[actionIndex].label) + L" key: " +
+			KeyLabel(static_cast<KeyAction>(actionIndex)) + swapped + L".";
+	}
+
+	// ---------------------------------------------------------------------
+	// Window size
+	// ---------------------------------------------------------------------
+
+	std::wstring DescribeWindowScale()
+	{
+		return std::to_wstring(g_app.windowScalePercent) + L"%";
+	}
+
+	// Right makes the window bigger, Left smaller; it stops at either end
+	// rather than wrapping (see CycleOpacity).
+	void CycleWindowScale(int direction)
+	{
+		size_t index = 0;
+		for (size_t i = 0; i < kWindowScaleChoices.size(); ++i)
+		{
+			if (kWindowScaleChoices[i] == g_app.windowScalePercent)
+				index = i;
+		}
+		const int next = std::clamp(static_cast<int>(index) + (direction < 0 ? -1 : 1), 0,
+			static_cast<int>(kWindowScaleChoices.size()) - 1);
+		g_app.windowScalePercent = kWindowScaleChoices[static_cast<size_t>(next)];
+		SaveWindowSettingsToIni();
+		g_app.status = L"Window size: " + DescribeWindowScale();
+		if (g_mainWindow)
+		{
+			if (g_app.overlayVisible)
+				PositionOverlayWindow(g_mainWindow);
+			else
+				SetWindowPos(g_mainWindow, nullptr, 0, 0, ScaledOverlayWidth(), ScaledOverlayHeight(),
+					SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+			InvalidateRect(g_mainWindow, nullptr, FALSE);
+		}
+	}
+
 	// Everything the Settings screen can change goes back to the values a
 	// fresh install starts with - including character selection back to All
 	// series. A default-constructed AppState *is* the defaults, so this
@@ -6518,6 +6913,13 @@ void UpdateInputOwnership(HWND window);
 			SetLedMirrorEnabled(defaults.ledMirrorEnabled); // starts/stops the poll
 		for (const auto& action : kBindableActions)
 			g_app.*(action.button) = defaults.*(action.button);
+		g_app.keyBindings = defaults.keyBindings;
+		g_app.capturingKeyIndex = -1;
+		SaveKeyBindingsToIni();
+		g_app.windowScalePercent = defaults.windowScalePercent;
+		if (g_mainWindow && !g_app.overlayVisible)
+			SetWindowPos(g_mainWindow, nullptr, 0, 0, ScaledOverlayWidth(), ScaledOverlayHeight(),
+				SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 
 		// Back to a fixed, centred window, and the remembered spot goes with
 		// it - a later switch back to draggable should start from centre
@@ -7676,6 +8078,7 @@ void UpdateInputOwnership(HWND window);
 		row(SettingAction::Background, L"Background", DescribeBackgroundChoice());
 		row(SettingAction::PadSkin, L"Pad skin", DescribePadSkin());
 		row(SettingAction::Opacity, L"Window transparency", DescribeOpacity());
+		row(SettingAction::WindowSize, L"Window size", DescribeWindowScale());
 		row(SettingAction::WindowPlacement, L"Window", DescribeWindowPlacement());
 		row(SettingAction::SneakPeek, L"Sneak peek", DescribeSneakPeek(),
 			ToneForSwitch(g_app.peekSizeChoice != 0));
@@ -7709,7 +8112,19 @@ void UpdateInputOwnership(HWND window);
 				SettingValueTone::Neutral, g_app.*(kBindableActions[i].button), i);
 		}
 
+		heading(L"Keyboard keys");
+		for (size_t i = 0; i < kKeyActionCount; ++i)
+		{
+			const bool capturing = g_app.capturingKeyIndex == static_cast<int>(i);
+			row(SettingAction::KeyBinding, std::wstring(L"Key - ") + kKeyActions[i].label,
+				capturing ? std::wstring(L"Press a key...") : KeyLabel(static_cast<KeyAction>(i)),
+				SettingValueTone::Neutral, 0, i);
+		}
+
 		heading(L"System");
+		const bool recompiledRunning = IsRecompiledRunning();
+		row(SettingAction::RecompiledStatus, L"Dimensions Recompiled",
+			recompiledRunning ? L"Running" : L"Not running", ToneForSwitch(recompiledRunning));
 		row(SettingAction::WritableTags, L"Writable vehicle tags", DescribeWritableVehicleTags(),
 			ToneForSwitch(g_app.writableVehicleTags));
 		row(SettingAction::ClearAllPads, L"Clear all pads", {});
@@ -7806,6 +8221,9 @@ void UpdateInputOwnership(HWND window);
 		case SettingAction::Heading: break;
 		case SettingAction::Shortcut: if (allowAction) BeginShortcutCapture(); break;
 		case SettingAction::Binding: if (allowAction) BeginBindingCapture(entry.bindingIndex); break;
+		case SettingAction::KeyBinding: if (allowAction) BeginKeyCapture(entry.bindingIndex); break;
+		case SettingAction::RecompiledStatus: break;
+		case SettingAction::WindowSize: CycleWindowScale(direction); break;
 		case SettingAction::ClearAllPads: if (allowAction) ClearAllPads(true); break;
 		case SettingAction::KeyboardLayout: if (allowAction) g_app.screen = Screen::KeyboardLayout; break;
 		case SettingAction::ResetDefaults: if (allowAction) ResetSettingsToDefaults(); break;
@@ -8538,6 +8956,7 @@ void UpdateInputOwnership(HWND window);
 			g_app.overlayVisible &&
 			!g_app.capturingShortcut &&
 			g_app.capturingBindingIndex < 0 &&
+			g_app.capturingKeyIndex < 0 &&
 			(controllerWants || g_keyboardAbilitiesPeekHeld);
 
 		if (wants && !g_abilitiesPeekHeld)
@@ -8578,6 +8997,7 @@ void UpdateInputOwnership(HWND window);
 			!g_app.overlayVisible &&
 			!g_app.capturingShortcut &&
 			g_app.capturingBindingIndex < 0 &&
+			g_app.capturingKeyIndex < 0 &&
 			(heldButtons & g_app.buttonSneakPeek) == g_app.buttonSneakPeek;
 		if (wants)
 			ShowPeekWindow();
@@ -9556,11 +9976,13 @@ void UpdateInputOwnership(HWND window);
 		constexpr float kGapY = 18.0f;
 		constexpr float kCaptionH = 24.0f;
 
-		struct KbKey { const wchar_t* label; const wchar_t* caption; };
+		struct KbKey { std::wstring label; const wchar_t* caption; };
 		const KbKey row1[] = {
-			{L"Esc", L"Back"}, {L"S", L"Settings / Fav"}, {L"M", L"Move / Organize"},
-			{L"Z", L"Abilities"}, {L"L", L"Quick load"}, {L"C", L"Quick clear"},
-			{L"G", L"LED demo"}, {L"[", L"Prev sort"}, {L"]", L"Next sort"},
+			{KeyLabel(KeyAction::Back), L"Back"}, {KeyLabel(KeyAction::SettingsFavorite), L"Settings / Fav"},
+			{KeyLabel(KeyAction::MoveOrganize), L"Move / Organize"}, {KeyLabel(KeyAction::Abilities), L"Abilities"},
+			{KeyLabel(KeyAction::QuickLoad), L"Quick load"}, {KeyLabel(KeyAction::QuickClear), L"Quick clear"},
+			{KeyLabel(KeyAction::LedDemo), L"LED demo"}, {KeyLabel(KeyAction::PrevSort), L"Prev sort"},
+			{KeyLabel(KeyAction::NextSort), L"Next sort"},
 		};
 		const int row1Count = static_cast<int>(sizeof(row1) / sizeof(row1[0]));
 		const float row1KeyW = 80.0f;
@@ -9575,7 +9997,8 @@ void UpdateInputOwnership(HWND window);
 
 		const float row2Y = row1Y + kKeyH + kCaptionH + kGapY;
 		// Arrow cluster + Enter.
-		const std::array<const wchar_t*, 4> arrows = {L"Up", L"Down", L"Left", L"Right"};
+		const std::array<std::wstring, 4> arrows = {KeyLabel(KeyAction::Up), KeyLabel(KeyAction::Down),
+			KeyLabel(KeyAction::Left), KeyLabel(KeyAction::Right)};
 		const float arrowsW = 4 * kArrowW + 3 * kGapX;
 		const float enterW = kKeyW;
 		const float navW = arrowsW + 40.0f + enterW;
@@ -9587,7 +10010,7 @@ void UpdateInputOwnership(HWND window);
 		DrawTextLineCentered(g, L"Navigate", static_cast<int>(navX),
 			static_cast<int>(row2Y + kKeyH + 4), static_cast<int>(arrowsW), RGB(214, 220, 230),
 			static_cast<int>(kCaptionH));
-		DrawKeycap(g, navX + arrowsW + 40.0f, row2Y, enterW, kKeyH, L"Enter", L"Confirm", false);
+		DrawKeycap(g, navX + arrowsW + 40.0f, row2Y, enterW, kKeyH, KeyLabel(KeyAction::Confirm), L"Confirm", false);
 
 		const float row3Y = row2Y + kKeyH + kCaptionH + kGapY;
 		const std::wstring toggleLabel = g_app.shortcutKeyCode != 0
@@ -9612,8 +10035,17 @@ void UpdateInputOwnership(HWND window);
 		HDC windowDC = BeginPaint(window, &paint);
 		RECT client{};
 		GetClientRect(window, &client);
-		const int width = client.right - client.left;
-		const int height = client.bottom - client.top;
+		const int clientWidth = client.right - client.left;
+		const int clientHeight = client.bottom - client.top;
+		// The frame is always laid out at full size; a smaller window gets
+		// it shrunk once at the very end.
+		const int width = kOverlayWidth;
+		const int height = kOverlayHeight;
+		if (clientWidth <= 0 || clientHeight <= 0)
+		{
+			EndPaint(window, &paint);
+			return;
+		}
 
 		// Everything below is drawn into an off-screen 32-bit top-down DIB
 		// and the finished frame is handed to UpdateLayeredWindow in one
@@ -9967,7 +10399,8 @@ void UpdateInputOwnership(HWND window);
 			// refused - so it is drawn under the list. Outside capture the
 			// rows already show every setting's value, and a leftover
 			// message there would just be noise.
-			if ((g_app.capturingShortcut || g_app.capturingBindingIndex >= 0) && !g_app.status.empty())
+			if ((g_app.capturingShortcut || g_app.capturingBindingIndex >= 0 || g_app.capturingKeyIndex >= 0) &&
+				!g_app.status.empty())
 			{
 				const int hintY = kSettingsTop + static_cast<int>(visibleRows) * kSettingsPitch + 16;
 				DrawTextLine(g, g_app.status, 24, hintY, width - 48, RGB(255, 204, 51), 26);
@@ -10127,10 +10560,63 @@ void UpdateInputOwnership(HWND window);
 		// SetLayeredWindowAttributes used to apply, in a single present. The
 		// constant alpha is the user's opacity setting, scaled by whatever
 		// show/dismiss fade is running.
-		POINT source{0, 0};
+		HDC presentDC = s_bufferDC;
 		SIZE size{width, height};
+		if (clientWidth != width || clientHeight != height)
+		{
+			frameGraphics.Flush(Gdiplus::FlushIntentionSync);
+			static HDC s_scaledDC = nullptr;
+			static HBITMAP s_scaledBitmap = nullptr;
+			static HGDIOBJ s_scaledOldBitmap = nullptr;
+			static void* s_scaledBits = nullptr;
+			static int s_scaledW = 0;
+			static int s_scaledH = 0;
+			if (!s_scaledDC || s_scaledW != clientWidth || s_scaledH != clientHeight)
+			{
+				if (s_scaledDC)
+				{
+					SelectObject(s_scaledDC, s_scaledOldBitmap);
+					DeleteObject(s_scaledBitmap);
+					DeleteDC(s_scaledDC);
+				}
+				BITMAPINFO info{};
+				info.bmiHeader.biSize = sizeof(info.bmiHeader);
+				info.bmiHeader.biWidth = clientWidth;
+				info.bmiHeader.biHeight = -clientHeight;
+				info.bmiHeader.biPlanes = 1;
+				info.bmiHeader.biBitCount = 32;
+				info.bmiHeader.biCompression = BI_RGB;
+				s_scaledBits = nullptr;
+				s_scaledDC = CreateCompatibleDC(windowDC);
+				s_scaledBitmap = CreateDIBSection(windowDC, &info, DIB_RGB_COLORS, &s_scaledBits, nullptr, 0);
+				s_scaledOldBitmap = SelectObject(s_scaledDC, s_scaledBitmap);
+				s_scaledW = clientWidth;
+				s_scaledH = clientHeight;
+			}
+			if (s_scaledBits)
+			{
+				std::memset(s_scaledBits, 0, static_cast<size_t>(clientWidth) * static_cast<size_t>(clientHeight) * 4);
+				Gdiplus::Bitmap scaledFrame(clientWidth, clientHeight, clientWidth * 4, PixelFormat32bppPARGB,
+					static_cast<BYTE*>(s_scaledBits));
+				Gdiplus::Graphics scaledGraphics(&scaledFrame);
+				scaledGraphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+				scaledGraphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+				scaledGraphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+				// Clamped edges, so the bicubic filter does not pull in
+				// transparent pixels from beyond the frame.
+				Gdiplus::ImageAttributes clampEdges;
+				clampEdges.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
+				scaledGraphics.DrawImage(&frame, Gdiplus::Rect(0, 0, clientWidth, clientHeight),
+					0, 0, width, height, Gdiplus::UnitPixel, &clampEdges);
+				scaledGraphics.Flush(Gdiplus::FlushIntentionSync);
+				presentDC = s_scaledDC;
+				size = SIZE{clientWidth, clientHeight};
+			}
+		}
+
+		POINT source{0, 0};
 		BLENDFUNCTION blend{AC_SRC_OVER, 0, CurrentOverlayAlpha(), AC_SRC_ALPHA};
-		UpdateLayeredWindow(window, nullptr, nullptr, &size, s_bufferDC, &source,
+		UpdateLayeredWindow(window, nullptr, nullptr, &size, presentDC, &source,
 			0, &blend, ULW_ALPHA);
 
 		EndPaint(window, &paint);
@@ -12122,6 +12608,19 @@ if (changed)
 			Paint(window);
 			return 0;
 		case WM_KEYDOWN:
+		{
+			if (g_app.capturingKeyIndex >= 0)
+			{
+				const size_t index = static_cast<size_t>(g_app.capturingKeyIndex);
+				if (wParam == VK_ESCAPE)
+					CancelKeyCapture();
+				else if (wParam == VK_BACK)
+					ApplyKeyBinding(index, kKeyActions[index].defaultKey);
+				else if (!IsModifierKey(wParam))
+					ApplyKeyBinding(index, static_cast<UINT>(wParam));
+				InvalidateRect(window, nullptr, FALSE);
+				return 0;
+			}
 			if (g_app.capturingBindingIndex >= 0)
 			{
 				// Binding capture is controller-only; the keyboard can only
@@ -12169,27 +12668,33 @@ if (changed)
 			// Any keypress means the user is on the keyboard right now, so Auto
 			// button labels follow that.
 			g_app.lastInputWasKeyboard = true;
-			switch (wParam)
+			// Keys come from the rebindable table. Esc stays a way back out
+			// even after Back is moved elsewhere, as long as nothing else has
+			// taken it, so a bad rebind can never trap anyone in a screen.
+			KeyAction keyAction = KeyActionFor(static_cast<UINT>(wParam));
+			if (keyAction == KeyAction::Count && wParam == VK_ESCAPE)
+				keyAction = KeyAction::Back;
+			switch (keyAction)
 			{
-			case VK_UP: Navigate(-1); break;
-			case VK_DOWN: Navigate(1); break;
+			case KeyAction::Up: Navigate(-1); break;
+			case KeyAction::Down: Navigate(1); break;
 			// Bit 30 of lParam is the previous key state: set means this is a
 			// hardware auto-repeat rather than a fresh press. Values are only
 			// edited on a fresh press, for the same reason the stick repeat
 			// above skips them.
-			case VK_LEFT:
+			case KeyAction::Left:
 				if (g_app.screen != Screen::Settings || (lParam & (1 << 30)) == 0)
 					NavigateGrid(-1, 0);
 				break;
-			case VK_RIGHT:
+			case KeyAction::Right:
 				if (g_app.screen != Screen::Settings || (lParam & (1 << 30)) == 0)
 					NavigateGrid(1, 0);
 				break;
-			case VK_RETURN: Confirm(); break;
-			case VK_ESCAPE: Back(window); break;
+			case KeyAction::Confirm: Confirm(); break;
+			case KeyAction::Back: Back(window); break;
 			// S mirrors the controller's Y everywhere: Settings on the pad
 			// viewer, and favorite / filter on the screens where Y does those.
-			case 'S':
+			case KeyAction::SettingsFavorite:
 				if (g_app.screen == Screen::PadViewer)
 					g_app.screen = Screen::Settings;
 				else if (g_app.screen == Screen::RosterList && !g_app.reorganizingRoster)
@@ -12202,7 +12707,7 @@ if (changed)
 				break;
 			// M mirrors the controller's X everywhere: quick move on the pad
 			// viewer, and organize on the Favorites roster / world grid.
-			case 'M':
+			case KeyAction::MoveOrganize:
 				if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
 					BeginMoveFromSelectedPad();
 				else if (g_app.screen == Screen::RosterList &&
@@ -12213,11 +12718,11 @@ if (changed)
 					g_app.virtualTile == VirtualTile::None && !g_app.reorganizingFranchise)
 					BeginFranchiseReorganize();
 				break;
-			case 'L':
+			case KeyAction::QuickLoad:
 				if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
 					OpenBrowseScreen();
 				break;
-			case 'C':
+			case KeyAction::QuickClear:
 				if (g_app.screen == Screen::PadViewer && !g_app.selectingMoveDestination)
 				{
 					if (g_app.padState[g_app.slotIndex].occupied)
@@ -12226,29 +12731,32 @@ if (changed)
 					g_app.status = L"There is nothing tracked on that pad to clear.";
 				}
 				break;
-			case 'G':
+			case KeyAction::LedDemo:
 				if (g_app.screen == Screen::PadViewer)
 					ToggleLedDemo();
 				break;
 			// Z is the keyboard's hold-to-peek abilities button (controller RT).
-			case 'Z':
+			case KeyAction::Abilities:
 				g_keyboardAbilitiesPeekHeld = true;
 				break;
 			// Keyboard equivalents of the LB/RB sort cycling on the franchise
 			// grid / browse rosters.
-			case VK_OEM_4: // '[' - previous sort
+			case KeyAction::PrevSort:
 				if (IsFranchiseSortBrowseActive())
 					CycleFranchiseSort(-1);
 				break;
-			case VK_OEM_6: // ']' - next sort
+			case KeyAction::NextSort:
 				if (IsFranchiseSortBrowseActive())
 					CycleFranchiseSort(+1);
+				break;
+			default:
 				break;
 			}
 			InvalidateRect(window, nullptr, FALSE);
 			return 0;
+		}
 		case WM_KEYUP:
-			if (wParam == 'Z')
+			if (wParam == g_app.keyBindings[static_cast<size_t>(KeyAction::Abilities)])
 			{
 				g_keyboardAbilitiesPeekHeld = false;
 				InvalidateRect(window, nullptr, FALSE);
@@ -12271,7 +12779,7 @@ if (changed)
 					0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
 				return 0;
 			}
-			const POINT point{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))};
+			const POINT point = LayoutPointFromLParam(lParam);
 			const int hoveredAction = ActionButtonIndexAt(point);
 			if (hoveredAction != g_app.hoveredPadActionIndex)
 			{
@@ -12305,7 +12813,7 @@ if (changed)
 				POINT cursor{};
 				GetCursorPos(&cursor);
 				ScreenToClient(window, &cursor);
-				if (g_app.draggingWindow || ActionButtonIndexAt(cursor) < 0)
+				if (g_app.draggingWindow || ActionButtonIndexAt(LayoutPointFromClient(cursor)) < 0)
 				{
 					SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
 					return TRUE;
@@ -12322,7 +12830,7 @@ if (changed)
 			return 0;
 		case WM_LBUTTONDOWN:
 		{
-			const POINT point{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))};
+			const POINT point = LayoutPointFromLParam(lParam);
 			const int actionIndex = ActionButtonIndexAt(point);
 			if (actionIndex >= 0)
 			{
@@ -12362,7 +12870,7 @@ if (changed)
 				SaveWindowSettingsToIni();
 				return 0;
 			}
-			const POINT point{static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam))};
+			const POINT point = LayoutPointFromLParam(lParam);
 			const int actionIndex = ActionButtonIndexAt(point);
 			if (g_app.pressedPadActionIndex >= 0)
 			{
@@ -12676,6 +13184,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 	LoadShortcutFromIni();
 	LoadInputSettingsFromIni();
 	LoadWindowSettingsFromIni();
+	LoadKeyBindingsFromIni();
 	LoadWebSettingsFromIni();
 	LoadFavoritesFromIni();
 	LoadFranchiseOrderFromIni();
@@ -12713,7 +13222,7 @@ g_app.status = std::to_wstring(embeddedTags) +
 	// hidden and only shown when the configured shortcut is triggered.
 	HWND window = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
 		className, L"LEGO Dimensions Toypad Picker", WS_POPUP,
-		CW_USEDEFAULT, CW_USEDEFAULT, kOverlayWidth, kOverlayHeight, nullptr, nullptr, instance, nullptr);
+		CW_USEDEFAULT, CW_USEDEFAULT, ScaledOverlayWidth(), ScaledOverlayHeight(), nullptr, nullptr, instance, nullptr);
 	if (!window)
 	{
 		ReleaseGlossCache();
